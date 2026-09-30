@@ -9,6 +9,7 @@ Item {
     signal failed(string path)
     signal isDirectory(string path)
     signal terminalFailed(string path)
+    signal clipboardFailed()
     // Raised where the two single-flight guards below drop a request, so a swallowed press says so.
     signal busy(string path)
     signal terminalBusy(string path)
@@ -91,6 +92,9 @@ Item {
 
     Process {
         id: copier
+        onExited: function (exitCode) {
+            if (exitCode !== 0) root.clipboardFailed()
+        }
     }
 
     // A library cannot name a singleton, so the menu's Update Flea row comes through here, and the pane's footer says what it did.
