@@ -81,7 +81,11 @@ Item {
         if (copier.running) {
             return
         }
-        copier.command = ["sh", "-c", "printf '%s' \"$1\" | wl-copy", "_", text]
+        var x11 = Quickshell.env("XDG_SESSION_TYPE") === "x11"
+                  || (!Quickshell.env("WAYLAND_DISPLAY") && !!Quickshell.env("DISPLAY"))
+        copier.command = ["sh", "-c", x11
+                          ? "printf '%s' \"$1\" | xclip -selection clipboard -in"
+                          : "printf '%s' \"$1\" | wl-copy", "_", text]
         copier.running = true
     }
 
