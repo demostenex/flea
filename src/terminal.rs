@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 // The exit status ui/Opener.qml reads. 0 is a successful handoff and needs no name.
 pub const FAILED: i32 = 2;
 
-// Canonical, so a relative path and a symlink both name the one real directory the terminal sits in.
+/// Resolve a relative path or symlink to the directory the terminal should use.
 fn resolved(path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
@@ -63,7 +63,8 @@ pub fn open_terminal(path: &str) -> i32 {
     }
 }
 
-// The guards every program Flea starts and does not wait for carries; src/update.rs hands its updater the same.
+/// Apply the process guards to a child that Flea starts without waiting for it.
+/// The updater in `src/update.rs` uses these guards too.
 pub fn detach(child: &mut Command) {
     // The setting is inherited across exec, so this is the last point that can hand it back.
     thp::enable();
