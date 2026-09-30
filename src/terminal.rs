@@ -14,8 +14,9 @@ fn resolved(path: &str) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
-// xdg-terminal-exec is the OEM route: `omarchy default terminal` configures what it reads,
-// and --dir= names the working directory without taking a command.
+/// Open a terminal in `path`, preferring the desktop's `xdg-terminal-exec`.
+/// If that launcher is missing, try Alacritty, Kitty, then xterm in the resolved directory.
+/// Return [`FAILED`] when the path is invalid or no terminal can be launched.
 pub fn open_terminal(path: &str) -> i32 {
     let target = match resolved(path) {
         Some(p) => p,
