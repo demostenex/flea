@@ -2,6 +2,8 @@
 
 # Seconds one IPC poll waits for its state, used by the two polling helpers below.
 sweep_wait_seconds=30
+# Eight wheel notches reach the two-page PDF stack's end at the capture window size.
+sweep_pdf_end_notches=8
 
 # Every capture asserts the effective text size, parsed theme and fresh PNG dimensions.
 sweep_shot() {
@@ -106,24 +108,21 @@ sweep_view_states() {
     sweep_shot "$surface-hidden"
 }
 
-# Views: List, default and larger Grid tiles, three Columns at rest and a deep path.
-sweep_views() {
-    local size path deep="$sweep_root/views/projects/release/candidate/deep"
+# The views tree: two documents and a dotfile at the top and at a deep path.
+sweep_views_fixture() {
+    local path deep="$sweep_root/views/projects/release/candidate/deep"
     mkdir -p "$deep"
     for path in "$sweep_root/views" "$deep"; do
         printf 'Release notes\n' > "$path/a.txt"
         printf 'Second document\n' > "$path/b.txt"
         printf 'Hidden configuration\n' > "$path/.hidden.txt"
     done
-    sweep_launch "$sweep_root/views"
-    sweep_wait viewMode list
-    sweep_view_states list 3
-    for size in medium large; do
-        sweep_launch "$sweep_root/views" "$(jq -cn --arg size "$size" '{view:"grid",preview:{thumbSize:$size}}')"
-        sweep_wait viewMode grid
-        menus_expect uiSettings ".preview.thumbSize == \"$size\"" "Grid $size thumbnail size loaded"
-        sweep_view_states "grid-$size" 3
-    done
+}
+
+# Columns at rest and a deep path, with selections, cut marks and visible dotfiles.
+sweep_columns() {
+    local deep="$sweep_root/views/projects/release/candidate/deep"
+    sweep_views_fixture
     sweep_launch "$sweep_root/views" '{"view":"columns"}'
     sweep_wait viewMode columns
     sweep_wait columnCount 3
@@ -133,6 +132,22 @@ sweep_views() {
     sweep_wait columnCount 3
     sweep_view_states columns-deep 2
     kill_flea
+}
+
+# Views: List, default and larger Grid tiles, three Columns at rest and a deep path.
+sweep_views() {
+    local size
+    sweep_views_fixture
+    sweep_launch "$sweep_root/views"
+    sweep_wait viewMode list
+    sweep_view_states list 3
+    for size in medium large; do
+        sweep_launch "$sweep_root/views" "$(jq -cn --arg size "$size" '{view:"grid",preview:{thumbSize:$size}}')"
+        sweep_wait viewMode grid
+        menus_expect uiSettings ".preview.thumbSize == \"$size\"" "Grid $size thumbnail size loaded"
+        sweep_view_states "grid-$size" 3
+    done
+    sweep_columns
 }
 
 # Preview fixtures reuse the suites' media, PDF, text and audio generators, plus a real alpha PNG.
@@ -180,7 +195,7 @@ sweep_previews() {
             markdown) sweep_text columnMarkdownText 'Release notes' ;;
             remote) sweep_text columnMarkdownText 'cdn.example.com' ;;
             audio) sweep_wait columnPlayerLoaded false; sweep_wait columnMediaPlaying false; sweep_text columnPlayCentre ' ' ;;
-            text) sweep_wait columnTextLines 'hello from flea|second line|' ;;
+            text) sweep_wait columnTextLines 'hello from flea|second line' ;;
             large) sweep_text columnTextLines 'Log row 00000' ;;
             overlimit) sweep_wait columnTextLines 'too large' ;;
         esac
@@ -189,8 +204,9 @@ sweep_previews() {
         fi
         sweep_shot "column-$tag-$state"
         if [[ "$tag" == pdf ]]; then
-            permissions_point "$(ipc columnChevronCentre right)"
-            sweep_wait columnPdfPage 1
+            capmarkdown_column_pointer sweep-pdf-page-turn
+            omarchy-drive scroll down "$sweep_pdf_end_notches" >/dev/null || fail 'capsweep: the PDF stack wheel failed'
+            pdf_expect false '.pages == 2 and .scrollY > 0 and (.landed | index(1) != null)' 'sweep second stacked page decoded after scrolling'
             sweep_shot column-pdf-page-turn
         fi
         key -k Space >/dev/null
@@ -322,7 +338,7 @@ sweep_menus() {
     kill_flea
 }
 
-# Dialogs: delete, collision, one and several Permissions, New File, inline Rename and Open with.
+# Dialogs: delete, collision, one and several Permissions, New File, New Folder, inline Rename and Open with.
 sweep_dialogs() {
     local section dir="$sweep_root/dialogs"
     mkdir -p "$dir/to"
@@ -356,6 +372,16 @@ sweep_dialogs() {
     sweep_shot dialog-new-file-open
     key -k Escape >/dev/null
     menus_expect menuDialogState '.opened | not' 'New File closed'
+    [[ ! -e "$dir/New Folder" ]] || fail 'capsweep: New Folder exists before the menu'
+    click_background
+    [[ ! -e "$dir/New Folder" ]] || fail 'capsweep: New Folder existed before the menu'
+    menus_choose newFolder
+    sweep_wait renameEditorLive true
+    [[ -d "$dir/New Folder" ]] || fail 'capsweep: New Folder missing after menu'
+    sweep_shot dialog-new-folder-editor
+    key -k Escape >/dev/null
+    sweep_wait renameEditorLive false
+    [[ -d "$dir/New Folder" ]] || fail 'capsweep: Escape removed New Folder'
     seek_row_named a.txt
     key r >/dev/null
     sweep_wait renameEditorLive true
@@ -385,7 +411,7 @@ sweep_dialogs() {
 
 # Settings: every live rail page once, plus the keymap sheet filtered by a typed query.
 sweep_settings() {
-    local section
+    local section sweep_sections
     sweep_launch "$sweep_root/views"
     settings_open_key
     sweep_wait settingsOpen true
@@ -504,8 +530,12 @@ sweep_desktop_shot() {
 # Current palette or Cool Dawn runs through the same cases and an isolated child HOME.
 sweep_run() {
     local sweep_theme="$1" sweep_root="$fixture_root/capsweep-$1" sweep_real_bin="$flea_bin" sweep_home
-    local real_foreground="$real_foreground" flea_bin="$flea_bin" evidence_dir="$evidence_dir/$1" menus_checks=0 picker_wait_seconds=180
-    local -a sweep_sections
+    # A section run names its evidence for its sections at the pinned size, apart from the theme runs.
+    local sweep_evidence="${2:-$1}"
+    [[ -n "${2:-}" ]] && sweep_evidence="${sweep_evidence}14"
+    local real_foreground="$real_foreground" flea_bin="$flea_bin" evidence_dir="$evidence_dir/$sweep_evidence" menus_checks=0 picker_wait_seconds=180
+    local -a sweep_sections=(${2:-views previews menus dialogs settings windows picker})
+    local section
     sandbox_make "$sweep_root"
     sweep_home="$sweep_root/home"
     fixture_home_make "$sweep_home"
@@ -522,15 +552,24 @@ sweep_run() {
     { printf '#!/usr/bin/env bash\n'; printf 'exec env HOME=%q %q "$@"\n' "$sweep_home" "$sweep_real_bin"; } > "$flea_bin"
     chmod +x "$flea_bin"
     printf 'SWEEP_THEME %s textSize=14 seam=display.textSize childHome=%s\n' "$sweep_theme" "$sweep_home"
-    sweep_views
-    sweep_previews
-    sweep_menus
-    sweep_dialogs
-    sweep_settings
-    sweep_windows
-    FLEA_BIN="$sweep_real_bin" FLEA_UI="$flea_ui" timeout "$picker_wait_seconds" python3 "$repo/tests/ui-captures-sweep-picker.py" "$sweep_root/picker" "$sweep_home" "$evidence_dir" \
-        || fail "capsweep: picker sweep failed, status $?"
-    cat "$evidence_dir/picker-backend.log" >> "$run_log"
+    for section in "${sweep_sections[@]}"; do
+        case "$section" in
+            views) sweep_views ;;
+            columns) sweep_columns ;;
+            previews) sweep_previews ;;
+            menus) sweep_menus ;;
+            dialogs) sweep_dialogs ;;
+            settings) sweep_settings ;;
+            windows) sweep_windows ;;
+            picker) ;;
+            *) fail "capsweep: no section named $section" ;;
+        esac
+    done
+    if [[ " ${sweep_sections[*]} " == *" picker "* ]]; then
+        FLEA_BIN="$sweep_real_bin" FLEA_UI="$flea_ui" timeout "$picker_wait_seconds" python3 "$repo/tests/ui-captures-sweep-picker.py" "$sweep_root/picker" "$sweep_home" "$evidence_dir" \
+            || fail "capsweep: picker sweep failed, status $?"
+        cat "$evidence_dir/picker-backend.log" >> "$run_log"
+    fi
     printf 'SWEEP_TOTAL %s %s shots\n' "$sweep_theme" "$(wc -l < "$evidence_dir/manifest.tsv")"
 }
 
@@ -539,3 +578,98 @@ case_capsweep() { sweep_run current; }
 
 # Cool Dawn repeats the entire native sweep without editing the user's theme or text setting.
 case_capsweeplow() { sweep_run cool-dawn; }
+
+# Columns only at size 14 on the live theme, for one native columns specimen.
+case_cap_columns14() { sweep_run current columns; }
+
+# Quick Look on an STL keeps the seeded cache thumbnail as its picture, at text size 14, with no thumbnailer run; a second STL whose thumbnail is still being made waits on the loading state and ends on the thumbnail.
+case_capsweepstl() {
+    local dir="$fixture_root/capsweepstl" stl_home="$fixture_root/capsweepstl-home"
+    local real_home="$HOME" key stl_mtime cache_png stl_uri key_uri seen end
+    command -v magick >/dev/null || fail 'capsweepstl: magick is missing, so the thumbnail fixture cannot be built'
+    command -v python3 >/dev/null || fail 'capsweepstl: python3 is missing, so the cache entry cannot be keyed'
+    sandbox_scratch "$dir"
+    printf 'solid capsweepstl-fixture\nendsolid capsweepstl-fixture\n' > "$dir/model.stl" \
+        || fail 'capsweepstl: the STL fixture failed'
+    fixture_home_make "$stl_home"
+    mkdir -p "$stl_home/.local/share/thumbnailers"
+    # The seeded STL is a cache hit and never runs this; the second one makes its thumbnail in six seconds, so Quick Look opens first.
+    printf '[Thumbnailer Entry]\nExec=/bin/sh -c "/usr/bin/sleep 6; exec /usr/bin/magick -size 256x192 xc:#9ece6a png:\\$0" %%o\nMimeType=model/stl;model/3mf;\n' \
+        > "$stl_home/.local/share/thumbnailers/stl-seed.thumbnailer"
+    stl_mtime=$(stat -c %Y "$dir/model.stl")
+    magick -size 256x192 xc:'#7aa2f7' "$dir/.stl-thumb-tmp.png" \
+        || fail 'capsweepstl: the thumbnail fixture failed'
+    # The freedesktop key is the md5 of the file URI, with GLib's literal bytes left bare.
+    key_uri=$(python3 - "$dir/model.stl" <<'PY'
+import hashlib, sys
+literal = b"!$&'()*+,-./:=@_~"
+uri = "file://"
+for byte in sys.argv[1].encode():
+    if (48 <= byte <= 57 or 65 <= byte <= 90 or 97 <= byte <= 122) or byte in literal:
+        uri += chr(byte)
+    else:
+        uri += "%%%02X" % byte
+print(hashlib.md5(uri.encode()).hexdigest())
+print(uri)
+PY
+    ) || fail 'capsweepstl: the cache key failed'
+    key=${key_uri%%$'\n'*}
+    stl_uri=${key_uri#*$'\n'}
+    mkdir -p "${XDG_CACHE_HOME}/thumbnails/large"
+    cache_png="${XDG_CACHE_HOME}/thumbnails/large/$key.png"
+    # lookup() trusts only a cache entry stamped with the file's own mtime, as uncompressed tEXt.
+    python3 - "$dir/.stl-thumb-tmp.png" "$stl_mtime" "$stl_uri" "$cache_png" <<'PY'
+import struct, sys, zlib
+data = open(sys.argv[1], "rb").read()
+assert data[:8] == b"\x89PNG\r\n\x1a\n"
+assert data[8:16] == struct.pack(">I", 13) + b"IHDR"
+def text(key, value):
+    payload = key + b"\x00" + value
+    return struct.pack(">I", len(payload)) + b"tEXt" + payload + struct.pack(">I", zlib.crc32(b"tEXt" + payload) & 0xffffffff)
+# PNG orders IHDR first: signature 8 plus IHDR 25 is offset 33, so both stamps splice there.
+stamps = text(b"Thumb::URI", sys.argv[3].encode()) + text(b"Thumb::MTime", sys.argv[2].encode())
+open(sys.argv[4], "wb").write(data[:33] + stamps + data[33:])
+PY
+    [[ "$(grep -ao 'Thumb::MTime' "$cache_png" | wc -l | tr -d ' ')" == 1 ]] \
+        || fail 'capsweepstl: the seeded cache entry carries no mtime stamp'
+    seed_ui_state "$fixture_root/capsweepstl-state" '{"keys":"default","view":"columns","display":{"textSize":{"mode":14}}}'
+    export HOME="$stl_home"
+    launch "$dir"
+    wait_listing 1
+    settle
+    seek_row_named model.stl
+    matrix_wait_column image model.stl
+    sweep_shot column-stl-thumbnail
+    key -k Space >/dev/null
+    sweep_wait previewOpen true
+    sweep_wait previewKind image
+    sweep_wait previewState image
+    sweep_shot quicklook-stl-thumbnail
+    key -k Escape >/dev/null
+    sweep_wait previewOpen false
+    # A file made after the listing has no cache entry, so Space meets the row before its thumbnail exists.
+    printf 'solid capsweepstl-late\nendsolid capsweepstl-late\n' > "$dir/model-late.stl" \
+        || fail 'capsweepstl: the late STL fixture failed'
+    wait_listing 2
+    seek_row_named model-late.stl
+    key -k Space >/dev/null
+    sweep_wait previewOpen true
+    sweep_wait previewKind image
+    [[ "$(ipc previewState)" == loading ]] || fail "capsweepstl: an STL with no thumbnail yet read '$(ipc previewState)', want loading"
+    sweep_shot quicklook-stl-pending
+    # Every sample until the thumbnail lands is the loading state, and none is the sentence.
+    seen=loading
+    end=$((SECONDS + sweep_wait_seconds))
+    while (( SECONDS < end )) && [[ "$seen" == loading ]]; do
+        seen=$(ipc previewState) || fail 'capsweepstl: previewState unavailable'
+        [[ "$seen" == 'This image could not be read.' ]] && fail 'capsweepstl: the late STL showed the unreadable sentence before its thumbnail'
+        sleep 0.1
+    done
+    [[ "$seen" == image ]] || fail "capsweepstl: the late STL ended on '$seen', want image"
+    sweep_shot quicklook-stl-late-thumbnail
+    key -k Escape >/dev/null
+    sweep_wait previewOpen false
+    printf 'CAPSWEEPSTL column=thumbnail quicklook=image late=image\n'
+    kill_flea
+    export HOME="$real_home"
+}

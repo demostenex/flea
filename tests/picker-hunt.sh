@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Release hunt: board behavior through real picker keys and backend responses.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -23,7 +24,7 @@ if source.count(stopped) != 1:
 path.write_text(source.replace(stopped, 'onStopped: Qt.exit(0)'))
 PYCODE
 [ "$?" -eq 0 ] || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons"
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui"
 cp tests/picker-hunt.qml "$test_root/config/shell.qml"
 cp tests/picker-focus-helper.py "$test_root/focus-backend"
@@ -169,7 +170,7 @@ sys.exit(0 if r.get('pickerView')==sys.argv[2] else 1)
 PY
             then echo 'FAIL remembered view was not persisted for restart'; failures=$((failures+1)); fi
         fi
-        warnings=$(printf '%s\n' "$output" | grep -E 'TypeError|ReferenceError|Unable to assign|Cannot anchor to an item' || true)
+        warnings=$(printf '%s\n' "$output" | grep -E 'TypeError|ReferenceError|Unable to assign|Cannot anchor to an item|Binding loop detected' || true)
         if [ -n "$warnings" ]; then printf 'FAIL picker binding warning: %s\n' "$warnings"; failures=$((failures+1)); fi
     done
 done

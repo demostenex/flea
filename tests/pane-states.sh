@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # A listing past its wait draws the Error state alone, never the crawl under it; offscreen, no display or lock.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -25,7 +26,7 @@ mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/ru
 chmod 700 "$test_root/runtime" || exit 1
 # The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
 ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
 cp tests/pane-states.qml "$test_root/config/shell.qml" || exit 1
 
@@ -57,7 +58,9 @@ if [ "$pass_count" -ne 1 ] || [ "$fail_count" -ne 0 ]; then
 fi
 # The offscreen platform itself says it cannot mask a FloatingWindow; that one line is the platform's, never the states'.
 platform_warning='This plugin does not support setting window masks'
-warnings=$(printf '%s\n' "$output" | grep -aE 'TypeError|ReferenceError|WARN|ERROR' | grep -vF "$platform_warning")
+# The suite unsets HYPRLAND_INSTANCE_SIGNATURE itself, so this one line is the suite's own setup, never the states'.
+hyprland_warning='$HYPRLAND_INSTANCE_SIGNATURE is unset. Cannot connect to hyprland.'
+warnings=$(printf '%s\n' "$output" | grep -aE 'TypeError|ReferenceError|WARN|ERROR' | grep -vF "$platform_warning" | grep -vF "$hyprland_warning")
 if [ -n "$warnings" ]; then
     printf 'FAIL the states harness logged a warning\n'
     printf '%s\n' "$warnings"

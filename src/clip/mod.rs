@@ -20,7 +20,7 @@ pub fn use_x11() -> bool {
 }
 
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 // Serialises the tests that borrow process-global Wayland names for a fake socket.
 #[cfg(test)]
@@ -69,3 +69,4 @@ impl Drop for DisplayEnv {
         }
     }
 }
+

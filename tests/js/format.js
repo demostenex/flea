@@ -1,4 +1,6 @@
 .import "../../ui/js/Format.js" as Format
+.import "../../ui/js/Messages.js" as Messages
+.import "sourcefixture.js" as Source
 
 function run(check) {
     // One grouping rule for every count the product prints: the search's scan and the filter's scope.
@@ -86,6 +88,20 @@ function run(check) {
     check("mode 644 is not executable", Format.isExecutable(33188), false)
     check("a vanished row is not executable", Format.isExecutable(0), false)
 
+    // Execute semantics travel unchanged through the real row parser and the shipped colour function.
+    var nameColor = eval("(function(root, Theme, Format) {" + Source.block(Source.source("ui/Row.qml"), "function nameColor()", "ui/Row.qml") + "})")
+    var palette = {color: {foreground: "foreground", executable: "executable", symlink: "symlink", muted: "muted"}}
+    for (var fstype of ["exfat", "vfat"]) {
+        var row = Messages.sized(JSON.parse('{"rows":[{"n":"Launcher","d":false,"p":33261,"x":false}]}'))[0]
+        check(fstype + " 0755 name keeps foreground", nameColor({row: row, lifted: false}, palette, Format), "foreground")
+        check(fstype + " keeps its reported 0755 permission cell", Format.permissions(row.p), "rwxr-xr-x")
+        check(fstype + " keeps its reported mode after colour lookup", row.p, 0o100755)
+    }
+    check("a normal disk 0755 name stays executable", nameColor({row: {p: 0o100755}, lifted: false}, palette, Format), "executable")
+    check("a normal disk 0644 name stays foreground", nameColor({row: {p: 0o100644}, lifted: false}, palette, Format), "foreground")
+    check("a modeless symlink keeps symlink colour", nameColor({row: {p: 0o120777, x: false}, lifted: false}, palette, Format), "symlink")
+    check("a lifted executable keeps foreground", nameColor({row: {p: 0o100755}, lifted: true}, palette, Format), "foreground")
+
     // Issue 67, jesedv: the yanked path is quoted unless a shell reads every character as itself.
     check("a path a shell reads as one word is handed over as it is",
           Format.shellQuoted("/home/gm/Work-2.0_final"), "/home/gm/Work-2.0_final")
@@ -100,6 +116,17 @@ function run(check) {
         check("a path holding " + JSON.stringify(dangerous) + " is quoted whole",
               Format.shellQuoted("/home/gm/" + dangerous), "'/home/gm/" + dangerous + "'")
     }
+    // One pass: a value is printed as given, so a placeholder inside an earlier value is not filled by a later one.
+    check("fill puts values by number, in any order, every copy",
+          Format.fill("%2 %1 %1", "a", "b") + "|" + Format.fill("%1 and %2 and %3", 1, "two", 3) + "|" + Format.fill("none", 1), "b a a|1 and two and 3|none")
+    check("fill leaves a placeholder with no value, %0 and a lone percent as written",
+          Format.fill("%1 %2", "x") + "|" + Format.fill("%0 %1 % %a 100%", "x"), "x %2|%0 x % %a 100%")
+    check("fill prints a value as a string, a dollar as typed",
+          Format.fill("%1|%1", "$&") + "|" + Format.fill("%1", "$$") + "|" + Format.fill("%1", undefined) + "|" + Format.fill("%1", 0), "$&|$&|$$|undefined|0")
+    check("fill never fills a placeholder that an earlier value holds",
+          Format.fill("%1 %2", "%2", "b") + "|" + Format.fill("%2 %1", "%1", "%1"), "%2 b|%1 %1")
+    check("fill reads one digit, so %10 is value 1 then a zero",
+          Format.fill("%10", "a", "b"), "a0")
     check("and a quote inside the path closes and reopens around itself",
           Format.shellQuoted("/home/gm/a'b"), "'/home/gm/a'\\''b'")
 }

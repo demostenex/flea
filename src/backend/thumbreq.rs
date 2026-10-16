@@ -55,7 +55,7 @@ pub(crate) fn thumb_rows(
                     }
                     Some(m) => m,
                 };
-                match cache.lookup(&path, mtime) {
+                match cache.lookup(&path, mtime, tb.thumbs.fingerprint()) {
                     Hit::Ready(p) => {
                         writeln!(out, "{}", thumbed_line(row, &p.to_string_lossy(), since(t))).ok();
                     }
@@ -102,7 +102,7 @@ pub(crate) fn thumb_rows(
             Some(m) => m,
         };
         let mtime = meta.map(|m| m.mtime()).unwrap_or(0);
-        match cache.lookup(&path, mtime) {
+        match cache.lookup(&path, mtime, tb.thumbs.fingerprint()) {
             Hit::Ready(p) => {
                 writeln!(out, "{}", thumbed_line(row, &p.to_string_lossy(), since(t))).ok();
             }
@@ -118,7 +118,7 @@ pub(crate) fn thumb_rows(
     }
 }
 
-// One entry per queued or running job, so the pool's own queue bound plus the worker count bounds this map too.
+// One entry per queued, waiting or running job, so MAX_QUEUE, MAX_DEFERRED and the worker count bound this map too.
 fn queue_row(
     out: &mut impl Write,
     st: &mut State,
@@ -132,35 +132,51 @@ fn queue_row(
     if st.asked.iter().any(|(p, _)| *p == path) {
         return;
     }
+    // Workers may have freed room since the last report, so pump before refusing a row at the deferred cap.
+    super::thumbdefer::pump(out, st, pool);
+    // corner: past MAX_DEFERRED nothing waits any longer, so the row is answered empty at once; see AGENTS.md "Thumbnail requests".
+    if st.deferred.full() {
+        writeln!(out, "{}", thumbed_line(row, "", 0.0)).ok();
+        return;
+    }
     st.asked.push((path.clone(), row));
     st.outstanding += 1;
-    // A job the pool dropped to make room will never report, so its row is unmapped and answered here rather than at shutdown.
-    for job in pool.submit(Job { path, mtime, mime, trace: trace(row) }) {
-        st.outstanding = st.outstanding.saturating_sub(1);
-        if let Some(at) = st.asked.iter().position(|(p, _)| *p == job.path) {
-            let dropped_row = st.asked.remove(at).1;
-            writeln!(out, "{}", thumbed_line(dropped_row, "", 0.0)).ok();
-        }
+    st.deferred.enqueue(Job { path, mtime, mime, trace: trace(row) });
+    super::thumbdefer::pump(out, st, pool);
+}
+
+// A job already inside a worker keeps its mapping; every queued or waiting job leaves with its cancellation.
+pub(crate) fn cancel_all(st: &mut State, pool: &Pool) {
+    for job in pool.cancel_all().into_iter().chain(st.deferred.take_all()) {
+        forget_one(st, &job.path);
     }
 }
 
 // A job already inside a worker cannot be cancelled, so its row stays mapped until it reports.
-pub(crate) fn cancel_row(st: &mut State, pool: &Pool, row: usize) {
+pub(crate) fn cancel_row(out: &mut impl Write, st: &mut State, pool: &Pool, row: usize) {
     let at = match st.asked.iter().position(|(_, r)| *r == row) {
         Some(i) => i,
         None => return,
     };
-    let dropped = pool.cancel(&st.asked[at].0);
+    // A row still waiting for room is taken back from the deferred queue, and a queued one from the pool.
+    let mut dropped = st.deferred.take(&st.asked[at].0);
+    if dropped.is_empty() {
+        dropped = pool.cancel(&st.asked[at].0);
+    }
     if dropped.is_empty() {
         return;
     }
     st.outstanding = st.outstanding.saturating_sub(dropped.len());
     st.asked.remove(at);
+    // The room a cancel frees goes to the next waiting row now, not at the next report.
+    super::thumbdefer::pump(out, st, pool);
 }
 
 // A result whose path is no longer mapped belongs to a superseded listing and is dropped, never reported against the current one.
-pub(crate) fn report_done(out: &mut impl Write, st: &mut State, done: Done) {
+pub(crate) fn report_done(out: &mut impl Write, st: &mut State, pool: &Pool, done: Done) {
     st.outstanding = st.outstanding.saturating_sub(1);
+    // Workers have taken jobs off the pool since the last pump, so the oldest waiting rows go in now.
+    super::thumbdefer::pump(out, st, pool);
     let row = match st.asked.iter().position(|(p, _)| *p == done.path) {
         Some(i) => st.asked.remove(i).1,
         None => return,
@@ -208,7 +224,7 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::sync::Arc;
 
-    // One jpeg declaration over /usr/bin/false, which reads and writes nothing; the full path only queues under it here and a popped job just exits non-zero.
+    // One jpeg declaration, so for_mime answers; the harness's pool has no worker, so the program it names never runs.
     fn tables() -> Tables {
         let aliases = Arc::new(Aliases::load());
         let thumbs = Arc::new(Thumbnailers::from_entries(
@@ -239,11 +255,10 @@ mod tests {
         }
     }
 
-    fn harness(dir: &TestDir, tb: &Tables) -> (State, Pool, Cache) {
+    fn harness(dir: &TestDir) -> (State, Pool, Cache) {
         let (events, _) = channel();
-        let (results, _) = channel();
         let st = State::new(crate::backend::dirsizeworker::Worker::new(events));
-        let pool = Pool::new(1, results, dir.join("poolcache"), Arc::clone(&tb.aliases), Arc::clone(&tb.thumbs));
+        let pool = Pool::idle();
         let cache = Cache::at(dir.join("cache"));
         (st, pool, cache)
     }
@@ -253,7 +268,7 @@ mod tests {
         let d = TestDir::new("thumbcacheonly");
         d.file("photo.jpg", "not a picture, so no decoder could read it either");
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         listed(&d, &mut st);
         let mut out = Vec::new();
         thumb_rows(&mut out, &[0], &mut st, &tb, &pool, &cache, true);
@@ -261,7 +276,7 @@ mod tests {
         assert!(line.contains(r#""file":"""#), "a miss with no cache entry answers none: {}", line);
         assert_eq!(st.outstanding, 0, "no job may be in flight for a row that was answered");
         assert!(st.asked.is_empty(), "and no mapping may hold it for a later report");
-        pool.cancel_all();
+        assert!(pool.cancel_all().is_empty(), "nothing reaches the pool for a cache-only miss");
     }
 
     #[test]
@@ -270,11 +285,11 @@ mod tests {
         let path = d.file("photo.jpg", "bytes the open is then refused for");
         let mtime = std::fs::metadata(&path).unwrap().mtime();
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         let uri = thumbcache::uri_for(&path);
         let large = cache.large_path(&uri);
         std::fs::create_dir_all(large.parent().unwrap()).unwrap();
-        thumbwrite::write_marker(&large, &uri, mtime).unwrap();
+        thumbwrite::write_marker(&large, &uri, mtime, None).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         listed(&d, &mut st);
         // The window already holds this row's figures, so the request reuses them with no stat.
@@ -285,7 +300,7 @@ mod tests {
         assert!(line.contains(&large.to_string_lossy().into_owned()),
             "the cached entry is served although the source no longer opens: {}", line);
         assert_eq!(st.outstanding, 0, "a served row queues nothing either");
-        pool.cancel_all();
+        assert!(pool.cancel_all().is_empty(), "nothing reaches the pool for a served row");
     }
 
     #[test]
@@ -293,7 +308,7 @@ mod tests {
         let d = TestDir::new("thumbcachedqueue");
         d.file("photo.jpg", "not a picture, and nothing here decodes it");
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         listed(&d, &mut st);
         std::fs::remove_file(d.join("photo.jpg")).unwrap();
         let mut out = Vec::new();
@@ -301,7 +316,7 @@ mod tests {
         assert!(out.is_empty(), "a genuine miss is queued from cached figures, not answered: {}",
             String::from_utf8_lossy(&out));
         assert_eq!(st.outstanding, 1, "the job is in flight from the window's figures alone");
-        pool.cancel_all();
+        assert_eq!(pool.cancel_all().iter().map(|j| j.path.clone()).collect::<Vec<_>>(), vec![d.join("photo.jpg")], "the queued job is the windowed row's own file");
     }
 
     #[test]
@@ -314,7 +329,7 @@ mod tests {
         assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o644) }, 0, "fixture fifo must exist");
         std::os::unix::fs::symlink(&fifo, d.join("link.jpg")).unwrap();
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         st.base = d.path().to_path_buf();
         let mut l = Listing::new();
         l.push("link.jpg", false);
@@ -329,7 +344,7 @@ mod tests {
         assert!(line.contains(r#""file":"""#), "a symlink to a fifo answers none: {}", line);
         assert_eq!(st.outstanding, 0, "no job may queue for a fifo target");
         assert!(st.asked.is_empty(), "and no mapping may hold it");
-        pool.cancel_all();
+        assert!(pool.cancel_all().is_empty(), "nothing reaches the pool for a fifo target");
     }
 
     #[test]
@@ -343,7 +358,7 @@ mod tests {
         let target_mtime = std::fs::metadata(&target).unwrap().mtime();
         let link_mtime = std::fs::symlink_metadata(d.join("link.jpg")).unwrap().mtime();
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         st.base = d.path().to_path_buf();
         let mut l = Listing::new();
         l.push("link.jpg", false);
@@ -379,11 +394,11 @@ mod tests {
         let link_mtime = std::fs::symlink_metadata(&link).unwrap().mtime();
         assert_ne!(target_mtime, link_mtime, "the mtimes must differ to tell the two keys apart");
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         let uri = thumbcache::uri_for(&link);
         let large = cache.large_path(&uri);
         std::fs::create_dir_all(large.parent().unwrap()).unwrap();
-        thumbwrite::write_marker(&large, &uri, target_mtime).unwrap();
+        thumbwrite::write_marker(&large, &uri, target_mtime, None).unwrap();
         st.base = d.path().to_path_buf();
         let mut l = Listing::new();
         l.push("link.jpg", false);
@@ -397,7 +412,7 @@ mod tests {
         assert!(line.contains(&large.to_string_lossy().into_owned()),
             "a cached symlink answers its entry under cacheOnly: {}", line);
         assert_eq!(st.outstanding, 0, "a served row queues nothing");
-        pool.cancel_all();
+        assert!(pool.cancel_all().is_empty(), "nothing reaches the pool for a served symlink");
     }
 
     #[test]
@@ -405,7 +420,7 @@ mod tests {
         let d = TestDir::new("thumbfull");
         d.file("photo.jpg", "not a picture, and nothing here decodes it");
         let tb = tables();
-        let (mut st, pool, cache) = harness(&d, &tb);
+        let (mut st, pool, cache) = harness(&d);
         listed(&d, &mut st);
         let mut out = Vec::new();
         thumb_rows(&mut out, &[0], &mut st, &tb, &pool, &cache, false);
@@ -413,6 +428,37 @@ mod tests {
             String::from_utf8_lossy(&out));
         assert_eq!(st.outstanding, 1, "the job is in flight as it always was");
         assert_eq!(st.asked.len(), 1, "and the mapping holds it for the report");
-        pool.cancel_all();
+        assert_eq!(pool.cancel_all().iter().map(|j| j.path.clone()).collect::<Vec<_>>(), vec![d.join("photo.jpg")], "the queued job is the row's own file");
+    }
+
+    // Sample input: a photo.jpg whose fail marker was written under marker_table, or under the loaded table when None; answers the wire, the jobs in flight and the jobs queued.
+    fn answer_with_marker(tag: &str, marker_table: Option<&str>) -> (String, usize, usize) {
+        let d = TestDir::new(tag);
+        let path = d.file("photo.jpg", "not a picture, and nothing here decodes it");
+        let mtime = std::fs::metadata(&path).unwrap().mtime();
+        let tb = tables();
+        let (mut st, pool, cache) = harness(&d);
+        let uri = thumbcache::uri_for(&path);
+        let marker = cache.fail_path(&uri);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        thumbwrite::write_marker(&marker, &uri, mtime, Some(marker_table.unwrap_or(tb.thumbs.fingerprint()))).unwrap();
+        listed(&d, &mut st);
+        let mut out = Vec::new();
+        thumb_rows(&mut out, &[0], &mut st, &tb, &pool, &cache, false);
+        (String::from_utf8(out).unwrap(), st.outstanding, pool.cancel_all().len())
+    }
+
+    #[test]
+    fn a_failure_recorded_under_the_loaded_table_answers_none_and_queues_nothing() {
+        let (line, outstanding, queued) = answer_with_marker("thumbfailsame", None);
+        assert!(line.contains(r#""file":"""#), "a recorded failure answers none: {}", line);
+        assert_eq!((outstanding, queued), (0, 0), "and no decode is queued for it");
+    }
+
+    #[test]
+    fn a_failure_recorded_under_another_table_is_tried_again() {
+        let (line, outstanding, queued) = answer_with_marker("thumbfailother", Some("an older table"));
+        assert!(line.is_empty(), "a marker from another table is a miss, queued and not answered: {}", line);
+        assert_eq!((outstanding, queued), (1, 1), "the file is tried once more");
     }
 }

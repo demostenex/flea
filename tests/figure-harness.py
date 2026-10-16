@@ -1,4 +1,5 @@
 # Execute the figure suite's real shell fragments with controlled lower-layer failures.
+import hashlib
 import json
 import os
 import pathlib
@@ -297,7 +298,7 @@ QtObject {
                                          XDG_CACHE_HOME=str(box / "qml-cache")),
                                 capture_output=True, text=True, timeout=FRAGMENT_BOUND_SECONDS)
         component_output = result.stdout + result.stderr
-        component_ok = result.returncode == 0 and "figure-component: 20 check(s), 0 failed" in component_output
+        component_ok = result.returncode == 0 and "figure-component: 24 check(s), 0 failed" in component_output
         check(component_ok, "mx2a F31/F32 and mx2b F37/F38 one request per creation and per burst, an equal ask dropped, the exact failed-inline fence"
               + ("" if component_ok else ": " + component_output.strip()))
     else:
@@ -539,7 +540,13 @@ for path in ("ui/vendor/figure-helper.mjs", "src/backend/sandbox.rs", "ui/js/Fig
              "tests/markdown-figures.qml", "tools/vendor-js/build.sh"):
     recorded = re.search(re.escape(f"`{path}`") + r"(?: at |\s\d+ to )(\d+)", budget_paragraph)
     actual = len((tree / path).read_text().splitlines())
-    check(recorded is not None and int(recorded[1]) == actual,
+    matches = recorded is not None and int(recorded[1]) == actual
+    if path == "src/backend/sandbox.rs":
+        # Sample receipt: `src/backend/sandbox.rs` 365 to 401 (source sha256 4a732e3e123e01ee68dae16d2cb4cd623a87a13e4aeb067872bc12f64477319f).
+        receipt = re.search(re.escape(f"`{path}`")
+                            + r"\s\d+ to \d+ \(source sha256 ([0-9a-f]{64})\)", budget_paragraph)
+        matches = matches and receipt is not None and receipt[1] == hashlib.sha256((tree / path).read_bytes()).hexdigest()
+    check(matches,
           f"mx2a F29 mx2 records the final {path} line count ({actual})")
 sandbox = (tree / "src/backend/sandbox.rs").read_text()
 check("const READONLY_PREFIX_ARGS: usize = 4;" in sandbox
@@ -547,9 +554,9 @@ check("const READONLY_PREFIX_ARGS: usize = 4;" in sandbox
       and "READONLY_PREFIX_ARGS + ro_binds.len() * READONLY_BIND_ARGS" in sandbox,
       "mx2a F30 read-only sandbox prefix and bind argument counts are named")
 service_source = (tree / "ui/FigureService.qml").read_text()
-# Sample input: `pub const REFUSED: i32 = 127;` in src/figurehelper.rs.
+# Sample input: `const REFUSED: i32 = 127;` in src/figurehelper.rs.
 def rust_refusal(source):
-    found = re.search(r"(?m)^pub const REFUSED: i32 = (\d+);", source)
+    found = re.search(r"(?m)^(?:pub )?const REFUSED: i32 = (\d+);", source)
     return int(found[1]) if found else None
 
 
@@ -566,7 +573,7 @@ check(rust_status is not None and rust_status == qml_status
       and "REFUSED in src/figurehelper.rs" in service_source
       and "exitCode === root.refusalExit" in service_source,
       f"mx2a F35 and F38 the QML refusal status ({qml_status}) equals the Rust REFUSED ({rust_status})")
-sample_rust = "pub const REFUSED: i32 = 127;\n"
+sample_rust = "const REFUSED: i32 = 127;\n"
 sample_qml = "    readonly property int refusalExit: 127\n"
 check(rust_refusal(sample_rust) == qml_refusal(sample_qml) == 127
       and rust_refusal(sample_rust.replace("127", "126")) != qml_refusal(sample_qml)

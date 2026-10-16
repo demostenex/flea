@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The multi-row Permissions card's advloop findings, driven against the shipped dialog; offscreen.
+. "$(dirname "$0")/headless-commons.sh"
+# The multi-row Permissions card's review findings, driven against the shipped dialog; offscreen.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
 cd "$(dirname "$0")/.." || exit 1
@@ -25,7 +26,7 @@ mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/ru
 chmod 700 "$test_root/runtime" || exit 1
 # The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
 ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
 cp tests/permissions-adv.qml "$test_root/config/shell.qml" || exit 1
 cp tests/permissions-columns.js "$test_root/config/permissions-columns.js" || exit 1
@@ -50,7 +51,7 @@ if [ "$done_count" -ne 1 ]; then
     printf 'FAIL completion receipts %s, want exactly 1 DONE beside the PASS\n' "$done_count"
     verdict=1
 fi
-expected_checks=297
+expected_checks=304
 if [ "$pass_count" -ne "$expected_checks" ] || [ "$fail_count" -ne 0 ]; then
     printf 'FAIL the permissions dialog missed a finding: pass=%s fail=%s want %s/0\n' "$pass_count" "$fail_count" "$expected_checks"
     printf '%s\n' "$output" | grep -aE 'PERMADV|ERROR|error'

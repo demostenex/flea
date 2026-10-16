@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Drive production previews offscreen with the real 120ms timer, then repeat in seeded manual mode.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -33,7 +34,7 @@ run_phase() {
         cp -- "$test_root/images/img0.jpg" "$test_root/images/img$index.jpg" || exit 1
     done
     ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-    ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+    headless_commons "$test_root" || exit 1
     ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
     cp tests/preview-settle-live.qml "$test_root/config/shell.qml" || exit 1
     if [ -n "$seed" ]; then
@@ -61,7 +62,7 @@ run_phase() {
     fail_count=$(printf '%s\n' "$output" | grep -ac 'PREVIEWSETTLE FAIL')
     done_count=$(printf '%s\n' "$output" | grep -ac 'PREVIEWSETTLE DONE')
     clean_count=$(printf '%s\n' "$output" | grep -acE 'PREVIEWSETTLE DONE failures=0$')
-    expected=38
+    expected=41
     [ "$label" = manual ] && expected=3
     warnings=$(printf '%s\n' "$output" | grep -aiE 'WARN|ERROR|TypeError|ReferenceError|not ready|not a type|is not defined|file not found' || true)
     if [ "$code" -ne "$self_kill_exit" ] || [ "$done_count" -ne 1 ] || [ "$clean_count" -ne 1 ] \

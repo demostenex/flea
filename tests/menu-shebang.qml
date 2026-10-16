@@ -35,8 +35,11 @@ ShellRoot {
         property bool rowHasShebang: false
         property var columnsArea: null
         property var menuActions: ({ready: true, requestId: 1})
+        function selectedIndices() { return [] }
+        function menuSelectionIdentity() { return "[]" }
         function contextMenu() {
-            return {visible: true, hasRow: true, entries: [], cursor: 0, submenuOpen: false,
+            // visible without opened is a menu in its close fade.
+            return {visible: true, opened: false, hasRow: true, entries: [], cursor: 0, submenuOpen: false,
                 submenuCursor: 0, submenuEntries: [], frameItem: null, submenuFrameItem: null,
                 workArea: {}, forHeader: false, forRail: false}
         }
@@ -51,6 +54,8 @@ ShellRoot {
         property bool rowHasShebang: false
         property var columnsArea: null
         property var menuActions: stubPane.menuActions
+        function selectedIndices() { return [] }
+        function menuSelectionIdentity() { return "[]" }
         function contextMenu() { return stubPane.contextMenu() }
     }
     Flea.Ipc { id: ipc; pane: stubPane; fleaWindow: windowStub }
@@ -69,6 +74,7 @@ ShellRoot {
         if (root.phase === 0) {
             root.check("script-receipt", s.shebangReply.path === root.scriptPath && s.shebangReply.id === 1
                 && s.shebangReply.hasShebang === true && s.shebangHas === true)
+            root.check("a menu fading out reads closed", s.opened === false)
             root.phase = 1
             root.ask(root.notesPath, 2)
             s = root.state()

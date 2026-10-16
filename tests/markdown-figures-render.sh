@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Render this checkout's Markdown figures with the real helper, checking geometry, ink, fallback and request history.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -46,7 +47,7 @@ mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/ca
 chmod 700 "$test_root/runtime" || exit 1
 # The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
 ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
 cp tests/markdown-figures-render.js "$test_root/config/" || exit 1
 cp tests/markdown-figures-render.qml "$test_root/config/shell.qml" || exit 1
@@ -315,7 +316,7 @@ if [ -n "${FLEA_CI_SUITE_LOGS:-}" ]; then
     cp "$test_root/md3u-cases.png" "$FLEA_CI_SUITE_LOGS/markdown-md3u-geometry.png" || exit 1
 fi
 
-# Nesting and inline maths: the controller's ql-markdown-nesting fixture, a formula pair for ink, a failing formula, a repeat and one far below the cache.
+# Nesting and inline maths: the ql-markdown-nesting fixture, a formula pair for ink, a failing formula, a repeat and one far below the cache.
 draw_dir="$test_root/draw"
 mkdir -p "$draw_dir" || exit 1
 cat > "$draw_dir/nesting.md" <<'EOF'

@@ -21,6 +21,33 @@ ShellRoot {
     // e80q: the held Quick Look move's pre-landing path and mid-frame count.
     property string qlOld: ""
     property int qlMid0: 0
+    // A burst inside Quick Look's open hold: its settle and cap Timers, and what happened while the settle ran.
+    property var holdSettle: null
+    property var holdCap: null
+    property bool holdWatch: false
+    property bool holdReadySettling: false
+    property int holdReadyDrops: 0
+    property bool holdLandSettling: false
+    property double holdStopAt: 0
+    property double holdLandAt: 0
+    property int holdCaps: 0
+    // Far past the settle, so only the settle's own stop can land the open before the cap.
+    readonly property int holdCapMs: 5000
+    property string holdPhase: ""
+    property double holdDeadline: 0
+    property bool holdTimedOut: false
+    readonly property int holdSetupMs: 2500
+    readonly property int holdLandingMs: 2000
+
+    function holdDetail() {
+        return "phase=" + root.holdPhase + " ready=" + root.holdReadySettling
+            + " readyDrops=" + root.holdReadyDrops + " lookReady=" + quick.lookReady + " sizeWait=" + quick.sizeWait + " status=" + quick.status
+            + " settling=" + (root.holdSettle !== null && root.holdSettle.running)
+            + " capRunning=" + (root.holdCap !== null && root.holdCap.running)
+            + " landSettling=" + root.holdLandSettling + " stopAt=" + root.holdStopAt + " landAt=" + root.holdLandAt
+            + " caps=" + (quick.revealCaps - root.holdCaps) + " early=" + quick.revealedEarly
+            + " timeout=" + root.holdTimedOut
+    }
 
     function buildRows() {
         var rows = []
@@ -45,6 +72,15 @@ ShellRoot {
     function step(index) {
         pane.cursorIndex = index
         preview.followSelection()
+    }
+
+    function quickTimer(test) {
+        for (var i = 0; i < quick.resources.length; i++) {
+            var t = quick.resources[i]
+            if (t instanceof Timer && test(t))
+                return t
+        }
+        return null
     }
 
     function later(ms) {
@@ -193,6 +229,7 @@ ShellRoot {
         }
     }
 
+    // landed is per open: it gates only the stage after the img1 reopen, whose move needs that open landed.
     Timer {
         id: qpoll
         interval: 10
@@ -200,7 +237,7 @@ ShellRoot {
         property double deadline: 0
         property string want: ""
         onTriggered: {
-            if (quick.path === qpoll.want) {
+            if (quick.path === qpoll.want && quick.landed) {
                 qpoll.stop()
                 root.go(root.stage + 1)
             } else if (Date.now() > qpoll.deadline) {
@@ -208,6 +245,60 @@ ShellRoot {
                 root.failures.push("timeout waiting for quick path " + qpoll.want)
                 root.done()
             }
+        }
+    }
+
+    Connections {
+        target: root.holdWatch ? quick : null
+        function onLookReadyChanged() {
+            if (root.holdPhase === "settle" && !quick.lookReady)
+                root.holdReadyDrops += 1
+            if (quick.lookReady && root.holdSettle.running)
+                root.holdReadySettling = true
+        }
+        function onLandedChanged() {
+            if (!quick.landed)
+                return
+            root.holdLandAt = Date.now()
+            if (root.holdSettle.running)
+                root.holdLandSettling = true
+        }
+    }
+
+    Connections {
+        target: root.holdWatch ? root.holdSettle : null
+        function onRunningChanged() {
+            if (root.holdPhase === "settle" && !root.holdSettle.running) {
+                root.holdStopAt = Date.now()
+                console.log("PREVIEWSETTLE HOLD stopped " + root.holdDetail())
+            }
+        }
+    }
+
+    Timer {
+        id: holdPoll
+        interval: 10
+        repeat: true
+        onTriggered: {
+            if (Date.now() > root.holdDeadline) {
+                root.holdTimedOut = true
+                console.log("PREVIEWSETTLE HOLD watchdog " + root.holdDetail())
+            } else if (root.holdPhase === "setup") {
+                if (!quick.lookReady || quick.path !== root.imagePath(3) || !root.holdSettle.running)
+                    return
+                root.holdReadySettling = true
+                // Hold only decode setup; restore and run the production 120ms settle before observing its stop.
+                root.holdSettle.interval = quick.followSettleMs
+                root.holdSettle.restart()
+                root.holdPhase = "settle"
+                root.holdDeadline = Date.now() + root.holdLandingMs
+                console.log("PREVIEWSETTLE HOLD ready " + root.holdDetail())
+                return
+            } else if (!quick.landed) {
+                return
+            }
+            holdPoll.stop()
+            root.go(root.stage + 1)
         }
     }
 
@@ -428,6 +519,42 @@ ShellRoot {
             root.check("quick held move lands whole", quick.path === root.imagePath(2)
                 && quick.swapState().midFrames === root.qlMid0,
                 "mid=" + quick.swapState().midFrames + " mid0=" + root.qlMid0)
+            quick.close()
+            root.later(150)
+        },
+        function () {
+            // No captured listing row: a same-file reload must not toggle the independent image-metadata readiness gate.
+            pane.cursorIndex = -1
+            quick.lastMoveAt = 0
+            quick.follow(root.imagePath(3), "image-x-generic", 1003, "")
+            root.holdSettle = root.quickTimer(function (t) { return t.interval === quick.followSettleMs })
+            root.holdCap = root.quickTimer(function (t) { return t.running && t.interval !== quick.followSettleMs && t.interval !== quick.stripHideMs })
+            root.holdCaps = quick.revealCaps
+            if (root.holdCap)
+                root.holdCap.interval = root.holdCapMs
+            root.holdWatch = root.holdSettle !== null
+            root.holdPhase = "setup"
+            if (root.holdWatch)
+                root.holdSettle.interval = root.holdCapMs
+            quick.follow(root.imagePath(4), "image-x-generic", 1004, "")
+            quick.follow(root.imagePath(3), "image-x-generic", 1003, "")
+            if (root.holdWatch && quick.lookReady && root.holdSettle.running)
+                root.holdReadySettling = true
+            root.check("quick burst inside the hold trails", root.holdWatch && root.holdCap !== null
+                && root.holdSettle.running && quick.unrevealed && quick.path === root.imagePath(3),
+                "settle=" + (root.holdSettle !== null) + " cap=" + (root.holdCap !== null) + " unrevealed=" + quick.unrevealed)
+            root.holdDeadline = Date.now() + root.holdSetupMs
+            holdPoll.start()
+        },
+        function () {
+            root.holdWatch = false
+            var detail = root.holdDetail()
+            root.check("quick hold burst lands nothing while settling", root.holdReadySettling
+                && root.holdReadyDrops === 0 && !root.holdLandSettling, detail)
+            root.check("quick hold burst lands once the settle stops", !root.holdTimedOut
+                && root.holdStopAt > 0 && root.holdLandAt >= root.holdStopAt && quick.landed
+                && quick.path === root.imagePath(3) && root.holdSettle.interval === quick.followSettleMs
+                && quick.revealCaps === root.holdCaps && !quick.revealedEarly && root.holdCap.running, detail)
             root.done()
         }
     ]

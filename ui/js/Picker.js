@@ -3,6 +3,13 @@
 .import "Format.js" as Format
 .import "Thumbs.js" as Thumbs
 
+// Whole sentences with "%1" for a value, filled by fill so each translates as one.
+var WORDS = {
+    requestedBy: "Requested by %1",
+    selectedWithSize: "%1 selected · %2",
+    hintsEsc: "%1 · Esc cancel"
+}
+
 // The portal request tools/flea-portal puts in FLEA_PICKER, and the answer ui/picker.qml writes
 // back. Everything here is pure so tests/js/picker.js can drive it without a window.
 
@@ -45,6 +52,7 @@ function request(text) {
         accept: String(read.accept || ""),
         multiple: read.multiple === true,
         directory: read.directory === true,
+        hidden: typeof read.hidden === "boolean" ? read.hidden : undefined,
         folder: String(read.folder || ""),
         file: String(read.file || ""),
         name: String(read.name || ""),
@@ -69,14 +77,15 @@ function title(req) {
 // Only a portal identity is ever shown here. A host application has none, and inventing one from
 // the window title would put a name the desktop never vouched for under a trusted-looking label.
 function subtitle(req) {
-    return req.app.length > 0 ? "Requested by " + req.app : ""
+    return req.app.length > 0 ? Format.fill(WORDS.requestedBy, req.app) : ""
 }
 
 // The primary button. The count rides on it in the multiple case, which is the board's "Send 3".
 function acceptLabel(req, count) {
     var base = req.accept.length > 0 ? req.accept : defaultAccept(req)
+    // The count goes in first and the caller's own text last, so a placeholder in it is never filled in.
     if (req.multiple && count > 1) {
-        return base + " " + Format.count(count)
+        return "%2 %1".arg(Format.count(count)).arg(base)
     }
     return base
 }
@@ -96,7 +105,7 @@ function statusLine(count, bytes) {
     if (count === 0) {
         return "0 selected"
     }
-    return Format.count(count) + " selected · " + Format.size(bytes)
+    return Format.fill(WORDS.selectedWithSize, Format.count(count), Format.size(bytes))
 }
 
 // The footer's right half, which says only the keys this mode actually answers.
@@ -105,11 +114,28 @@ function hints(req) {
         return "Enter save · Esc cancel"
     }
     var pick = req.multiple ? (req.directory ? "Enter open · Space mark folder" : "Space select · Enter open/send") : "Enter open"
-    return pick + " · Esc cancel"
+    return Format.fill(WORDS.hintsEsc, pick)
 }
 
-// The chip row: the caller's filters, then All files, which is always explicit. An empty list is no
-// row at all, because a chooser with one chip is a chooser with nothing to choose between.
+// The collision review's error line, one template so a placeholder inside the name is never filled in.
+function collisionLine(name) {
+    return "%1 already exists here.".arg(name)
+}
+
+// Where a name's stem ends: at its last dot, and a leading dot belongs to the stem.
+function stemEnd(name) {
+    var dot = String(name).lastIndexOf(".")
+    return dot > 0 ? dot : String(name).length
+}
+
+// Callout 12: Back, Up, the rail, the list, Filename, the filter, Cancel and the answer; a hidden or disabled stop is skipped.
+function tabOrder(stops) {
+    return [].concat(stops.chrome, [stops.rail, stops.view], stops.save, stops.answers)
+        .filter(function(item) { return item.visible && item.enabled && item.activeFocusOnTab })
+}
+
+// The filter menu's rows: the caller's filters, then All files, which is always explicit. No filters is no
+// dropdown at all, because a chooser with one filter is a chooser with nothing to choose between.
 function chips(req) {
     if (req.filters.length === 0) {
         return []
@@ -122,22 +148,7 @@ function chips(req) {
     return out
 }
 
-// Room the path label always keeps, so a narrow window still names where the list stands.
-var CHIP_PATH_MIN = 96
-
-// Sample input: chipStripWidth(300, 400, 96) answers 204, chipStripWidth(300, 100, 96) answers 100.
-function chipStripWidth(free, chipsWidth, pathMin) {
-    if (!(free > 0) || !(chipsWidth > 0)) {
-        return 0
-    }
-    var keep = pathMin > 0 ? pathMin : 0
-    if (free <= keep) {
-        return 0
-    }
-    return Math.min(chipsWidth, free - keep)
-}
-
-// Which chip starts active: the caller's current_filter when it names one of them, else the first.
+// Which filter starts current: the caller's current_filter when it names one of them, else the first.
 function currentChip(req) {
     if (req.filters.length === 0) {
         return -1
@@ -195,7 +206,21 @@ function validName(name) {
 }
 
 // What both the strip and the status line say about a name validName() refuses, in ops.rs's words.
-var NAME_REFUSED = "a name cannot be empty, . or .. , or contain a separator"
+var NAME_REFUSED = "a name cannot be empty, . or .., or contain /"
+// Status lines are whole sentences with placeholders, filled by Format.fill.
+var SAVE_REFUSED = "%1 cannot be used: %2"
+var SAVE_EXISTS = "%1 already exists here. Review it before you continue."
+
+// Whole sentences for the selection check, filled by Format.fill; singular and plural are two sentences.
+var NOTES = {
+    skippedOne: "Selected %1 of %2. 1 was left out: %3 (%4).",
+    skippedMany: "Selected %1 of %2. %3 were left out: %4 (%5) and %6 more."
+}
+
+// A name is one token to the wrapper, so its segment joints carry zero-width breaks; zero width keeps one-line draws identical.
+function jointName(name) {
+    return String(name).replace(/([._-])/g, "$1\u200b")
+}
 
 var DOUBLE_OPEN = "open"
 var DOUBLE_MARK = "mark"

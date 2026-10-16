@@ -79,6 +79,7 @@ var PATHS = {
     "file-text": "M4 22V2h10l6 6v14H4z M14 2v6h6 M8 9h2 M8 13h8 M8 17h8",
     // LanguageMarks' Markdown mark, Flea's cut of dcurtis/markdown-mark (CC0): the frame, the M and the down arrow in one stroke.
     "markdown": "M2 5h20v14H2z M5.5 15V9l3 3.5 3-3.5v6 M17 9v6 M14.5 12.5 17 15l2.5-2.5",
+    "html": "M4 2h16l-1.5 17L12 22l-6.5-3z M15.5 6.5h-7V11h7v5L12 17.5 8.5 16",
     "code": "M16 18l6-6-6-6 M8 6l-6 6 6 6",
     "image": "M3 3h18v18H3z M7 9A2 2 0 1 0 11 9A2 2 0 1 0 7 9Z M21 15l-3-3L6 21",
     "film": "M3 3h18v18H3z M7 3v18 M3 7.5h4 M3 12h18 M3 16.5h4 M17 3v18 M17 7.5h4 M17 16.5h4",
@@ -135,6 +136,7 @@ var PATHS = {
     "eye-off": "M12 5 22 12 12 19 2 12z M10 10h4v4h-4z M4 4l16 16",
     // Replaces the "▸" Text the menu used to draw, so it stops mixing a font dingbat into a path language.
     "chevron-right": "M9 18l6-6-6-6",
+    "chevron-down": "M6 9l6 6 6-6",
     "chevron-left": "M15 18l-6-6 6-6",
     // The window chrome's own five marks, added with the bar that draws them.
     "arrow-left": "M19 12H5 M12 19l-7-7 7-7",
@@ -151,12 +153,16 @@ var PATHS = {
     "alert": "M12 2 23 21H1z M12 10v4 M12 18L12.01 18",
     // The Locked pane state draws this beside it: the shackle is a real curve so it stays an arc, and the keyhole is the same dot technique.
     "lock": "M4 11h16v10H4z M8 11V7a4 4 0 0 1 8 0v4 M12 15h.01",
+    // The compress submenu's With-password row: a bow ring, a shaft and two teeth; the bow is a true circle under the cut.
+    "key": "M3 7a4 4 0 1 0 8 0a4 4 0 1 0-8 0 M10.5 10.5l8 8 M16 16l2.5-2.5 M18.5 18.5l1.5-1.5",
     // The operations rows the archive and convert subsystems draw, from the spec's own glyph shelf.
     "archive-out": "M2 3h20v5H2z M4 8v13h16V8 M12 18v-6 M9 15l3-3 3 3",
     // The Move to Dropbox row, which the canvas draws with the network mark.
     "network": "M9 2h6v6H9z M2 16h6v6H2z M16 16h6v6h-6z M12 8v4 M5 16v-4h14v4",
     // The convert popup's checkbox mark.
     "check": "M4 12l6 6L20 6",
+    // The Tags row's mark: a square-cornered price tag with its hole as a SquareCap dot.
+    "tag": "M3 3h7l11 11-7 7L3 10z M7.5 7.5L7.51 7.5",
     // The PDF viewer's own three, recut sharp like the rest of the set; "maximize" is lucide's
     // name for the mark the canvas calls expand.
     "minus": "M5 12h14",

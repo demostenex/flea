@@ -1,12 +1,15 @@
+.import "../../ui/js/Format.js" as Format
 .import "../../ui/js/Picker.js" as Picker
 .import "../../ui/js/Sort.js" as Sort
 .import "../../ui/js/Keymap.js" as Keymap
 .import "sourcefixture.js" as Source
 
 .import "pickerkeys.js" as PickerKeys
+.import "pickerhidden.js" as PickerHidden
 
 function run(check) {
     PickerKeys.run(check)
+    PickerHidden.run(check)
     // The shape tools/flea-portal writes for an OpenFile with two filters, taken from its request_for().
     var asked = JSON.stringify({
         mode: "open", title: "Send to unraid", app: "", accept: "Send", multiple: true,
@@ -35,10 +38,37 @@ function run(check) {
     // A host application has no portal identity, and nothing else may be shown as one.
     check("no app id draws no requester line", Picker.subtitle(req), "")
     check("an app id is named", Picker.subtitle(Picker.request('{"app":"org.gnome.gedit"}')), "Requested by org.gnome.gedit")
+    check("the requester is one template with the caller's text kept whole", Picker.subtitle(Picker.request('{"app":"a%1b"}')), "Requested by a%1b")
 
     check("the accept label carries the count", Picker.acceptLabel(req, 3), "Send 3")
+
+    // The collision review: one template, the name kept whole, and the stem the field selects.
+    check("the collision line is one template", Picker.collisionLine("report.txt"), "report.txt already exists here.")
+    check("a name holding a placeholder is kept whole", Picker.collisionLine("a%1b.txt"), "a%1b.txt already exists here.")
+    check("the stem ends at the last dot", Picker.stemEnd("Downloading the Source.html"), 22)
+    check("a double extension keeps its first part in the stem", Picker.stemEnd("a.tar.gz"), 5)
+    check("a name with no dot is all stem", Picker.stemEnd("README"), 6)
+    check("a leading dot is part of the stem", Picker.stemEnd(".bashrc"), 7)
+    check("an empty name has an empty stem", Picker.stemEnd(""), 0)
+
+    // Callout 12: Back, Up, the rail, the list, Filename, the filter, Cancel and the answer; a hidden or disabled stop is skipped.
+    function stop(name, off) { return { name: name, visible: off !== "hidden", enabled: off !== "disabled", activeFocusOnTab: true } }
+    function walk(over) {
+        var filter = stop("Filter", over.filter)
+        var stops = { chrome: [stop("Back", over.back), stop("Up")], rail: stop("Rail"), view: stop(over.view || "List"),
+            save: over.save ? [stop("Filename")] : [], answers: [filter, stop("Cancel"), stop("Answer", over.answer)] }
+        return Picker.tabOrder(stops).map(function(item) { return item.name }).join(",")
+    }
+    check("an open walks the chrome, rail, list, filter, Cancel, answer", walk({}), "Back,Up,Rail,List,Filter,Cancel,Answer")
+    check("an open with no filters has no filter stop", walk({ filter: "hidden" }), "Back,Up,Rail,List,Cancel,Answer")
+    check("a save puts Filename after the list and before the filter", walk({ save: true }), "Back,Up,Rail,List,Filename,Filter,Cancel,Answer")
+    check("a save with no filters goes from Filename to Cancel", walk({ save: true, filter: "hidden" }), "Back,Up,Rail,List,Filename,Cancel,Answer")
+    check("a disabled Back is skipped", walk({ back: "disabled" }), "Up,Rail,List,Filter,Cancel,Answer")
+    check("an answer that cannot be taken is skipped", walk({ answer: "disabled" }), "Back,Up,Rail,List,Filter,Cancel")
+    check("the grid takes the list's place", walk({ view: "Grid", save: true }), "Back,Up,Rail,Grid,Filename,Filter,Cancel,Answer")
     check("and groups a four-figure one", Picker.acceptLabel(req, 1204), "Send 1,204")
     check("one file does not carry a count", Picker.acceptLabel(req, 1), "Send")
+    check("a caller's label is substituted once and never re-scanned", Picker.acceptLabel(Picker.request('{"accept":"Se%2nd","multiple":true}'), 3), "Se%2nd 3")
     check("no accept label falls back to Open", Picker.acceptLabel(Picker.request("{}"), 0), "Open")
     check("a folder request falls back to Choose folder", Picker.acceptLabel(Picker.request('{"directory":true}'), 0), "Choose folder")
 
@@ -99,6 +129,14 @@ function run(check) {
     // and the window has to be the thing that refuses it.
     check("a traversal survives the request unchanged", Picker.request('{"name":"../../pwn"}').name, "../../pwn")
     check("and the request's own name is then refused", Picker.validName(Picker.request('{"name":"../../pwn"}').name), false)
+
+    // The save card's lines are whole templates; each rendered line equals today's string except for the zero-width joints.
+    check("the refused line is one whole sentence",
+        Format.fill(Picker.SAVE_REFUSED, "export.txt", Picker.NAME_REFUSED),
+        "export.txt cannot be used: a name cannot be empty, . or .., or contain /")
+    check("the collision line is one whole sentence",
+        Format.fill(Picker.SAVE_EXISTS, Picker.jointName("export.txt")),
+        "export.\u200btxt already exists here. Review it before you continue.")
 
     check("a path joins under its directory", Picker.join("/home/gm", "a.txt"), "/home/gm/a.txt")
     check("the root does not double its slash", Picker.join("/", "etc"), "/etc")
@@ -168,11 +206,9 @@ function run(check) {
     check("a second tap on another path is a single tap", Picker.sameTap("/a/b.txt", "/a/c.txt"), false)
     check("a second tap with no first tap is a single tap", Picker.sameTap("", "/a/b.txt"), false)
     check("a second tap with no path is a single tap", Picker.sameTap("/a/b.txt", ""), false)
-    // Issue #224: the chips take room first and the path gives way, keeping its minimum.
-    check("a strip that fits takes it all", Picker.chipStripWidth(300, 100, 96), 100)
-    check("chips take room first and the path keeps its minimum", Picker.chipStripWidth(300, 400, 96), 204)
-    check("a strip wider than the free width still scrolls", Picker.chipStripWidth(200, 400, 96), 104)
-    check("no free width leaves the path whole", Picker.chipStripWidth(50, 400, 96), 0)
+    // The chip row is gone, so its width helper and the path minimum it kept leave with it.
+    check("the chip strip width helper is gone", typeof Picker.chipStripWidth, "undefined")
+    check("the chip path minimum is gone", typeof Picker.CHIP_PATH_MIN, "undefined")
 
     // Issue #225: the Mac preset's Return/Enter looks up as rename yet still activates.
     var none = Qt.NoModifier
@@ -266,4 +302,81 @@ function run(check) {
     readReply(listing, worker, '{"t":"paths","paths":["/b/obsolete"]}')
     check("F43 obsolete worker forwards nothing", listing.replies.length, 2)
     check("F33 obsolete worker accepts no paths request", requestPaths(worker, false, [0], obsoleteRequest), false)
+
+    // Picker sort persistence: requesting sort remembers folder sort and updates default sort leaf
+    var sortSlice = Source.slice(winSrc, "function requestSort(order) {", "function filterRequest()").trim()
+    var factory = new Function("win", "backend", "ViewState", "listing", "return (" + sortSlice + ")")
+    var remembered = [], leafChanges = []
+    var winMock = { sortable: true, recent: false, path: "/home/gm/Downloads", windowSize: 100, pendingListings: 0,
+                    clearListing: function() {}, actionFocus: function() {},
+                    restoreActionFocus: function() {} }
+    var backendMock = { sortBy: "name", sortDesc: false,
+                        rememberFolderSort: function(path, key, desc) { remembered.push({ path: path, key: key, desc: desc }) } }
+    var viewMock = { state: { foldersFirst: true, groupByKind: false },
+                     changeLeaf: function(key, leaf) { leafChanges.push({ key: key, leaf: leaf }) } }
+    var listMock = { sort: function() {}, window: function() {} }
+    var runSort = factory(winMock, backendMock, viewMock, listMock)
+    runSort({ key: "mtime", desc: true })
+    check("picker sort remembers folder sort", JSON.stringify(remembered),
+          JSON.stringify([{ path: "/home/gm/Downloads", key: "mtime", desc: true }]))
+    check("picker sort updates ViewState sort leaf", JSON.stringify(leafChanges),
+          JSON.stringify([{ key: "sort", leaf: { key: "date", reverse: true } }]))
+    // With remembering off the folder entry stays unwritten while the default still follows.
+    var rememberedOff = [], leafOff = []
+    var viewOff = { state: { foldersFirst: true, groupByKind: false, rememberSort: false },
+                    changeLeaf: function(key, leaf) { leafOff.push({ key: key, leaf: leaf }) } }
+    var backendOff = { sortBy: "name", sortDesc: false,
+                       rememberFolderSort: function(path, key, desc) { rememberedOff.push(path) } }
+    var runOff = factory({ sortable: true, recent: false, path: "/home/gm/Downloads", windowSize: 100, pendingListings: 0,
+                           clearListing: function() {}, actionFocus: function() {},
+                           restoreActionFocus: function() {} }, backendOff, viewOff, listMock)
+    runOff({ key: "size", desc: false })
+    check("picker sort with remembering off writes no folder entry", JSON.stringify(rememberedOff), "[]")
+    check("picker sort with remembering off still writes default leaf", JSON.stringify(leafOff),
+          JSON.stringify([{ key: "sort", leaf: { key: "size", reverse: false } }]))
+    // One builder shapes the Recent, empty path and control sort cases.
+    function sortCase(recent, path) {
+        var remembered = []
+        var backend = { sortBy: "name", sortDesc: false,
+                        rememberFolderSort: function(p, k, d) { remembered.push({ path: p, key: k, desc: d }) } }
+        var view = { state: { foldersFirst: true, groupByKind: false }, changeLeaf: function() {} }
+        var win = { sortable: true, recent: recent, path: path, windowSize: 100, pendingListings: 0,
+                    clearListing: function() {}, actionFocus: function() {},
+                    restoreActionFocus: function() {} }
+        return { backend: backend, remembered: remembered, run: factory(win, backend, view, listMock) }
+    }
+    // Recent has no folder to remember, but the window sort still changes.
+    var recentCase = sortCase(true, "/home/gm/Downloads")
+    recentCase.run({ key: "size", desc: true })
+    check("picker sort in Recent writes no folder entry and still changes window sort",
+          recentCase.backend.sortBy + ":" + recentCase.backend.sortDesc + ":" + JSON.stringify(recentCase.remembered), "size:true:[]")
+    // The same shape with a folder remembers its sort, so the Recent and empty path cases fail only on their guard.
+    var control = sortCase(false, "/home/gm/Downloads")
+    control.run({ key: "size", desc: true })
+    check("picker sort control of the same shape remembers one folder entry", JSON.stringify(control.remembered),
+          JSON.stringify([{ path: "/home/gm/Downloads", key: "size", desc: true }]))
+    // An empty path has no folder to remember, but the window sort still changes.
+    var emptyCase = sortCase(false, "")
+    emptyCase.run({ key: "size", desc: true })
+    check("picker sort with empty path writes no folder entry and still changes window sort",
+          emptyCase.backend.sortBy + ":" + emptyCase.backend.sortDesc + ":" + JSON.stringify(emptyCase.remembered), "size:true:[]")
+    remembered = []; leafChanges = []
+    runSort({ key: "mtime", desc: true })
+    check("picker sort asked for the order it has writes nothing", remembered.length + leafChanges.length, 0)
+    runSort({ key: "size", desc: false })
+    check("picker sort hands a key the schema shares through as is", JSON.stringify(leafChanges),
+          JSON.stringify([{ key: "sort", leaf: { key: "size", reverse: false } }]))
+    remembered = []; leafChanges = []
+    winMock.recent = true
+    runSort({ key: "name", desc: false })
+    check("picker sort in Recent remembers no folder", remembered.length, 0)
+    check("picker sort in Recent still moves the default sort", JSON.stringify(leafChanges),
+          JSON.stringify([{ key: "sort", leaf: { key: "name", reverse: false } }]))
+    remembered = []; leafChanges = []
+    winMock.recent = false
+    winMock.path = ""
+    runSort({ key: "size", desc: true })
+    check("picker sort with no folder remembers none", remembered.length, 0)
+    check("picker sort with no folder still moves the default sort", JSON.stringify(leafChanges),
+          JSON.stringify([{ key: "sort", leaf: { key: "size", reverse: true } }]))
 }

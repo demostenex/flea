@@ -1,15 +1,17 @@
 .import "menuhunt.js" as MenuHunt
 .import "../../ui/js/Menu.js" as Menu
 .import "../../ui/js/MenuRefresh.js" as MenuRefresh
+.import "../../ui/js/MenuContext.js" as MenuContext
 .import "../../ui/js/LockedMenu.js" as LockedMenu
+.import "../../ui/js/StateWords.js" as StateWords
 .import "../../ui/js/Nav.js" as Nav
 .import "../../ui/js/Icons.js" as Icons
 .import "../../ui/js/Mounts.js" as Mounts
 .import "sourcefixture.js" as Source
 
 function state(changes) {
-    var value = { hasRow: true, selectionCount: 1, rowMode: 0o100644, clipboardAvailable: false,
-        rowIsSymlink: false,
+    var value = { hasRow: true, selectionCount: 1, rowMode: 0o100644, rowIsFile: true, clipboardAvailable: false,
+        rowIsSymlink: false, rowName: "debian-13.iso", flashZipMember: "",
         hiddenActions: ["delete", "openTerminal", "moveto", "copyto", "properties", "permissions",
             "copyAs", "pasteAs", "invertSelection"],
         archiveFormats: ["zip"], canExtract: true, rowIsArchive: false, rowIsImage: true, canConvert: true,
@@ -26,18 +28,22 @@ function separated(rows) {
 }
 function run(check) {
     var file = Menu.listingEntries(state({}))
-    check("Menus and Places inventory has 49 actions", Menu.INVENTORY.length, 49)
+    check("Menus and Places inventory has 57 actions", Menu.INVENTORY.length, 57)
     check("Open with uses the authoritative cut geometry", Icons.pathFor("app-window"), "M3 4h18v16H3z M3 9h18 M6 6.5h.01 M9 6.5h.01")
     check("Restore all uses the authoritative undo geometry", Icons.pathFor("undo"), "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5")
-    check("inventory storage ids are unique", Object.keys(Menu.INVENTORY.reduce(function (out, row) { out[row[0]] = true; return out }, {})).length, 49)
+    check("inventory storage ids are unique", Object.keys(Menu.INVENTORY.reduce(function (out, row) { out[row[0]] = true; return out }, {})).length, 57)
     check("default image menu matches Menus specimen", actions(file),
-          "open,openWith,cut,copy,paste,duplicate,rename,compress,convert,addToShelf,taildrop,dropbox,trash,addFavourite,toggleHidden")
+          "open,openWith,run,openAsText,cut,copy,paste,duplicate,rename,compress,convert,flashDrive,addToShelf,taildrop,dropbox,trash,addFavourite,toggleHidden,toggleLangMarks")
+    check("code icons ship enabled with the existing code glyph", entry(file, "toggleLangMarks").label + "|" + entry(file, "toggleLangMarks").glyph, "Hide code icons|code")
+    check("code icons flip their verb live", entry(Menu.listingEntries(state({langMarks: false})), "toggleLangMarks").label, "Show code icons")
+    check("Settings can hide the code-icons row", entry(Menu.listingEntries(state({hiddenActions: ["toggleLangMarks"]})), "toggleLangMarks").action, undefined)
+    check("the code-icons row follows Show hidden files", file.findIndex(function (r) { return r.action === "toggleLangMarks" }), file.findIndex(function (r) { return r.action === "toggleHidden" }) + 1)
     check("empty clipboard keeps Paste disabled", entry(file, "paste").disabled, true)
     check("populated clipboard enables Paste", entry(Menu.listingEntries(state({ clipboardAvailable: true })), "paste").disabled, false)
-    check("folder omits conversion and extraction", actions(Menu.listingEntries(state({ rowMode: 0o040755, rowIsImage: false }))),
-          "open,openWith,cut,copy,paste,duplicate,rename,compress,addToShelf,taildrop,dropbox,trash,addFavourite,toggleHidden")
+    check("folder omits run and open as text; Pane gives a folder no image or archive flag, so no conversion or extraction", actions(Menu.listingEntries(state({ rowMode: 0o040755, rowIsImage: false, rowName: "Photos" }))),
+          "open,openWith,cut,copy,paste,duplicate,rename,compress,addToShelf,taildrop,dropbox,trash,addFavourite,toggleHidden,toggleLangMarks")
     check("background menu includes real creation actions in order", actions(Menu.listingEntries(state({ hasRow: false }))),
-          "newFolder,newFile,paste,selectAll,openTerminal,addFavourite,sort,toggleHidden,settings")
+          "newFolder,newFile,paste,selectAll,openTerminal,addFavourite,sort,toggleHidden,toggleLangMarks,settings")
     var background = Menu.listingEntries(state({ hasRow: false, updateVersion: "0.3.4" }))
     check("a known newer build adds Update Flea under Settings, in the same group, with the download mark",
           background.slice(-2).map(function (r) { return (r.separator ? "|" : r.action) + ":" + r.glyph }).join(","),
@@ -50,7 +56,7 @@ function run(check) {
     check("and neither does an empty version, which is what every state but available gives",
           entry(Menu.listingEntries(state({ hasRow: false, updateVersion: "" })), "updateFlea").action, undefined)
     check("selected file cannot be pinned as a folder", entry(file, "addFavourite").disabled, true)
-    check("Favorites menu uses GM's displayed spelling", entry(file, "addFavourite").label, "Add to Favorites")
+    check("Favorites menu uses the displayed spelling", entry(file, "addFavourite").label, "Add to Favorites")
     check("selected directory can be pinned", entry(Menu.listingEntries(state({ rowMode: 0o040755 })), "addFavourite").disabled, false)
     check("multi-selection cannot pin a cursor sibling", entry(Menu.listingEntries(state({ rowMode: 0o040755, selectionCount: 2 })), "addFavourite").disabled, true)
     check("symlink metadata cannot pretend to be a directory", entry(Menu.listingEntries(state({ rowMode: 0o120777 })), "addFavourite").disabled, true)
@@ -71,10 +77,11 @@ function run(check) {
     check("and its marks are the main menu's own",
           railGlyphs(Menu.railEntries(mountedShare)), "folder-open|drive|rename|sliders|minus")
     check("a group change draws a separator", Menu.railEntries(mountedShare).filter(function (r) { return r.separator === true }).length, 3)
-    var stick = { group: "device", kind: "volume", device: "/dev/sda1", mounted: true, removable: true, volumeMenu: true }
-    check("a mounted volume offers Open, Unmount and Eject", railLabels(Menu.railEntries(stick)), "Open|Unmount|Eject")
-    check("Mount and Unmount share the drive mark", railGlyphs(Menu.railEntries(stick)), "folder-open|drive|eject")
-    var idleVolume = { group: "device", kind: "volume", device: "/dev/sda1", mounted: false, removable: false, volumeMenu: true }
+    var stick = { group: "device", kind: "volume", device: "/dev/sda1", mounted: true, removable: true }
+    check("a mounted volume offers Open, Unmount, Eject and Flash image",
+          railLabels(Menu.railEntries(stick)), "Open|Unmount|Eject|Flash image")
+    check("Mount and Unmount share the drive mark", railGlyphs(Menu.railEntries(stick)), "folder-open|drive|eject|file")
+    var idleVolume = { group: "device", kind: "volume", device: "/dev/sda1", mounted: false, removable: false }
     check("an unmounted volume offers the mount its activation does", railLabels(Menu.railEntries(idleVolume)), "Mount")
     var savedOnly = { group: "network", kind: "share", uri: "smb://h/data/", mounted: false }
     check("an unmounted saved place keeps Rename, Edit address and Remove from Network",
@@ -105,9 +112,17 @@ function run(check) {
     check("while Delete permanently, which the share can do, stays and stays enabled",
           entry(onShare, "deletePermanently").action + "|" + entry(onShare, "deletePermanently").disabled, "deletePermanently|undefined")
     check("and a local file keeps Move to Trash", entry(Menu.listingEntries(state({ canTrash: Mounts.trashable("/home/gm/Downloads") })), "trash").action, "trash")
-    check("single-item actions stay present but disabled on multi-selection", ["openWith", "properties", "rename", "duplicate"].every(function (a) {
+    check("single-item actions stay present but disabled on multi-selection", ["openWith", "properties", "duplicate"].every(function (a) {
         return entry(Menu.listingEntries(state({ hiddenActions: [], selectionCount: 2 })), a).disabled === true
     }), true)
+    check("multi-selection keeps Rename enabled for the bulk card",
+        entry(Menu.listingEntries(state({ hiddenActions: [], selectionCount: 2 })), "rename").disabled, false)
+    // MenuAdditions040 e and Tags a draw "Rename N items" with the ellipsis character, one whole template filled with the count.
+    function renameLabel(count) { return entry(Menu.listingEntries(state({ hiddenActions: [], selectionCount: count })), "rename").label }
+    check("the file menu's rename row reads Rename for one selected row", renameLabel(1), "Rename")
+    check("and Rename 2 items\u2026 for two", renameLabel(2), "Rename 2 items\u2026")
+    check("and Rename 12 items\u2026 for twelve", renameLabel(12), "Rename 12 items\u2026")
+    check("the rail menu's Rename keeps its one word", Menu.railEntries(savedOnly)[0].label, "Rename")
     // Permissions040: Permissions takes the whole selection, so it stays
     // enabled where the single-item rows above grey out.
     check("multi-selection keeps Permissions enabled on files",
@@ -167,13 +182,42 @@ function run(check) {
     check("absent Taildrop provider removes its row", entry(Menu.listingEntries(state({ taildropInstalled: false })), "taildrop").action, undefined)
     var offline = entry(Menu.listingEntries(state({ taildropPeers: [] })), "taildrop")
     check("offline installed Taildrop remains disabled", offline.disabled, true)
-    check("offline Taildrop reads as an error, with no sentence beside it", offline.errored + "|" + offline.hint, "true|undefined")
+    check("offline Taildrop reads as an error, with one state word beside it", offline.errored + "|" + offline.hint, "true|offline")
     check("offline Taildrop offers no stale peers", offline.submenu.length, 0)
     check("fresh status disables a cached Taildrop target", entry(Menu.listingEntries(state({taildropRefreshing: true})), "taildrop").disabled, true)
     check("a provider still being read is dimmed, not errored", String(entry(Menu.listingEntries(state({taildropRefreshing: true})), "taildrop").errored), "undefined")
+    check("and says no word until it has answered", String(entry(Menu.listingEntries(state({taildropRefreshing: true, taildropPeers: []})), "taildrop").hint), "undefined")
     check("fresh status disables a cached Dropbox directory", entry(Menu.listingEntries(state({dropboxRefreshing: true})), "dropbox").disabled, true)
     check("a Taildrop still being read leaves Dropbox as it was answered", entry(Menu.listingEntries(state({taildropRefreshing: true})), "dropbox").disabled, false)
     check("installed signed-out provider reads as an error", entry(Menu.listingEntries(state({taildropPeers: [], taildropReason: "signed out"})), "taildrop").errored, true)
+    // Q13: every errored trigger says its own word in the hint slot, from the table in ui/js/StateWords.js.
+    function word(changes, action) { return String(entry(Menu.listingEntries(state(changes)), action).hint) }
+    check("Taildrop signed out says signed out", word({ taildropPeers: [], taildropCode: "signedOut" }, "taildrop"), "signed out")
+    check("Taildrop with no peers says no devices", word({ taildropPeers: [], taildropCode: "noPeers" }, "taildrop"), "no devices")
+    check("Taildrop stopped says offline", word({ taildropPeers: [], taildropCode: "stopped" }, "taildrop"), "offline")
+    check("Taildrop on a folder says files only", word({ taildropPeers: [], rowIsFile: false, rowIsImage: false, taildropCode: "signedOut" }, "taildrop"), "files only")
+    check("Taildrop on a folder whose mode was never read says files only", word({ taildropPeers: [], rowIsFile: false, rowMode: 0, rowIsImage: false, taildropCode: "" }, "taildrop"), "files only")
+    check("Taildrop on a link to a folder says files only", word({ taildropPeers: [], rowIsFile: false, rowMode: 0o120777, rowIsImage: false, taildropCode: "noPeers" }, "taildrop"), "files only")
+    check("Taildrop on a file whose mode was never read says offline", word({ taildropPeers: [], rowIsFile: true, rowMode: 0, taildropCode: "" }, "taildrop"), "offline")
+    check("LocalSend on a folder says files only", word({ localSendInstalled: true, localSendPeers: [], rowIsFile: false, rowIsImage: false }, "localsend"), "files only")
+    check("LocalSend on a folder whose mode was never read says files only", word({ localSendInstalled: true, localSendPeers: [], rowIsFile: false, rowMode: 0, rowIsImage: false }, "localsend"), "files only")
+    check("LocalSend on a link to a folder says files only", word({ localSendInstalled: true, localSendPeers: [], rowIsFile: false, rowMode: 0o120777, rowIsImage: false }, "localsend"), "files only")
+    check("LocalSend with nobody answering says no devices", word({ localSendInstalled: true, localSendPeers: [] }, "localsend"), "no devices")
+    check("LocalSend still being read says nothing", word({ localSendInstalled: true, localSendPeers: [], localSendChecking: true }, "localsend"), "undefined")
+    check("Dropbox signed out says signed out", word({ dropboxPath: "", dropboxCode: "signedOut" }, "dropbox"), "signed out")
+    check("Dropbox that is not answering says not running", word({ dropboxPath: "", dropboxCode: "notRunning" }, "dropbox"), "not running")
+    check("Dropbox still being read says nothing", word({ dropboxPath: "", dropboxRefreshing: true }, "dropbox"), "undefined")
+    check("Share link says the same word as Dropbox", word({ dropboxPath: "", rowInDropbox: true, dropboxCode: "signedOut" }, "sharelink"), "signed out")
+    check("a provider reason is never passed through", word({ taildropPeers: [], taildropReason: "Tailscale could not be checked" }, "taildrop"), "offline")
+    check("and no sentence is read: a signed out reason under another code says offline", word({ taildropPeers: [], taildropReason: "signed out", taildropCode: "stopped" }, "taildrop"), "offline")
+    check("nor a no peers reason under the failed code", word({ taildropPeers: [], taildropReason: "no peers", taildropCode: "statusFailed" }, "taildrop"), "offline")
+    check("Taildrop with an empty or unknown code says offline", word({ taildropPeers: [], taildropCode: "" }, "taildrop") + "|" + word({ taildropPeers: [], taildropCode: "other" }, "taildrop"), "offline|offline")
+    check("Taildrop codes invalid, disabled and statusFailed say offline", ["invalid", "disabled", "statusFailed"].map(function (code) { return word({ taildropPeers: [], taildropCode: code }, "taildrop") }).join("|"), "offline|offline|offline")
+    check("Dropbox signed out reason under a running code says not running", word({ dropboxPath: "", dropboxReason: "Dropbox is signed out", dropboxCode: "notRunning" }, "dropbox"), "not running")
+    check("Dropbox with an empty or unknown code says not running", word({ dropboxPath: "", dropboxCode: "" }, "dropbox") + "|" + word({ dropboxPath: "", dropboxCode: "other" }, "dropbox"), "not running|not running")
+    check("Dropbox codes readFailed, invalid and statusFailed say not running", ["readFailed", "invalid", "statusFailed"].map(function (code) { return word({ dropboxPath: "", dropboxCode: code }, "dropbox") }).join("|"), "not running|not running|not running")
+    check("every state word is one short lowercase run with no period",
+          Object.keys(StateWords.WORDS).every(function (key) { return /^[a-z]+( [a-z]+)?$/.test(StateWords.WORDS[key]) }), true)
     var absent = Menu.listingEntries(state({taildropInstalled: false, dropboxInstalled: false}))
     var available = Menu.listingEntries(state({}))
     var trashCursor = absent.findIndex(function(row) { return row.action === "trash" })
@@ -203,31 +247,37 @@ function run(check) {
     check("hidden files toggle uses inverse wording", Menu.hiddenRow(true).label, "Hide hidden files")
     check("permissions accepts ordinary file", Menu.permissionsEntry(0o100644, 1).disabled, false)
     check("permissions accepts directory", Menu.permissionsEntry(0o040755, 1).disabled, false)
-    // Issue 193: a row that cannot act reads red with no sentence beside it, never "Unavailable" (GM, 2026-09-24).
+    // Issue 193: a row that cannot act reads red with one state word beside it, never "Unavailable" (decided 2026-09-24).
     function refusal(e) { return e.disabled + "|" + e.errored + "|" + e.hint }
-    check("permissions on a symlink reads as an error with no sentence", refusal(Menu.permissionsEntry(0o120777, 1)), "true|true|undefined")
-    check("permissions on a row whose mode could not be read does too", refusal(Menu.permissionsEntry(0, 1)), "true|true|undefined")
+    check("permissions on a symlink reads as an error with one word", refusal(Menu.permissionsEntry(0o120777, 1)), "true|true|symlink")
+    check("permissions on a row whose mode could not be read names no word", refusal(Menu.permissionsEntry(0, 1)), "true|true|undefined")
+    check("permissions with nothing selected is refused with no kind to name", refusal(Menu.permissionsEntry(0o100644, 0)), "true|true|undefined")
+    check("permissions with nothing selected names no kind even for a link", refusal(Menu.permissionsEntry(0o120777, 0)), "true|true|undefined")
+    check("permissions on a fifo says special file", refusal(Menu.permissionsEntry(0o010644, 1)), "true|true|special file")
+    check("permissions on a socket says special file", refusal(Menu.permissionsEntry(0o140644, 1)), "true|true|special file")
     check("and a file's row can act, so it is not red", refusal(Menu.permissionsEntry(0o100644, 1)), "false|false|undefined")
     var perms = function (changes) { return entry(Menu.listingEntries(state(changes)), "permissions") }
-    check("the menu row under a parent without execute reads red with no sentence",
+    check("the menu row under a parent without execute reads red with no word",
           refusal(perms({ hiddenActions: [], rowMode: 0 })), "true|true|undefined")
     check("the menu row for a multi-selection reads plain on files",
         refusal(perms({ hiddenActions: [], selectionCount: 2, selectionModes: [0o100644, 0o100644] })), "false|undefined|undefined")
     check("and red when one of them is a link",
-        refusal(perms({ hiddenActions: [], selectionCount: 2, selectionModes: [0o100644, 0o120777] })), "true|true|undefined")
-    check("the menu row for a symlink reads the same way", refusal(perms({ hiddenActions: [], rowMode: 0o120777 })), "true|true|undefined")
+        refusal(perms({ hiddenActions: [], selectionCount: 2, selectionModes: [0o100644, 0o120777] })), "true|true|symlink")
+    check("and red with no word when one of them could not be read",
+        refusal(perms({ hiddenActions: [], selectionCount: 2, selectionModes: [0o100644, 0] })), "true|true|undefined")
+    check("the menu row for a symlink reads the same way", refusal(perms({ hiddenActions: [], rowMode: 0o120777 })), "true|true|symlink")
     check("the menu row for a folder it can change is plain", refusal(perms({ hiddenActions: [], rowMode: 0o040755 })), "false|undefined|undefined")
     check("permissions rejects missing metadata", Menu.permissionsEntry(undefined, 1).disabled, true)
     check("permissions rejects fifo", Menu.permissionsEntry(0o010644, 1).disabled, true)
     check("permissions allows read-only inspection of special bits", Menu.permissionsEntry(0o104755, 1).disabled, false)
-    // Issue 193 follow-up (GM, 2026-09-24): a right click on the Locked tile opens the
+    // Issue 193 follow-up (2026-09-24): a right click on the Locked tile opens the
     // locked folder's own menu, never the parent's background one.
     var locked = LockedMenu.lockedEntries({ lockedMode: 0o040000, hiddenActions: [] })
     check("the Locked tile offers only rows that act without listing the folder",
           actions(locked), "openTerminal,permissions,copypath")
     // One check per locked row: each offered action is the dispatch ui/Pane.qml performLocked
     // switches on, so a row renamed on either side strands the other. The signal carry itself
-    // (ContextMenu.lockedChosen) is QML-only and is covered by the controller's live check.
+    // (ContextMenu.lockedChosen) is QML-only and is covered by the maintainer's live check.
     check("its Open in Terminal row carries the terminal dispatch",
           entry(locked, "openTerminal").action, "openTerminal")
     check("its Permissions row carries the permissions dispatch",
@@ -241,10 +291,10 @@ function run(check) {
     check("Permissions stays plain while its owner may still be the operator, the way back in",
           refusal(entry(locked, "permissions")), "false|undefined|undefined")
     var stranger = LockedMenu.lockedEntries({ lockedMode: 0o040755, hiddenActions: [] })
-    check("Permissions for a folder owned by somebody else reads red with no sentence",
-          refusal(entry(stranger, "permissions")), "true|true|undefined")
+    check("Permissions for a folder owned by somebody else reads red and says not yours",
+          refusal(entry(stranger, "permissions")), "true|true|not yours")
     var unreadable = LockedMenu.lockedEntries({ lockedMode: 0, hiddenActions: [] })
-    check("Permissions with no mode to read reads red with no sentence too",
+    check("Permissions with no mode to read reads red and names no word",
           refusal(entry(unreadable, "permissions")), "true|true|undefined")
     check("hiding Open in terminal takes it off the Locked tile as well",
           entry(LockedMenu.lockedEntries({ lockedMode: 0o040000, hiddenActions: ["openTerminal"] }), "openTerminal").action, undefined)
@@ -377,8 +427,116 @@ function providerRefresh(check) {
     check("ContextMenu opens through Menu.submenuFor", contextSrc.indexOf("Menu.submenuFor(action, root.entries, root.clipboardAvailable)") >= 0, true)
     check("ContextMenu chooses through Menu.loneChoice", contextSrc.indexOf("Menu.loneChoice(root.loneFlyoutAction, id,") >= 0, true)
     check("its refusal names the empty-clipboard sentence", contextSrc.indexOf("root.refused(Menu.EMPTY_CLIPBOARD)") >= 0, true)
+    // A provider refresh must not move a lone flyout's highlight: its leaves are not the provider's.
+    var refreshProviderRows = eval("(function (root, menuRows, subRows, scroll, Qt) {"
+        + functionBody(contextSrc, "function refreshProviderRows()") + "})")
+    var loneKept = { opened: true, forRail: false, forHeader: false, forLocked: false, refreshOwed: false,
+        entries: [{ action: "copyAs", submenu: [{ id: "a" }, { id: "b" }, { id: "c" }] }],
+        cursor: 0, openSubmenuRow: -1, loneFlyoutAction: "copyAs", submenuCursor: 2 }
+    loneKept.buildEntries = function () {
+        return [{ action: "copyAs", submenu: [{ id: "a" }, { id: "b" }, { id: "c" }] },
+            { action: "taildrop", submenu: [{ id: "box" }] }]
+    }
+    loneKept.setEntries = function (next) { loneKept.entries = next }
+    refreshProviderRows(loneKept, { count: 0 }, { count: 0 }, {}, { callLater: function () {} })
+    check("a provider refresh under a lone flyout still takes the new rows", loneKept.entries.length, 2)
+    check("a provider refresh keeps the lone highlight", loneKept.submenuCursor, 2)
+    check("a provider refresh keeps no parent row", loneKept.openSubmenuRow, -1)
+    // Flash to drive reads the name table, so the built context must carry what Pane binds.
+    var listingContext = eval("(function (root, MenuRefresh, Flea, ViewState, UpdateCheck, flyoutAction, includeHidden) {" + functionBody(contextSrc, "function listingContext(") + "})")
+    function flashContextRoot() {
+        return { lastProviderAnswer: null, showHidden: false, hasRow: true, rowInDropbox: false,
+            dropboxPath: "", dropboxInstalled: false, dropboxReason: "",
+            rowIsFile: true, taildropInstalled: false, taildropReason: "",
+            archiveFormats: ["zip"], rowIsArchive: false, rowIsImage: true, canConvert: true,
+            canExtract: true, clipboardAvailable: false, clipboardWatchFailed: false,
+            canTrash: true, canLink: true, dirWritable: true, openWithApps: [], openWithLoaded: false,
+            rowMode: 0o100644, selectionCount: 1, rowIsSymlink: false, selectionModes: [],
+            rowHasShebang: false, cursorIsTarget: true, rowName: "debian-13.iso", flashZipMember: "",
+            localSend: { installed: false, peers: [], checking: false, answeredOnce: false },
+            storageClass: "", hasFolderSort: false }
+    }
+    // Sample input: a cold host keeps peer box and /fixture/Dropbox while its providers refresh.
+    var cold = flashContextRoot()
+    cold.item = null
+    cold.taildropInstalled = true
+    cold.taildropPeers = [{ id: "box", label: "Box" }]
+    cold.dropboxInstalled = true
+    cold.dropboxPath = "/fixture/Dropbox"
+    cold.lastProviderAnswer = MenuContext.settle(MenuContext.live(cold))
+    check("cold settle retains installed peers", cold.lastProviderAnswer.taildrop.peers[0].id, "box")
+    check("cold settle retains the Dropbox answer", cold.lastProviderAnswer.dropbox.path, "/fixture/Dropbox")
+    cold.providersRefreshing = true
+    cold.taildropPeers = []
+    cold.dropboxPath = ""
+    cold.localSend = { installed: true, peers: [], checking: true, answeredOnce: false }
+    var coldEnvironment = { scripts: [{ id: "build.sh", label: "Build" }], hiddenActions: ["copy", "trash", "copyAs"],
+        thumbPreview: true, updateVersion: "0.3.12" }
+    cold.listingContext = function (flyout, include) { return MenuContext.listingContext(cold, flyout, include, coldEnvironment) }
+    var coldContext = cold.listingContext("copyAs", false)
+    check("cold listing keeps the settled peers during refresh", coldContext.taildropPeers[0].id, "box")
+    check("cold listing keeps the settled Dropbox path during refresh", coldContext.dropboxPath, "/fixture/Dropbox")
+    check("cold listing hides other actions but keeps its requested flyout", coldContext.hiddenActions.join(","), "copy,trash")
+    check("cold listing leaves stored hidden actions intact", coldEnvironment.hiddenActions.join(","), "copy,trash,copyAs")
+    check("cold listing passes scripts from its environment", coldContext.scripts === coldEnvironment.scripts, true)
+    check("cold listing passes preview and update state", coldContext.thumbPreview + "|" + coldContext.updateVersion, "true|0.3.12")
+    check("cold listing reports the first LocalSend check", coldContext.localSendChecking, true)
+    cold.localSend.answeredOnce = true
+    check("cold listing does not draw a later LocalSend check", cold.listingContext().localSendChecking, false)
+    check("cold sheet listing includes hidden actions", cold.listingContext("", true).hiddenActions.length, 0)
+    cold.rowIsFile = false
+    check("cold folder listing suppresses file-only peers", cold.listingContext().taildropPeers.length, 0)
+    cold.rowIsFile = true
+    cold.taildropInstalled = false
+    check("cold listing drops a settled answer when installation changes", cold.listingContext().taildropPeers.length, 0)
+    // Sample input: no visual, identity a, hidden copy; sheet validation allows it and ordinary validation refuses it.
+    var hostSource = Source.source("ui/MenuHost.qml")
+    var coldBuild = eval("(function (root, ViewState, flyoutAction, includeHidden) {" + functionBody(hostSource, "function buildEntries(") + "})")
+    var coldBuildArgs = [], coldRefusals = [], coldIdentity = "a"
+    cold.forRail = false
+    cold.forHeader = false
+    cold.railEntries = []
+    cold.openedIdentity = "a"
+    cold.selectionIdentity = function () { return coldIdentity }
+    cold.buildEntries = function (flyout, include) {
+        coldBuildArgs.push({ flyout: flyout, include: include, preparing: cold.preparing })
+        return coldBuild(cold, { hiddenCols: ["size"] }, flyout, include)
+    }
+    cold.refuseLone = function (kind) { coldRefusals.push(kind) }
+    check("cold sheet validation allows its hidden copy row", MenuContext.validateChoice(cold, "copy", "", true), true)
+    check("cold validation builds while preparing", coldBuildArgs[0].preparing, true)
+    check("cold validation forwards includeHidden", coldBuildArgs[0].include, true)
+    check("cold validation clears preparing", cold.preparing, false)
+    check("cold ordinary validation refuses a hidden row", MenuContext.validateChoice(cold, "copy", "", false), false)
+    check("cold hidden-row refusal names unavailable", coldRefusals.pop(), "unavailable")
+    check("cold flyout validation allows a known leaf", MenuContext.validateChoice(cold, "copyAs", "copyPath"), true)
+    check("cold flyout validation asks for its parent action", coldBuildArgs[coldBuildArgs.length - 1].flyout, "copyAs")
+    check("cold validation refuses an unknown leaf", MenuContext.validateChoice(cold, "copyAs", "missing"), false)
+    check("cold unknown-leaf refusal names unavailable", coldRefusals.pop(), "unavailable")
+    check("cold validation refuses disabled Paste", MenuContext.validateChoice(cold, "paste", "", true), false)
+    check("cold disabled-row refusal names unavailable", coldRefusals.pop(), "unavailable")
+    coldIdentity = "b"
+    check("cold validation refuses a moved selection", MenuContext.validateChoice(cold, "copy", "", true), false)
+    check("cold moved-selection refusal names moved", coldRefusals.pop(), "moved")
+    // Sample input: a cold header with size hidden offers Show Size; a cold rail keeps its own Rename row.
+    cold.forHeader = true
+    check("cold header uses its hidden-column state", entry(cold.buildEntries(), "col:size").label, "Show Size")
+    check("cold header validation ignores row identity", MenuContext.validateChoice(cold, "col:size", ""), true)
+    cold.forHeader = false
+    cold.forRail = true
+    cold.railEntries = [{ action: "rename", label: "Rename" }]
+    check("cold rail uses its supplied entries", cold.buildEntries() === cold.railEntries, true)
+    check("cold rail validation ignores row identity", MenuContext.validateChoice(cold, "rename", ""), true)
+    check("cold helper calls leave the visual absent", cold.item, null)
+    var flashFlea = { Scripts: { entries: [] } }
+    var flashViewState = { menuHidden: ["delete", "openTerminal", "moveto", "copyto", "properties",
+        "permissions", "copyAs", "pasteAs", "invertSelection"], preview: true }
+    var flashP = listingContext(flashContextRoot(), MenuRefresh, flashFlea, flashViewState, { menuVersion: "" })
+    check("the listing context carries the flash fields", flashP.rowName + "|" + flashP.flashZipMember, "debian-13.iso|")
+    check("Flash to drive shows on a disk image through the real context", actions(Menu.listingEntries(flashP)).indexOf("flashDrive") >= 0, true)
+    check("and Pane binds no name for a directory row, so a folder called like an image offers none", paneSrc.indexOf('rowName: root.cursorRow !== null && !root.cursorRow.d ? root.cursorRow.n : ""') >= 0, true)
     var pasteBody = Source.slice(paneSrc, "function openPasteAs()", "function invertSelection")
-    check("Pane.openPasteAs closes and says empty on refuse", pasteBody.indexOf("menu.close()") >= 0 && pasteBody.indexOf("There is nothing to paste; y copies and x cuts.") >= 0, true)
+    check("Pane.openPasteAs closes and says empty on refuse", pasteBody.indexOf("menu.close()") >= 0 && pasteBody.indexOf("root.message(Menu.EMPTY_CLIPBOARD, false)") >= 0, true)
     // Show original answers only its own pending id, so a late reply never yanks a navigation.
     // One brace scan serves every shipped body below; an inline copy beside it is the defect this pins.
     // Sample input: functionBody("head function f(a) { return a } tail", "function f(") answers " return a ".
@@ -416,7 +574,7 @@ function providerRefresh(check) {
     ]
     refusalCases.forEach(function (test) {
         var menu = { entries: [], openSubmenuRow: -1, loneFlyoutAction: "copyAs", forRail: false,
-            forHeader: false, hasRow: true, openedIdentity: "original", selectionIdentity: test.identity,
+            forHeader: false, hasRow: true, openedIdentity: "original", selectionIdentity: function () { return test.identity },
             opened: true, validations: 0, reasons: [], fired: [] }
         menu.close = function () { menu.opened = false }
         menu.refused = function (reason) { menu.reasons.push(reason) }
@@ -439,7 +597,7 @@ function providerRefresh(check) {
         check("normal " + test.id + " validation closes", menu.opened, false)
     })
     var buildArgs = []
-    var sheetMenu = { entries: [], forRail: false, forHeader: false, hasRow: true, openedIdentity: "a", selectionIdentity: "a",
+    var sheetMenu = { entries: [], forRail: false, forHeader: false, hasRow: true, openedIdentity: "a", selectionIdentity: function () { return "a" },
         close: function () {}, refused: function () {}, refuseLone: function () {},
         buildEntries: function (flyout, include) { buildArgs.push(include); return [{ action: "permissions" }] } }
     check("a sheet choice validates against the rows it listed", validateChoice(sheetMenu, "permissions", "", true), true)

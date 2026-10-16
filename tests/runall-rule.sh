@@ -15,6 +15,7 @@ cleanup() {
     esac
 }
 trap cleanup EXIT
+python3 -B tests/headless-commons-check.py "$box" || exit 1
 checks=0
 bad=0
 # The verdict word is reworded in every line this suite prints, so only a real failure reads as one to flea-ci.
@@ -60,6 +61,18 @@ done < tests/run-all.sh > "$box/tests/run-all.sh"
 chmod +x "$box/tests/run-all.sh"
 [ "$(grep -c '^headless=' "$box/tests/run-all.sh")" -eq 2 ] && check ok "the copy has its two headless= lines" \
     || check bad "the copy has its two headless= lines"
+
+# The scratch copy swaps both lists for stubs, so the shipped lists are read here: a name with no tests/NAME.sh, such as two names run together, runs nothing.
+headless=""
+while IFS= read -r line; do
+    [[ "$line" == headless=* ]] && eval "$line"
+done < tests/run-all.sh
+unrunnable=""
+for name in $headless; do
+    [ -x "tests/$name.sh" ] || unrunnable="$unrunnable $name"
+done
+[ -n "$headless" ] && [ -z "$unrunnable" ] && check ok "every name in the shipped headless lists has an executable suite" \
+    || check bad "every name in the shipped headless lists has an executable suite, no runner for:${unrunnable:- (the lists are empty)}"
 
 # Each shipped rule line must be present, once, and byte-equal in the copy.
 for pattern in '^fail_line=' '\|\| printed=\$\('; do

@@ -35,7 +35,7 @@ QtObject {
     // ui.json then hid a row the shipped schema shows.
     readonly property var defaultMenuHidden: ["delete", "openTerminal", "placeMenu", "runScript",
                                                "moveto", "copyto", "properties", "permissions", "copyAs",
-                                               "pasteAs", "invertSelection", "extThumbs"]
+                                               "pasteAs", "invertSelection", "extThumbs", "run", "openAsText"]
 
     // ui.json names what is SHOWN. ui/Header.qml, ui/Row.qml and ui/ContextMenu.qml all ask the
     // opposite question, so the inversion lives here once rather than at each of them.
@@ -65,7 +65,7 @@ QtObject {
     // the section's only state: ui/js/Menu.js applyHidden is the consumer and ui/ContextMenu.qml the
     // one caller that passes it in, and the panel's master row is derived from this set, not stored.
     readonly property var menu: root.state.menu || ({})
-    // B1, GM's ruling: "Enable shelf" is one switch, so the Menus row is not a stored menu id at all.
+    // "Enable shelf" is one switch, so the Menus row is not a stored menu id at all.
     // It reads the shelf's own boolean, which is what src/shelfplugin.rs installs the bar plugin on.
     readonly property bool shelfEnabled: (root.state.shelf || ({})).enabled === true
     readonly property var menuHidden: (Array.isArray(root.menu.hidden) ? root.menu.hidden
@@ -81,9 +81,15 @@ QtObject {
     // file that never named them.
     readonly property bool keyHints: root.state.keyHints === true
 
+    // Code icons default on; only a saved boolean false disables them, matching schema healing.
+    readonly property bool langMarks: root.state.langMarks !== false
+    function toggleLangMarks() { root.changeKey("langMarks", !root.langMarks) }
+
     // Absent reads off, the way keyHints beside it does.
     readonly property bool highlightToday: root.state.highlightToday === true
 
+    // Settings > View > Open folders while dragging: absent reads off, like highlightToday.
+    readonly property bool openFoldersWhileDragging: root.state.openFoldersWhileDragging === true
     // Rows compare one number and never build a Date.
     property double todayStart: Format.dayStart(Date.now())
 
@@ -110,6 +116,9 @@ QtObject {
     // stored "dual", a window shape and not a view a pane can be in. PR 97, DouglasdeMoura.
     readonly property string view: Settings.contains(["list", "columns", "grid"], root.state.view)
                                    ? root.state.view : "list"
+    // Per-folder views stay separate from the fallback above and off until opted in, so an existing ui.json keeps its global view.
+    readonly property bool rememberViewPerFolder: root.state.rememberViewPerFolder === true
+    readonly property var folderViews: root.state.folderViews || ({})
     // The chooser's own last-used view (`pickerView` in src/uischema.rs); an undrawable word reads as the list.
     readonly property string pickerView: Settings.contains(["list", "grid"], root.state.pickerView)
                                          ? root.state.pickerView : "list"
@@ -165,15 +174,25 @@ QtObject {
     readonly property var preview: root.state.preview || ({})
     readonly property bool previewColumn: root.preview.column !== false
     readonly property bool previewAutomatic: root.preview.loadOn !== "manual"
+    // `previewFacts` in src/uischema.rs: the tall kinds' one compact line, or the full table `i` opens.
+    readonly property string previewFacts: root.state.previewFacts === "full" ? "full" : "compact"
     readonly property string thumbnailMode: root.preview.thumbnails || "media"
     readonly property string thumbnailSize: root.preview.thumbSize || "medium"
     // Huge 192 and Largest 256 decode nothing new: the shared cache already holds 256.
     readonly property int thumbnailPixels: Density.thumbPixelsFor(root.thumbnailSize)
     readonly property bool ctrlZoom: root.preview.ctrlZoom !== false
+    // `preview.volume` in src/uischema.rs, 0 to 100: the level ui/MediaSound.qml plays every player at, 100 being full scale.
+    readonly property int mediaVolume: root.preview.volume !== undefined ? root.preview.volume : 100
+    function setMediaVolume(level) { root.changeLeaf("preview", { volume: level }) }
+    // `preview.width` in src/uischema.rs: the Columns view's last column as a whole percent of the area, 0 for the default share.
+    readonly property int previewWidth: root.preview.width || 0
+    function setPreviewWidth(percent) { root.changeLeaf("preview", { width: percent }) }
+    // Quick Look's w: long lines wrap in a code or text file; off until pressed, and remembered.
+    readonly property bool previewWrap: root.preview.wrap === true
     readonly property string density: root.state.density || "compact"
     readonly property string addressBar: root.state.addressBar || "breadcrumb"
     readonly property bool hyprlandIcons: root.display.hyprlandIcons === true
-    property string saveStatus: "Saved · applied in this process"
+    property string saveStatus: "Saved"
 
     // Settings > View > Opening. ui/js/Startup.js is what turns these into a path; nothing else reads
     // them, so the panel and the two openers can never disagree about where a window or a tab begins.
@@ -314,6 +333,7 @@ QtObject {
     }
 
     function save() {
+        root.writeRevision += 1
         var next = UiState.asked(root.writeBook, root.patch())
         root.writeBook = next
         if (next.start.length > 0)
@@ -346,6 +366,9 @@ QtObject {
 
     // A change another window saved: the settled document with no argument, merged and validated, writes nothing.
     property string settleMode: ""
+    // Local saves and acknowledgements invalidate older snapshots, even after their owed keys clear.
+    property double writeRevision: 0
+    property double settleRevision: 0
     property bool settleDirty: false
     property string pruneInflight: ""
     property string pruneQueued: ""
@@ -365,6 +388,7 @@ QtObject {
         if (UiState.settleBusy(settler.running, root.settleMode, root.settleAnswer))
             return
         root.settleMode = mode
+        root.settleRevision = root.writeRevision
         root.settleAnswer = {}
         settler.command = [Quickshell.env("FLEA_BIN") || "flea", "--ui-state"]
         settler.running = true
@@ -407,16 +431,14 @@ QtObject {
                 return
             }
             if (!UiState.parsesAsObject(stateFile.text())) { root.pruneFailed(); return }
-            var pruned = UiState.pruneRefused(root.unsaved, root.pruneInflight, settled)
-            root.unsaved = pruned.unsaved
+            root.unsaved = UiState.dropInvalid(root.unsaved, root.pruneInflight)
             root.state = UiState.revertedState(root.state, root.pruneInflight, settled)
-            root.pruneInflight = ""
-            root.writeBook = { saved: root.writeBook.saved, inflight: "", pending: "", start: "" }
+            root.finishPrune(false)
+            return
+        }
+        if (root.settleRevision !== root.writeRevision) {
+            root.settleDirty = true
             root.settleNext()
-            if (JSON.stringify(root.unsaved) !== "{}") {
-                root.saveStatus = "Saving…"
-                root.save()
-            }
             return
         }
         if (exitCode !== 0) { root.settleNext(); return }
@@ -428,17 +450,22 @@ QtObject {
         root.syncFavourites(stateFile.text())
         root.settleNext()
     }
-    // A prune settle that never answered still drops what the schema refused, so no save strands behind a phantom writer.
-    function pruneFailed() {
-        root.unsaved = UiState.dropInvalid(root.unsaved, root.pruneInflight)
+    // One tail for both prune endings: end the settle, then save what is still owed.
+    function finishPrune(failed) {
         root.pruneInflight = ""
         root.writeBook = { saved: root.writeBook.saved, inflight: "", pending: "", start: "" }
-        root.saveFailed()
+        if (failed)
+            root.saveFailed()
         root.settleNext()
         if (JSON.stringify(root.unsaved) !== "{}") {
             root.saveStatus = "Saving…"
             root.save()
         }
+    }
+    // A prune settle that never answered still drops what the schema refused, so no save strands behind a phantom writer.
+    function pruneFailed() {
+        root.unsaved = UiState.dropInvalid(root.unsaved, root.pruneInflight)
+        root.finishPrune(true)
     }
     function refreshFavourites() {
         stateFile.reload()
@@ -472,7 +499,7 @@ QtObject {
         onLoadFailed: function (error) {
             if (error === FileViewError.FileNotFound && !root.initialReadComplete) return
             if (!root.initialReadComplete) root.unreadable = true
-            root.favouritesReadError = "Favorites not refreshed: ui.json unreadable; kept the old entries."
+            root.favouritesReadError = UiState.FAVOURITES_UNREAD
             root.favouritesReadFailed(root.favouritesReadError)
         }
     }
@@ -484,10 +511,12 @@ QtObject {
     function wrote(exitCode) {
         // Taken out before the patch below is built, so a writer queued behind this one launches with
         // what is still owed and not with the settings this one has just stored.
-        root.saveStatus = exitCode === 0 ? "Saved · applied in this process"
+        root.saveStatus = exitCode === 0 ? "Saved"
             : "Could not save settings · changes apply to this session only"
-        if (exitCode === 0)
+        if (exitCode === 0) {
+            root.writeRevision += 1
             root.unsaved = UiState.acknowledged(root.unsaved, root.writeBook.inflight)
+        }
         var failedPatch = root.writeBook.inflight
         var next = UiState.exited(root.writeBook, exitCode, root.patch())
         root.writeBook = next

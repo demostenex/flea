@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # The rename editor under real scrolling: ui/List.qml, ui/GridArea.qml and the shifted list origin, offscreen with no display or lock.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -12,7 +13,7 @@ fi
 # The probe's showRow stub copies these Pane.showRow branches, so a Pane that drops them must fail here, loudly.
 for marker in 'if (root.viewMode === "columns" && root.columnsArea) root.columnsArea.activeColumn().showCursor(view, context)' \
               'else if (root.viewMode === "list") list.showCursor(view, context)' \
-              'else root.listArea.positionViewAtIndex(view, ListView.Contain)'; do
+              'else root.listArea.showCursor(view, context)'; do
     if ! grep -qF -- "$marker" ui/Pane.qml; then
         printf 'FAIL ui/Pane.qml no longer carries the showRow branch the probe stubs: %s\n' "$marker"
         exit 1
@@ -29,7 +30,7 @@ mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/ru
 chmod 700 "$test_root/runtime" || exit 1
 # The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
 ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
 cp tests/rename-scroll-pane.qml "$test_root/config/RenamePaneStub.qml" || exit 1
 

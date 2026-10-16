@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Actual GridTile caption containment at base 12 and 14, offscreen; the old slot must fail at 14.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -19,7 +20,7 @@ mkdir -p "$test_root/config" "$test_root/home" "$test_root/state" "$test_root/ru
 chmod 700 "$test_root/runtime" || exit 1
 # The probe imports ui/ as Flea, and ui/'s qs.Commons resolves against this root, as it does from ui/boot.
 ln -s "$PWD/ui" "$test_root/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$test_root/config/Commons" || exit 1
+headless_commons "$test_root" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$test_root/config/Ui" || exit 1
 cp tests/gridcaption.qml "$test_root/config/shell.qml" || exit 1
 
@@ -28,7 +29,7 @@ output=$(env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
     QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 \
     timeout 30 qs -p "$test_root/config" 2>&1)
 
-# Sample input, one probe line: "  INFO qml: GRIDCAPTION PASS base=12,14 normal=2lines drop=1line"
+# Sample input, one probe line: "  INFO qml: GRIDCAPTION PASS base=12,14 normal=2lines drop=1line texts=1,2"
 pass_count=$(printf '%s\n' "$output" | grep -c 'GRIDCAPTION PASS')
 fail_count=$(printf '%s\n' "$output" | grep -c 'GRIDCAPTION FAIL')
 if [ "$pass_count" -ne 1 ] || [ "$fail_count" -ne 0 ]; then
@@ -36,4 +37,4 @@ if [ "$pass_count" -ne 1 ] || [ "$fail_count" -ne 0 ]; then
     printf '%s\n' "$output" | grep -aE 'GRIDCAPTION|ERROR|error' | head -20
     exit 1
 fi
-printf '%s\n' "$output" | grep -o 'GRIDCAPTION PASS.*'
+printf '%s\n' "$output" | grep -o 'GRIDCAPTION \(PASS\|TIP\).*'

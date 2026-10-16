@@ -1,16 +1,24 @@
 import QtQuick
+import QtQuick.Layouts
 import qs.Commons
 import "." as Flea
 import "js/Format.js" as Format
 import "js/Picker.js" as Picker
 
-// The picker's two chrome strips: what was asked for and the two answers on top, where the list is
-// standing and what it is narrowed to underneath. SendPicker.html draws both.
+// The picker's two chrome strips: what was asked for on top, where the list is standing underneath; the answers are ui/PickerAnswers.qml.
 Item {
     id: root
+    // Its Jump dropdown hangs below the strip, so the chrome rises over the places and the listing while it shows.
+    z: entry.jumpShown ? 1 : 0
 
     property var picker: null
     property var submissionFocus: null
+    property var listing: null
+    property var backend: null
+
+    readonly property bool editing: entry.editing
+    readonly property var jump: entry.jump
+    function startEdit() { entry.startEdit() }
 
     function submissionChanged() {
         var window = root.Window.window
@@ -26,7 +34,7 @@ Item {
         Qt.callLater(function() {
             if (!pending || root.submissionFocus !== pending) return
             root.submissionFocus = null
-            if (root.picker.answered || root.picker.submitting) return
+            if (root.picker.answered || root.picker.submitting || root.picker.backendUnavailable) return
             var before = pending.before
             if (before && before.visible && before.enabled && pending.stepped && pending.stepped.activeFocus)
                 before.forceActiveFocus()
@@ -41,142 +49,61 @@ Item {
         }
     }
 
-    signal cancelRequested()
-    signal acceptRequested()
     signal backRequested()
     signal upRequested()
-    signal chipChosen(int index)
     signal viewChosen(string mode)
 
     readonly property var req: root.picker.req
-    readonly property var chips: Picker.chips(root.req)
 
     readonly property color edge: root.picker.edge
 
     implicitHeight: ask.height + where.height
 
-    // The picker's answers are ButtonSystem040 A's one control; the picker owns Tab.
-    component Answer: Flea.DialogButton {
-        id: answer
-        property string name: answer.label
-        tabHandle: true
-        enabled: answer.available
-        activeFocusOnTab: answer.available
-        onTabbed: function(from, back) { root.picker.stepFocus(answer, back) }
-    }
-
-    // Back, Up and the view marks are Tier A chrome marks, frameless: muted at rest, the keyboard lifts one to the foreground, a lit view stays in it.
+    // Back and Up rest in the foreground like the main chrome; only an unlit view mark rests muted.
     component Mark: Flea.ChromeButton {
         id: mark
+        ruleRows: Theme.spacing.hairline
         property bool lit: false
         readonly property bool available: mark.enabled
         property string name: mark.accessName
         gesturePolicy: TapHandler.ReleaseWithinBounds
-        restingColor: mark.lit ? Theme.color.foreground : Theme.color.muted
+        restingColor: Theme.color.foreground
         activeFocusOnTab: mark.enabled
         keyboardFocused: mark.activeFocus
         Keys.onTabPressed: function(event) { root.picker.stepFocus(mark, (event.modifiers & Qt.ShiftModifier) !== 0) }
         Keys.onBacktabPressed: root.picker.stepFocus(mark, true)
-        Keys.onReturnPressed: if (mark.enabled) mark.activated()
-        Keys.onEnterPressed: if (mark.enabled) mark.activated()
-        Keys.onSpacePressed: if (mark.enabled) mark.activated()
     }
 
-    // A filter chip (Picker040's dropdown replaces it in 0.3.10): a word in a muted frame, the chosen one an accent frame and wash.
-    component Framed: Item {
-        id: control
-
-        property string label: ""
-        property string name: control.label
-        property bool primary: false
-        property bool available: true
-        opacity: available ? 1 : Theme.disabledOpacity
-        enabled: available
-        activeFocusOnTab: available
-        Keys.onTabPressed: function(event) { root.picker.stepFocus(control, (event.modifiers & Qt.ShiftModifier) !== 0) }
-        Keys.onBacktabPressed: root.picker.stepFocus(control, true)
-        Keys.onReturnPressed: if (control.available) control.pressed()
-        Keys.onEnterPressed: if (control.available) control.pressed()
-        Keys.onSpacePressed: if (control.available) control.pressed()
-
-        signal pressed()
-
-        readonly property color ink: !control.available ? Theme.color.muted : Theme.color.foreground
-
-        implicitWidth: caption.implicitWidth + 2 * Theme.spacing.gap
-        implicitHeight: Theme.hitMin
-        scale: press.pressed && control.available && !Theme.reducedMotion ? 0.96 : 1
-
-        Accessible.role: Accessible.Button
-        Accessible.name: control.name
-        Accessible.onPressAction: if (control.available) control.pressed()
-
-        Behavior on scale {
-            enabled: !Theme.reducedMotion
-            NumberAnimation { duration: 150; easing.type: Easing.OutQuad }
-        }
-
-        readonly property color frame: control.primary
-            ? Theme.color.accentFrame : Theme.color.muted
-
-        // The chosen chip carries its wash at rest; every other earns one under the pointer or the keyboard.
-        readonly property real wash: control.primary ? Theme.washActive : !control.available ? 0
-            : (control.activeFocus || press.pressed) ? Theme.washActive
-            : hover.hovered ? Theme.washHover : 0
-        readonly property color washInk: control.primary ? Theme.color.accent : Theme.color.foreground
-
-        Rectangle {
-            anchors.fill: parent
-            color: Qt.alpha(control.washInk, control.wash)
-            border.width: Theme.spacing.hairline
-            border.color: control.frame
-        }
-
-        Text {
-            id: caption
-            anchors.centerIn: parent
-            text: control.label
-            color: control.ink
-            font.family: Theme.font.family
-            font.pixelSize: Theme.font.caption
-            textFormat: Text.PlainText
-        }
-
-        HoverHandler {
-            id: hover
-            cursorShape: control.available ? Qt.PointingHandCursor : Qt.ArrowCursor
-        }
-
-        TapHandler {
-            id: press
-            acceptedButtons: Qt.LeftButton
-            onTapped: if (control.available) { control.forceActiveFocus(Qt.MouseFocusReason); control.pressed() }
-        }
-    }
-
+    // One 33 px line at body: the caller's title as it came, then the requester after a middot when the portal names one.
     Item {
         id: ask
+        objectName: "pickerAsk"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        height: Math.max(Theme.chromeHeight, titles.implicitHeight + 2 * Theme.spacing.rowPaddingY)
+        height: Math.max(Theme.chromeHeight, caller.implicitHeight + 2 * Theme.spacing.rowPaddingY)
 
         Rectangle {
             anchors.fill: parent
             color: Theme.color.surface
         }
 
-        Column {
+        RowLayout {
             id: titles
+            objectName: "pickerTitleLine"
             anchors.left: parent.left
             anchors.leftMargin: Theme.spacing.rowPaddingX
-            anchors.right: buttons.left
-            anchors.rightMargin: Theme.spacing.gap
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacing.rowPaddingX
             anchors.verticalCenter: parent.verticalCenter
+            spacing: 0
 
             // The caller's own words, and a filename is arbitrary text, so PlainText here too.
             Text {
-                width: parent.width
+                id: caller
+                Layout.alignment: Qt.AlignBaseline
+                Layout.fillWidth: true
+                Layout.maximumWidth: implicitWidth
                 text: Picker.title(root.req)
                 color: Theme.color.foreground
                 font.family: Theme.font.family
@@ -185,9 +112,22 @@ Item {
                 textFormat: Text.PlainText
             }
 
-            // Only a portal identity is drawn, so an application the desktop cannot name gets no line.
+            // Only a portal identity is drawn, in a Text of its own that the caller's title never reaches.
             Text {
-                width: parent.width
+                Layout.alignment: Qt.AlignBaseline
+                visible: requester.visible
+                text: "\u00a0\u00b7\u00a0"
+                color: Theme.color.muted
+                font.family: Theme.font.family
+                font.pixelSize: Theme.font.caption
+                textFormat: Text.PlainText
+            }
+
+            Text {
+                id: requester
+                objectName: "pickerRequester"
+                Layout.alignment: Qt.AlignBaseline
+                Layout.fillWidth: true
                 visible: text.length > 0
                 text: Picker.subtitle(root.req)
                 color: Theme.color.foreground
@@ -195,30 +135,6 @@ Item {
                 font.pixelSize: Theme.font.caption
                 elide: Text.ElideRight
                 textFormat: Text.PlainText
-            }
-        }
-
-        // Above the strip's rule: the answers' 2 px ring reaches the strip's own edges, and the rule must not cut it.
-        Row {
-            id: buttons
-            z: 1
-            anchors.right: parent.right
-            anchors.rightMargin: Theme.spacing.rowPaddingX
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Theme.spacing.gap
-
-            Answer {
-                id: cancelButton
-                label: "Cancel"
-                onActivated: root.cancelRequested()
-            }
-
-            Answer {
-                id: acceptButton
-                label: Picker.acceptLabel(root.req, root.picker.marks.length)
-                primary: true
-                available: root.picker.canAccept
-                onActivated: root.acceptRequested()
             }
         }
 
@@ -232,12 +148,12 @@ Item {
 
     Item {
         id: where
+        objectName: "pickerWhere"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: ask.bottom
-        // The strip carries 24 px hit boxes, so it takes a list row's height less the two hairline
-        // rules that bracket it: 35 at base-size 14, which is the board's own nav strip.
-        height: Theme.rowHeight - 2 * Theme.spacing.hairline
+        // The board's 27 px strip at base-size 14: the chrome's own height, so the field and its dropdown sit as in the main window.
+        height: Theme.chromeHeight
 
         Rectangle {
             anchors.bottom: parent.bottom
@@ -255,6 +171,7 @@ Item {
 
             Mark {
                 id: backButton
+                objectName: "pickerBack"
                 glyph: "arrow-left"
                 enabled: !root.picker.backendUnavailable && root.picker.history.length > 0 && !root.picker.submitting
                 onActivated: root.backRequested()
@@ -262,6 +179,7 @@ Item {
 
             Mark {
                 id: upButton
+                objectName: "pickerUp"
                 glyph: "arrow-up"
                 accessName: root.picker.recent ? "Parent folder unavailable in Recent" : "Parent folder"
                 // The board's own rule, drawn as its disabled Up: a history has no directory above it.
@@ -270,63 +188,72 @@ Item {
             }
         }
 
-        Text {
+        // Parents muted, the leaf lit inline after them; a long path elides its parents from the left and keeps the leaf whole.
+        Row {
+            id: strip
+            objectName: "pickerStrip"
             anchors.left: moves.right
             anchors.leftMargin: Theme.spacing.gap
-            anchors.right: types.left
-            anchors.rightMargin: Theme.spacing.gap
-            anchors.verticalCenter: parent.verticalCenter
-            // Recent is a location and not a path, so the strip says the location's own name; a
-            // tilde form of the token would be a path the window is not standing in.
-            text: root.picker.recent ? Picker.RECENT_LABEL : Format.tilde(root.picker.path, root.picker.home)
-            color: Theme.color.foreground
-            font.family: Theme.font.family
-            font.pixelSize: Theme.font.caption
-            elide: Text.ElideLeft
-            textFormat: Text.PlainText
-        }
-
-        // The caller's filters, and All files beside them; a request with no filters draws no chips.
-        // The view marks keep the far right, so the chips give way through their anchor.
-        Flickable {
-            id: types
             anchors.right: parent.right
             anchors.rightMargin: views.width + Theme.spacing.rowPaddingX + Theme.spacing.gap
             anchors.verticalCenter: parent.verticalCenter
-            // The chips take room first and the path gives way through its anchor, keeping its minimum.
-            width: Picker.chipStripWidth(where.width - moves.width - views.width - 2 * Theme.spacing.rowPaddingX - 3 * Theme.spacing.gap, chipRow.width, Picker.CHIP_PATH_MIN)
-            height: Theme.hitMin
-            contentWidth: chipRow.width
-            contentHeight: height
-            boundsBehavior: Flickable.StopAtBounds
-            flickableDirection: Flickable.HorizontalFlick
-            clip: true
-            Flea.FastScrollHandler { flickable: types }
-
-            function reveal(item) {
-                if (item.x < contentX) contentX = item.x
-                else if (item.x + item.width > contentX + width) contentX = item.x + item.width - width
+            // The marks centre in the band above the rule, so the path does too.
+            anchors.verticalCenterOffset: -Theme.spacing.hairline / 2
+            visible: !entry.editing
+            // Recent is a location and not a path, so the strip says its name, never a tilde form of the token.
+            readonly property string display: root.picker.recent ? Picker.RECENT_LABEL : Format.tilde(root.picker.path, root.picker.home)
+            readonly property string leaf: root.picker.recent ? strip.display : Format.leafPart(strip.display)
+            readonly property string parents: root.picker.recent ? "" : strip.display.substring(0, strip.display.length - strip.leaf.length)
+            Text {
+                id: stripParents
+                width: Math.min(implicitWidth, Math.max(0, strip.width - stripLeaf.width))
+                visible: strip.parents.length > 0
+                text: strip.parents
+                color: Theme.color.muted
+                font.family: Theme.font.family
+                font.pixelSize: Theme.font.caption
+                elide: Text.ElideLeft
+                textFormat: Text.PlainText
             }
-
-            Row {
-                id: chipRow
-                spacing: Theme.spacing.hairline * 4
-
-                Repeater {
-                    id: chipRepeater
-                    model: root.chips
-
-                    Framed {
-                        required property var modelData
-                        label: modelData.label
-                        primary: modelData.index === root.picker.filterIndex
-                        available: !root.picker.backendUnavailable && !root.picker.submitting
-                        onActiveFocusChanged: if (activeFocus) types.reveal(this)
-                        // The chosen chip is the picker's own primary: a foreground label in an accent frame.
-                        onPressed: root.chipChosen(modelData.index)
-                    }
-                }
+            Text {
+                id: stripLeaf
+                width: Math.min(implicitWidth, strip.width)
+                text: strip.leaf
+                color: Theme.color.foreground
+                font.family: Theme.font.family
+                font.pixelSize: Theme.font.caption
+                elide: Text.ElideMiddle
+                textFormat: Text.PlainText
             }
+        }
+
+        // Picker040 path entry: the shared field, whose line pathLogic below answers.
+        Flea.PathEntry {
+            id: entry
+            anchors.left: moves.right
+            anchors.leftMargin: Theme.spacing.gap
+            anchors.right: parent.right
+            anchors.rightMargin: views.width + Theme.spacing.rowPaddingX + Theme.spacing.gap
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: Theme.spacing.hairline
+            path: pathLogic.basePath
+            home: root.picker.home
+            showHidden: root.picker.showHidden
+            onCommitLine: function (text) { pathLogic.commitTyped(text) }
+            onJumpChosen: function (path) { pathLogic.ask(path) }
+            onEditClosed: pathLogic.editClosed()
+            onCompleteRequested: function (dir, hidden) { root.listing.peek(dir, root.picker.windowSize, hidden) }
+            onSaid: function (text) { root.picker.say(text, false) }
+            onJumpRequested: function (id, ranking, favourites, recent) { root.listing.jump(id, ranking, favourites, recent) }
+        }
+
+        Flea.PickerPathBar {
+            id: pathLogic
+            picker: root.picker
+            listing: root.listing
+            backend: root.backend
+            entry: entry
         }
     }
 
@@ -340,25 +267,27 @@ Item {
 
         Mark {
             id: listButton
+            objectName: "pickerListView"
             glyph: "list"
             lit: root.picker.viewMode === "list"
+            restingColor: listButton.lit ? Theme.color.foreground : Theme.color.mutedFrame
             activeFocusOnTab: false
             onActivated: root.viewChosen("list")
         }
 
         Mark {
             id: gridButton
+            objectName: "pickerGridView"
             glyph: "grid"
             lit: root.picker.viewMode === "grid"
+            restingColor: gridButton.lit ? Theme.color.foreground : Theme.color.mutedFrame
             activeFocusOnTab: false
             onActivated: root.viewChosen("grid")
         }
     }
 
     function focusItems() {
-        var items = [cancelButton, acceptButton, backButton, upButton]
-        for (var i = 0; i < chipRepeater.count; i++) items.push(chipRepeater.itemAt(i))
-        return items
+        return [backButton, upButton]
     }
     function controls() {
         return root.focusItems().concat([listButton, gridButton]).map(function(item) { return root.picker.control(item.name, item, item.available) })

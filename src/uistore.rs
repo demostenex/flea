@@ -281,6 +281,23 @@ mod tests {
     }
 
     #[test]
+    fn language_marks_heal_on_and_saved_off_survives_settle() {
+        let d = TestDir::new("uistore-langmarks");
+        let s = store(&d);
+        assert_eq!(s.read().get("langMarks").and_then(Json::as_bool), Some(true));
+        fs::create_dir_all(s.file().parent().expect("state dir")).expect("state dir");
+        fs::write(s.file(), r#"{"langMarks":"false"}"#).expect("invalid preference");
+        s.settle().expect("heal before GUI launch");
+        let healed = fs::read_to_string(s.file()).expect("healed document");
+        assert_eq!(jsondoc::parse(&healed).expect("JSON").get("langMarks").and_then(Json::as_bool), Some(true));
+        fs::write(s.file(), r#"{"langMarks":false}"#).expect("saved off");
+        s.settle().expect("settle saved off");
+        s.update(&patch(r#"{"hidden":true}"#)).expect("unrelated preference");
+        let kept = fs::read_to_string(s.file()).expect("kept document");
+        assert_eq!(jsondoc::parse(&kept).expect("JSON").get("langMarks").and_then(Json::as_bool), Some(false));
+    }
+
+    #[test]
     fn a_malformed_file_reads_the_full_default_shape_rather_than_throwing() {
         let d = TestDir::new("uistore-malformed");
         let s = store(&d);
@@ -372,6 +389,17 @@ mod tests {
         let reread = s.read();
         let after: Vec<&str> = reread.get("columns").and_then(Json::as_array).expect("columns").iter().filter_map(Json::as_str).collect();
         assert_eq!(after, ["name", "size", "date"]);
+    }
+
+    #[test]
+    fn per_folder_views_survive_a_store_round_trip() {
+        let d = TestDir::new("uistore-folder-views");
+        let s = store(&d);
+        s.update(&patch(r#"{"rememberViewPerFolder":true,"folderViews":{"/home/gm":"grid","/home/gm/Downloads":"list","/home/gm/Pictures":"grid","/home/gm/Documents":"list","/home/gm/Work":"columns"}}"#)).expect("store");
+        let reopened = s.read();
+        assert_eq!(reopened.get("rememberViewPerFolder").and_then(Json::as_bool), Some(true));
+        let views = reopened.get("folderViews").and_then(Json::as_object).expect("folderViews");
+        assert_eq!(views.iter().map(|(path, mode)| format!("{}={}", path, mode.as_str().unwrap_or(""))).collect::<Vec<_>>(), ["/home/gm=grid", "/home/gm/Downloads=list", "/home/gm/Pictures=grid", "/home/gm/Documents=list", "/home/gm/Work=columns"]);
     }
 
     #[test]

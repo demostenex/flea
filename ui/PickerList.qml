@@ -4,6 +4,7 @@ import "." as Flea
 import "js/Match.js" as Match
 import "js/Picker.js" as Picker
 import "js/Keymap.js" as Keymap
+import "js/MarkBox.js" as MarkBox
 import "js/Scroll.js" as Scroll
 import "js/Sort.js" as Sort
 
@@ -17,10 +18,8 @@ ListView {
     property var backend: null
 
     readonly property int visibleRows: Math.max(1, Math.ceil(root.height / Theme.rowHeight))
-    // The board's content-box dimensions exclude the border; QML Rectangle dimensions include it.
-    readonly property int checkInnerSize: Theme.font.bodySmall + Theme.spacing.hairline
-    readonly property int checkBorderWidth: Theme.spacing.hairline * 2
-    readonly property int checkSize: root.checkInnerSize + root.checkBorderWidth * 2
+    // PickerBox's outer size, read by the header's leading slot.
+    readonly property int checkSize: MarkBox.outer(Theme.font.bodySmall, Theme.spacing.hairline)
 
     // Hidden builds nothing: a hidden view is not a free view, AGENTS.md rule 6.
     model: root.visible ? root.picker.shownTotal : 0
@@ -62,21 +61,12 @@ ListView {
         width: Scroll.contentWidth(root.width, Theme.spacing.rowPaddingX)
         height: Theme.rowHeight
 
-        // The board's marked row: the accent wash and the accent bar, under the row's own text. The
-        // window's selected fill is a foreground grey, and SendPicker.html marks in the accent, so
-        // ui/Row.qml is left unselected here and the picker paints its own mark behind it.
+        // The board's marked row: the selection fill under the row's own text, never folded with the cursor rung ui/Row.qml paints.
         Rectangle {
             visible: cell.isMarked
             width: root.width
             height: parent.height
-            color: Style.selectedAccentFill
-        }
-
-        Rectangle {
-            visible: cell.isMarked
-            width: Theme.spacing.hairline * 2
-            height: parent.height
-            color: Theme.color.accent
+            color: Style.selectionFill
         }
 
         Flea.Row {
@@ -92,25 +82,13 @@ ListView {
             kindNames: root.picker.kindNames
         }
 
-        Rectangle {
+        Flea.PickerBox {
             id: box
             visible: cell.markable
             anchors.left: parent.left
             anchors.leftMargin: Theme.spacing.rowPaddingX
             anchors.verticalCenter: parent.verticalCenter
-            width: root.checkSize
-            height: root.checkSize
-            color: "transparent"
-            border.width: root.checkBorderWidth
-            border.color: cell.isMarked ? Theme.color.accent : Theme.color.muted
-
-            Flea.Glyph {
-                anchors.fill: parent
-                visible: cell.isMarked
-                name: "check"
-                maxSize: root.checkInnerSize - root.checkBorderWidth * 2
-                color: Theme.color.accent
-            }
+            marked: cell.isMarked
         }
 
         HoverHandler {
@@ -201,6 +179,9 @@ ListView {
             root.picker.showHidden = !root.picker.showHidden
             if (root.picker.path.length > 0)
                 root.picker.openWithoutHistory(root.picker.path)
+        } else if (action === "pathBar") {
+            root.firstArmed = false
+            root.picker.openPathBar()
         } else {
             event.accepted = false
         }

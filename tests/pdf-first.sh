@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/headless-commons.sh"
 # A turn before the first page lands must leave the cap alone and still land the turned-to page; offscreen, so no display and no lock.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -42,7 +43,7 @@ sandbox_scratch "$first_work"
 mkdir -p "$first_work"/{config,home,runtime,tmp} || exit 1
 chmod 700 "$first_work/runtime" || exit 1
 ln -s "$PWD/tests/pdf-first.qml" "$first_work/config/shell.qml" || exit 1
-ln -s /usr/share/omarchy/shell/Commons "$first_work/config/Commons" || exit 1
+headless_commons "$first_work" || exit 1
 ln -s /usr/share/omarchy/shell/Ui "$first_work/config/Ui" || exit 1
 
 # Two pages: a 54-megapixel noise JPEG that renders past any turn, then a light page that lands at once.
@@ -89,6 +90,12 @@ else
     case "$viewer_line" in
     *backend=1*fetchFirst=1*asked=1*fetchId=1*slot=quicklook*) ok "Quick Look forwards its backend and fetches" ;;
     *) bad "Quick Look never fetched through its viewer: $viewer_line (log $log)" ;;
+    esac
+    # Sample input: 'PDFFIRST FAILSENTENCE other=This file could not be read. | stalled=This file is not responding.', the flag alone picks the sentence.
+    fail_line=$(grep -a -m1 'PDFFIRST FAILSENTENCE' "$log")
+    case "$fail_line" in
+    *"other=This file could not be read. | stalled=This file is not responding."*) ok "only the stalled copy reads not responding" ;;
+    *) bad "a copy failure read the wrong sentence: $fail_line (log $log)" ;;
     esac
     # Sample input: 'PDFFIRST FETCHLATE source=1', the document kept after a late class.
     late_line=$(grep -a -m1 'PDFFIRST FETCHLATE' "$log")

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Permissions dismissal must return the first key and pointer gesture to the real listing.
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -19,13 +20,13 @@ chmod 4644 "$probe/home/fixture/a-special.txt" || exit 1
 env HOME="$probe/home" XDG_STATE_HOME="$probe/state" "$bin" --ui-state \
     '{"view":"list","keys":"default","menu":{"hidden":[]},"preview":{"column":false,"thumbnails":"off"},"updates":{"autoCheck":false},"display":{"textSize":{"mode":14}}}' >/dev/null || exit 1
 ln -s "$PWD/ui" "$probe/config/flea" || exit 1
-ln -s "$(readlink -f ui/boot/Commons)" "$probe/config/Commons" || exit 1
+headless_commons "$probe" || exit 1
 ln -s "$(readlink -f ui/boot/Ui)" "$probe/config/Ui" || exit 1
 cp tests/permissions-focus.qml "$probe/config/shell.qml" || exit 1
 ln -s "$PWD/ui/boot/fleatab.qml" "$probe/config/fleatab.qml" || exit 1
 cp tests/permissions-layout.js "$probe/config/permissions-layout.js" || exit 1
 log="$probe/qs.log"
-readonly runLimitSeconds=60 expectedChecks=200 expectedQsStatus=143
+readonly runLimitSeconds=60 expectedChecks=220 expectedQsStatus=143
 env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u FLEA_SELECT \
     HOME="$probe/home" XDG_STATE_HOME="$probe/state" XDG_CONFIG_HOME="$probe/config" \
     XDG_DATA_HOME="$probe/data" XDG_CACHE_HOME="$probe/cache" XDG_RUNTIME_DIR="$probe/runtime" \

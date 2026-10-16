@@ -3,6 +3,7 @@
 import QtQuick
 import Quickshell
 import "flea" as Flea
+import "langmark-count.js" as LangCost
 
 // Rowcost: one Row and one GridTile, built as ui/List.qml and ui/GridArea.qml build them, are counted against the measured objects.
 ShellRoot {
@@ -10,9 +11,15 @@ ShellRoot {
 
     property var sampleRow: ({ n: "rowcost.txt", i: "text-x-generic", p: 420, d: false, s: 13, m: 1758835200, t: false, k: 0, v: 0 })
     property var failures: []
-    // One Loader fewer than 0.3.6 98404bc7 (row=18 grid=14); one more object per delegate is a regression.
+    // One Loader fewer than 0.3.6 98404bc7 (row=18 grid=14), and a tile's tip takes its host's hover (grid=13); one more object per delegate is a regression.
     readonly property int rowMax: 17
-    readonly property int gridMax: 14
+    // A tile builds its drop wash, drop label and tooltip on use, 13 at rest; tests/gridcaption.qml counts its Texts.
+    readonly property int gridMax: 13
+    // A locating row draws its path split, armed strip mark included (measured 26, 22 unarmed); one more object is a regression.
+    readonly property int locatingMax: 26
+    readonly property int locatingUnarmedMax: 22
+    // The match wash a tile builds with the strip: its holder, the face it measures by and one box per caption line.
+    readonly property int gridArmedMax: 17
 
     Flea.Row {
         id: probeRow
@@ -105,6 +112,8 @@ ShellRoot {
     property int clipBuiltCount: -1
 
     function measureIdle() {
+        LangCost.plain(root.failures, probeRow, "rowcost", root.rowMax)
+        LangCost.plain(root.failures, probeTile, "rowcost-grid", root.gridMax)
         var rowCount = root.countUnder(probeRow)
         var gridCount = root.countUnder(probeTile)
         if (rowCount > root.rowMax)
@@ -126,6 +135,27 @@ ShellRoot {
             failures.push("row cell() no longer answers all four cells")
         if (probeRow.dropBuilt())
             failures.push("a row at rest builds its drop frame")
+        // Initial marks and drop targets must build their cue without a later active change.
+        var bornComponent = Qt.createComponent(Qt.resolvedUrl("flea/Row.qml"))
+        if (bornComponent.status !== Component.Ready) {
+            failures.push("the construction probe cannot load Row.qml: " + bornComponent.errorString())
+        } else {
+            var bornStates = [{ clipMark: "copy", dropTarget: false }, { clipMark: "scissors", dropTarget: false }, { clipMark: "", dropTarget: true }]
+            for (var b = 0; b < bornStates.length; b++) {
+                var born = bornComponent.createObject(root, { width: 800, row: root.sampleRow,
+                    clipMark: bornStates[b].clipMark, dropTarget: bornStates[b].dropTarget })
+                if (born === null) {
+                    failures.push("a row born marked could not be created")
+                    continue
+                }
+                if (bornStates[b].clipMark.length > 0 && born.clipRight() < 0)
+                    failures.push("a row born with " + bornStates[b].clipMark + " draws no clipboard mark")
+                if (bornStates[b].dropTarget && (!born.dropBuilt() || born.dropLabelText() !== "move here"))
+                    failures.push("a row born as a drop target builds no move cue")
+                born.destroy()
+            }
+        }
+        bornComponent.destroy()
         // No assigned set reaches a standalone row, so the fallback computes the draw from its own inputs.
         if (probeRow.assignedCols !== null)
             failures.push("a standalone row arrives with a shared set instead of the local default")
@@ -142,12 +172,19 @@ ShellRoot {
             failures.push("a fallback row restores " + JSON.stringify(probeRow.cols) + ", want " + wideCols)
         root.rowIdleCount = rowCount
         root.gridIdleCount = gridCount
+        root.nameRestCount = root.countUnder(probeRow.nameItem())
         probeTile.renaming = true
         renameProbe.start()
     }
 
     property int rowIdleCount: -1
     property int gridIdleCount: -1
+    property int nameRestCount: -1
+    property int locatingCount: -1
+    property int armedCount: -1
+    property int unarmedCount: -1
+    property int gridArmedCount: -1
+    property int gridMarkedCount: -1
 
     function measureRename() {
         if (root.editorsUnder(probeTile) !== 1)
@@ -350,12 +387,53 @@ ShellRoot {
         if (String(probeRow.cell("date").color) !== String(probeRow.cellInk))
             failures.push("highlight on draws " + probeRow.cell("date").color + " on a stale date, want cellInk")
         Flea.ViewState.state = {}
+        root.measureLocating()
+    }
+
+    // A locating row draws its name in the path split, so the hidden plain name builds no mark of its own, armed or matched.
+    function measureLocating() {
+        probeRow.markArmed = true
+        probeRow.searchQuery = "old"
+        var hidden = root.countUnder(probeRow.nameItem())
+        if (!probeRow.locating || hidden !== root.nameRestCount)
+            failures.push("a locating row's hidden name holds " + hidden + " objects, want its rest " + root.nameRestCount)
+        root.locatingCount = root.countUnder(probeRow)
+        probeRow.searchQuery = "zzz"
+        root.armedCount = root.countUnder(probeRow)
+        probeRow.markArmed = false
+        root.unarmedCount = root.countUnder(probeRow)
+        // A "/" filter inside a warm search is not locating, so its row draws its own run on the plain name.
+        probeRow.searchQuery = "old"
+        probeRow.filtering = true
+        probeRow.locateArmed = true
+        if (probeRow.locating || probeRow.nameItem().matchStart !== 0)
+            failures.push("a filtered row in a warm search draws matchStart " + probeRow.nameItem().matchStart + ", want 0")
+        probeRow.filtering = false
+        probeRow.locateArmed = false
+        probeRow.searchQuery = ""
+        if (root.locatingCount > root.locatingMax || root.armedCount > root.locatingMax)
+            failures.push("an armed locating row holds " + root.locatingCount + " and " + root.armedCount + " objects over the " + root.locatingMax + " ceiling")
+        if (root.unarmedCount > root.locatingUnarmedMax)
+            failures.push("an unarmed locating row holds " + root.unarmedCount + " objects over the " + root.locatingUnarmedMax + " ceiling")
+        // A tile builds its match mark with the strip, nothing more on the key that marks it, and drops it with the strip.
+        probeTile.markArmed = true
+        root.gridArmedCount = root.countUnder(probeTile)
+        probeTile.markQuery = "cost"
+        root.gridMarkedCount = root.countUnder(probeTile)
+        probeTile.markArmed = false
+        probeTile.markQuery = ""
+        if (root.gridArmedCount > root.gridArmedMax || root.gridMarkedCount !== root.gridArmedCount)
+            failures.push("an armed tile holds " + root.gridArmedCount + " and a marked one " + root.gridMarkedCount + ", want equal and at most " + root.gridArmedMax)
+        if (root.countUnder(probeTile) !== root.gridIdleCount)
+            failures.push("a disarmed tile keeps its mark objects")
         root.report()
     }
 
     function report() {
         if (failures.length === 0)
-            console.log("ROWCOST PASS row=" + root.rowIdleCount + " grid=" + root.gridIdleCount)
+            console.log("ROWCOST PASS row=" + root.rowIdleCount + " grid=" + root.gridIdleCount + " locating=" + root.locatingCount
+                        + " armed-unmatched=" + root.armedCount + " unarmed-unmatched=" + root.unarmedCount
+                        + " grid-armed=" + root.gridArmedCount + " grid-marked=" + root.gridMarkedCount)
         for (var f = 0; f < failures.length; f++)
             console.log("ROWCOST FAIL " + failures[f])
         Quickshell.execDetached(["kill", String(Quickshell.processId)])

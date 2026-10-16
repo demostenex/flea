@@ -1,5 +1,6 @@
 // X11 file clipboard adapter. xclip owns the GNOME file selection after Flea exits;
 // a small Xlib watcher notices selection-owner changes for other Flea windows.
+use super::control::OfferFiles;
 use super::{format, reply};
 use crate::backend::opsreq::OpMsg;
 use std::ffi::c_void;
@@ -32,9 +33,6 @@ extern "C" {
         actual_kind: *mut c_ulong, actual_format: *mut c_int,
         count: *mut c_ulong, remaining: *mut c_ulong, data: *mut *mut u8) -> c_int;
     fn XFree(data: *mut c_void) -> c_int;
-    fn XSetErrorHandler(handler: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>)
-        -> Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
-    fn XSelectInput(display: *mut c_void, window: c_ulong, event_mask: c_long) -> c_int;
     fn setsid() -> c_int;
 }
 
@@ -48,12 +46,6 @@ static X11_INIT: Once = Once::new();
 const MAX_PAYLOAD: u64 = 64 * 1024 * 1024;
 const READ_WAIT: Duration = Duration::from_secs(3);
 const WATCH_EVERY: Duration = Duration::from_millis(150);
-const PROPERTY_CHANGE_MASK: c_long = 1 << 22;
-const PROPERTY_NOTIFY: c_int = 28;
-
-// A clipboard owner may disappear between querying its XID and reading its property.
-// Xlib's default error handler exits the whole backend for that ordinary race.
-unsafe extern "C" fn ignore_x_error(_display: *mut c_void, _event: *mut c_void) -> c_int { 0 }
 
 struct Display {
     raw: *mut c_void,
@@ -65,10 +57,7 @@ struct Display {
 
 impl Display {
     fn open() -> Result<Self, String> {
-        X11_INIT.call_once(|| unsafe {
-            XInitThreads();
-            XSetErrorHandler(Some(ignore_x_error));
-        });
+        X11_INIT.call_once(|| { unsafe { XInitThreads(); } });
         let raw = unsafe { XOpenDisplay(std::ptr::null()) };
         if raw.is_null() {
             return Err("the X11 display could not be opened".to_string());
@@ -132,23 +121,13 @@ impl Display {
         Some(event_base)
     }
 
-    fn watch_owner_token(&self, owner: c_ulong) {
-        if owner != 0 {
-            unsafe {
-                XSelectInput(self.raw, owner, PROPERTY_CHANGE_MASK);
-                XSync(self.raw, 0);
-            }
-        }
-    }
-
     fn selection_event_pending(&self, event_base: c_int) -> bool {
         let mut changed = false;
         while unsafe { XPending(self.raw) } > 0 {
             // XEvent is a union of 24 longs; only its first int (type) is needed.
             let mut event = [0 as c_ulong; 24];
             unsafe { XNextEvent(self.raw, event.as_mut_ptr().cast()); }
-            let kind = unsafe { *(event.as_ptr().cast::<c_int>()) };
-            if kind == event_base || kind == PROPERTY_NOTIFY { changed = true; }
+            if unsafe { *(event.as_ptr().cast::<c_int>()) } == event_base { changed = true; }
         }
         changed
     }
@@ -198,14 +177,14 @@ fn read_target(mime: &str) -> Result<Option<Vec<u8>>, String> {
     Ok(status.success().then_some(bytes))
 }
 
-fn read_files(display: &Display, owner: c_ulong) -> Result<reply::Got, String> {
-    let none = || reply::Got { clip: "none".into(), paths: Vec::new(), token: String::new(), skipped: 0 };
+fn read_files(display: &Display, owner: c_ulong) -> Result<OfferFiles, String> {
+    let none = || OfferFiles { op: "none".into(), paths: Vec::new(), token: String::new(), skipped: 0, owner_pid: None };
     if owner == 0 { return Ok(none()); }
     if let Some(bytes) = read_target(format::GNOME)? {
         if let Some((op, paths, skipped)) = format::parse_gnome(&bytes) {
             if !paths.is_empty() {
                 format::check_path_cap(&paths)?;
-                return Ok(reply::Got { clip: op, paths, token: display.get_token(owner).unwrap_or_default(), skipped });
+                return Ok(OfferFiles { op, paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
             }
         }
     }
@@ -214,14 +193,14 @@ fn read_files(display: &Display, owner: c_ulong) -> Result<reply::Got, String> {
         if !paths.is_empty() {
             format::check_path_cap(&paths)?;
             let cut = read_target(format::KDE_CUT)?.is_some_and(|bytes| format::parse_kde_cut(&bytes));
-            return Ok(reply::Got { clip: if cut { "cut" } else { "copy" }.into(),
-                paths, token: display.get_token(owner).unwrap_or_default(), skipped });
+            return Ok(OfferFiles { op: if cut { "cut" } else { "copy" }.into(),
+                paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
         }
     }
     Ok(none())
 }
 
-pub fn get() -> Result<reply::Got, String> {
+pub fn get() -> Result<OfferFiles, String> {
     let display = Display::open()?;
     for _ in 0..2 {
         let owner = display.owner();
@@ -258,7 +237,7 @@ pub fn set(op: &str, paths: &[String]) -> Result<String, String> {
         }
         let owner = display.owner();
         if owner != 0 && owner != before
-            && read_files(&display, owner).is_ok_and(|got| got.clip == op && got.paths == paths)
+            && read_files(&display, owner).is_ok_and(|got| got.op == op && got.paths == paths)
             && display.owner() == owner {
             let token = format::make_token()?;
             if !display.put_token(owner, &token) {
@@ -289,12 +268,12 @@ pub fn clear_cut(paths: &[String]) -> Result<bool, String> {
     let display = Display::open()?;
     let owner = display.owner();
     let got = read_files(&display, owner)?;
-    if got.clip != "cut" || got.paths != paths || display.owner() != owner { return Ok(false); }
+    if got.op != "cut" || got.paths != paths || display.owner() != owner { return Ok(false); }
     Ok(display.clear())
 }
 
-fn changed(got: &reply::Got) -> String {
-    reply::reply_get(true, Some(got), "").replacen("\"op\":\"get\"", "\"op\":\"changed\"", 1)
+fn changed(got: &OfferFiles) -> String {
+    reply::reply_get(Ok(got)).replacen("\"op\":\"get\"", "\"op\":\"changed\"", 1)
         .replacen("\"ok\":true,", "", 1)
 }
 
@@ -319,9 +298,6 @@ pub fn watch(replies: mpsc::Sender<OpMsg>) {
         let mut ticks = 0;
         loop {
             let owner = display.owner();
-            // Subscribe before reading: a token added after the read then triggers
-            // PropertyNotify. If it was added during subscription, the read sees it.
-            if owner != last_owner && event_base.is_some() { display.watch_owner_token(owner); }
             // On servers without XFixes, re-read each second: XIDs can be reused.
             let notified = event_base.is_some_and(|base| display.selection_event_pending(base));
             ticks += 1;
@@ -357,7 +333,7 @@ mod tests {
 
     #[test]
     fn changed_reply_keeps_the_clipboard_shape() {
-        let got = reply::Got { clip: "cut".into(), paths: vec!["/tmp/a".into()], token: "x11:1a".into(), skipped: 0 };
+        let got = OfferFiles { op: "cut".into(), paths: vec!["/tmp/a".into()], token: "x11:1a".into(), skipped: 0, owner_pid: None };
         let line = changed(&got);
         assert!(line.contains("\"op\":\"changed\""));
         assert!(line.contains("\"clip\":\"cut\""));

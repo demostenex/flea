@@ -1,9 +1,11 @@
 .pragma library
 
+.import "Lists.js" as Lists
 .import "Archive.js" as Archive
 .import "ExtThumbs.js" as ExtThumbs
 .import "Format.js" as Format
 .import "Sort.js" as Sort
+.import "StateWords.js" as StateWords
 
 // Submenus carry an entry array, including an empty array while a provider is unavailable.
 function hasSubmenu(entry) {
@@ -26,6 +28,9 @@ function clamp(point, size, bounds) {
 // The flyout's tail row, which is the only way into the dialog; ui/PaneMenuActions.qml reads it.
 var OPEN_WITH_OTHER = "__another__"
 
+// The file menu's rename row over two or more selected rows, one whole template.
+var RENAME_MANY = "Rename %1 items\u2026"
+
 // One order for every menu: F file, B background, T Trash, P Places, R rail rows (never hideable, never in Settings > Menus).
 var INVENTORY = [
     ["open", "Open", "folder-open", "FTPR", "open"],
@@ -35,15 +40,21 @@ var INVENTORY = [
     // it carries are the ones that take a path and not the clipboard, archive, send or destroy ones.
     ["openTab", "New tab", "plus", "P", "open"],
     ["openwith", "Open with", "app-window", "F", "open", "openWith"],
-    // Mount and Unmount are one toggle on the drive mark, as Show and Hide share the eye; Eject keeps its own.
+    // The run card's own entrances: Run asks through flea --open like Enter does, so the card stays the one place anything executes.
+    ["run", "Run", "play", "F", "open"],
+    ["openAsText", "Open as text", "file-text", "F", "open"],
+    // Mount and Unmount are one toggle; a locked container offers Unlock alone (ui/UnlockDialog.qml).
+    ["unlockVolume", "Unlock", "lock", "R", "open"],
     ["mountVolume", "Mount", "drive", "R", "open"],
     ["mountPhone", "Mount", "drive", "R", "open"],
     ["unmountVolume", "Unmount", "drive", "R", "rrelease"],
     ["unmountPhone", "Unmount", "drive", "R", "rrelease"],
     ["unmount", "Unmount", "drive", "R", "rrelease"],
     ["eject", "Eject", "eject", "R", "rrelease"],
-    ["newFolder", "New Folder", "folder-plus", "B", "open"],
-    ["newFile", "New File", "file-plus", "B", "open"],
+    // Flash image opens the flasher with this drive chosen: last, in a group of its own, no switch.
+    ["flashImage", "Flash image", "file", "R", "rflash"],
+    ["newFolder", "New folder", "folder-plus", "B", "open"],
+    ["newFile", "New file", "file-plus", "B", "open"],
     ["cut", "Cut", "scissors", "F", "basic"],
     ["copy", "Copy", "copy", "F", "basic"],
     ["paste", "Paste", "clipboard", "FB", "basic"],
@@ -62,6 +73,8 @@ var INVENTORY = [
     ["compress", "Compress", "archive", "F", "archive"],
     ["extract", "Extract", "archive-out", "F", "archive"],
     ["convert", "Convert", "sliders", "F", "archive"],
+    // Flash to drive opens the flasher with this image chosen, after Convert.
+    ["flashDrive", "Flash to drive", "drive", "F", "archive"],
     // Flea's own spiral drawn static: FleaMark paints in over two seconds, which a menu row never waits for.
     ["shelf", "Add to shelf", "shelf", "F", "share", "addToShelf"],
     ["taildrop", "Send with Taildrop", "tailscale", "F", "share"],
@@ -69,7 +82,7 @@ var INVENTORY = [
     // on PATH, and carrying its own reproduced mark rather than a cut glyph.
     ["localsend", "Send with LocalSend", "localsend", "F", "share"],
     ["dropbox", "Move to Dropbox", "dropbox", "F", "share"],
-    ["sharelink", "Copy Share Link", "network", "F", "share"],
+    ["sharelink", "Copy share link", "network", "F", "share"],
     ["trash", "Move to Trash", "trash", "F", "trash"],
     ["delete", "Delete permanently", "trash", "F", "trash", "deletePermanently"],
     ["openTerminal", "Open in terminal", "terminal", "FBP", "inspect"],
@@ -84,10 +97,14 @@ var INVENTORY = [
     // MenuAdditions rule 2: after Copy as, one row per executable in ~/.config/flea/scripts, and
     // absent rather than greyed when that directory is missing or holds none.
     ["runScript", "Run script", "terminal", "F", "inspect"],
+    // MenuAdditions040 specimen e: Compare sits before Add to Favorites, with no key, and is absent unless two regular files are marked.
+    ["compare", "Compare", "columns", "F", "inspect"],
     ["addFavourite", "Add to Favorites", "star", "FBP", "inspect"],
+    ["tags", "Tags", "tag", "F", "inspect"],
     ["removeFavourite", "Remove from Favorites", "minus", "PR", "inspect"],
     ["sort", "Sort by", "sort", "B", "view"],
     ["toggleHidden", "Show hidden files", "eye", "FB", "view"],
+    ["toggleLangMarks", "Show code icons", "code", "FB", "view"],
     ["extThumbs", "Show thumbnails", "image", "B", "view"],
     ["settings", "Settings", "sliders", "B", "settings"],
     ["updateFlea", "Update Flea", "download", "B", "settings"],
@@ -152,22 +169,32 @@ function availableEntry(e, p, kind) {
     // MenuAdditions040: Invert selection flips over the rows the listing
     // draws, so with nothing selected there is nothing to flip from.
     if (e.action === "invertSelection" && count === 0) return false
-    if (["duplicate", "rename", "properties"].indexOf(e.action) >= 0)
+    // Run names a file to execute, so a directory or a wider selection is not offered it.
+    if ((e.action === "run" || e.action === "openAsText")
+            && (count !== 1 || (Number(p.rowMode) & Format.S_IFMT) === Format.S_IFDIR)) return false
+    if (["duplicate", "properties"].indexOf(e.action) >= 0)
         e.disabled = count !== 1
+    // Bulk rename: several selected rows open the card instead of refusing, and the row says how many.
+    if (e.action === "rename") {
+        e.disabled = count < 1
+        if (count > 1) e.label = RENAME_MANY.arg(Format.count(count))
+    }
     if (e.action === "permissions") {
         var permission = permissionsEntry(p.rowMode, count, p.selectionModes)
         e.disabled = permission.disabled
-        if (permission.errored) e.errored = true
+        if (permission.errored) { e.errored = true; if (permission.hint) e.hint = permission.hint }
     }
     // Only a cursor-row script without any execute bit qualifies; its two-byte probe runs once at menu open.
     if (e.action === "makeExecutable" && !canMakeExecutable(p.rowMode, count, p.hasShebang, p.cursorIsTarget)) return false
+    // The held rows or menu snapshot supply every selected item's own kind.
+    if (e.action === "compare" && !canCompare(p.compareKinds)) return false
     if (e.action === "runScript") {
         if (!(p.scripts || []).length) return false
         e.submenu = p.scripts.map(function (script) { return { id: script.id, label: script.label } })
     }
     if (e.action === "compress") {
         if (!(p.archiveFormats || []).length) return false
-        e.submenu = Archive.formatEntries(p.archiveFormats)
+        e.submenu = Archive.formatEntries(p.archiveFormats).concat(Archive.passwordEntry(p.archiveFormats))
     }
     // Issue 133: a mount with no trash directory never offers the row, rather than offering one that
     // fails; ui/js/Mounts.js trashable is the one reader of what the path says about that.
@@ -175,8 +202,12 @@ function availableEntry(e, p, kind) {
     // A read-only folder turns its write rows off; the listing's own w flag decides, never the mode.
     if (p.dirWritable === false && ["newFolder", "newFile", "paste", "pasteAs", "duplicate",
             "rename", "trash", "deletePermanently"].indexOf(e.action) >= 0) e.disabled = true
+    if (e.action === "tags" && !p.tagSubmenu) return false
+    if (e.action === "tags") e.submenu = p.tagSubmenu
     if (e.action === "extract" && !Archive.extractEntry(e, p, count)) return false
     if (e.action === "convert" && !(p.rowIsImage && p.canConvert && count === 1)) return false
+    // Flash to drive shows only when one disk image is selected, read off the name table.
+    if (e.action === "flashDrive" && (count !== 1 || !Archive.isDiskImage(p.rowName, p.flashZipMember))) return false
     // OpenWith.html: the desktop's current default is first and carries the muted caption "default"
     // in the hint slot, the registry order follows it, and the tail row sits under its own
     // separator with the app-window glyph. The row self-hides when the registry names nothing.
@@ -198,9 +229,8 @@ function availableEntry(e, p, kind) {
         delete e.glyph
         e.submenu = p.taildropPeers || []
         e.disabled = p.taildropRefreshing === true || !e.submenu.length
-        // The row says it cannot answer by being red, not by carrying the reason: a sentence here
-        // widened the menu past its own frame while the providers were still being read.
-        if (e.disabled && p.taildropRefreshing !== true) e.errored = true
+        // The row says it cannot answer by red and one state word, not the reason: a sentence widened the menu past its frame mid-read.
+        if (e.disabled && p.taildropRefreshing !== true) { e.errored = true; e.hint = StateWords.taildrop(p) }
     }
     // Absent rather than greyed when nothing is installed, the Menu board's rule for a row whose
     // whole destination is missing; the row is a plain send, so it has no submenu and no reason.
@@ -211,13 +241,13 @@ function availableEntry(e, p, kind) {
         delete e.glyph
         e.submenu = p.localSendPeers || []
         e.disabled = p.localSendChecking === true || !e.submenu.length
-        if (e.disabled && p.localSendChecking !== true) e.errored = true
+        if (e.disabled && p.localSendChecking !== true) { e.errored = true; e.hint = StateWords.localsend(p) }
     }
     if (e.action === "dropbox" || e.action === "sharelink") {
         if (!p.dropboxInstalled || (e.action === "dropbox" ? p.rowInDropbox : !p.rowInDropbox)) return false
         e.disabled = p.dropboxRefreshing === true || !p.dropboxPath
         if (e.action === "dropbox") { e.mark = "dropbox"; delete e.glyph }
-        if (e.disabled && p.dropboxRefreshing !== true) e.errored = true
+        if (e.disabled && p.dropboxRefreshing !== true) { e.errored = true; e.hint = StateWords.dropbox(p) }
     }
     if (e.action === "sort") e.submenu = sortEntries(p.hasFolderSort === true)
     // Present only while a check has found a newer build, whose version rides the hint slot beside the status square.
@@ -230,6 +260,11 @@ function availableEntry(e, p, kind) {
         var hidden = hiddenRow(p.showHidden)
         e.label = hidden.label
         e.glyph = hidden.glyph
+    }
+    if (e.action === "toggleLangMarks") {
+        var code = codeIconsRow(p.langMarks)
+        e.label = code.label
+        e.glyph = code.glyph
     }
     // The class switch ships hidden; switched on, it is present only on network,
     // phone or USB storage and reads Show while that class is off, Hide while on.
@@ -247,14 +282,16 @@ function availableRail(e, entry) {
     var share = network && entry.kind === "share"
     var mounted = entry.mounted === true
     switch (e.id) {
-    case "mountVolume": return volume && !mounted && entry.volumeMenu === true
+    case "unlockVolume": return volume && entry.locked === true
+    case "mountVolume": return volume && !mounted && entry.locked !== true
     case "mountPhone": return phone && !mounted
-    case "open": return (volume && mounted && (entry.volumeMenu === true || entry.removable === true))
-        || (phone && mounted) || (share && mounted)
-    case "unmountVolume": return volume && mounted && entry.volumeMenu === true
+    case "open": return (volume && mounted) || (phone && mounted) || (share && mounted)
+    case "unmountVolume": return volume && mounted
     case "unmountPhone": return phone && mounted
     case "unmount": return share && mounted
-    case "eject": return volume && mounted && entry.removable === true
+    case "eject": return volume && mounted && (entry.removable === true || entry.loop === true)
+    // Flash image shows on a writable removable drive, mounted or not, never on an open crypt, whose mapper names no drive.
+    case "flashImage": return volume && entry.removable === true && entry.readOnly !== true && !/^\/dev\/(mapper\/|dm-)/.test(entry.device || "")
     case "rename": return share && entry.editable !== false
     case "editPlace": return share && entry.editable !== false
     case "remove": return share && entry.editable !== false
@@ -264,21 +301,32 @@ function availableRail(e, entry) {
 }
 
 // The mode describes the selected object itself, so a symlink never grants access to its unseen target.
-// Issue 193, GM's ruling of 2026-09-24: a row that cannot act reads red with no sentence, as a provider does.
+// Issue 193, decided 2026-09-24: a row that cannot act reads red with one state word, as a provider does.
 // MenuAdditions040: Permissions takes the whole selection, so one bad row
 // among modes refuses the row; the dialog inspects each file in turn.
 function permissionsEntry(mode, count, modes) {
+    var word
     if (modes !== undefined && modes !== null && modes.length > 0) {
         for (var i = 0; i < modes.length; i++) {
             var kind = (Number(modes[i]) || 0) & Format.S_IFMT
-            if (!(kind === Format.S_IFREG || kind === 0o040000))
-                return { label: "Permissions", action: "permissions", glyph: "lock", disabled: true, errored: true }
+            if (!(kind === Format.S_IFREG || kind === 0o040000)) {
+                var bad = { label: "Permissions", action: "permissions", glyph: "lock", disabled: true, errored: true }
+                word = StateWords.permissions(modes[i])
+                if (word) bad.hint = word
+                return bad
+            }
         }
         return { label: "Permissions", action: "permissions", glyph: "lock", disabled: false, errored: false }
     }
-    var kind = (Number(mode) || 0) & Format.S_IFMT
-    var allowed = count >= 1 && (kind === Format.S_IFREG || kind === 0o040000)
-    return { label: "Permissions", action: "permissions", glyph: "lock", disabled: !allowed, errored: !allowed }
+    var one = (Number(mode) || 0) & Format.S_IFMT
+    var allowed = count >= 1 && (one === Format.S_IFREG || one === 0o040000)
+    var entry = { label: "Permissions", action: "permissions", glyph: "lock", disabled: !allowed, errored: !allowed }
+    // No selection refuses the row for want of an item, not for a kind, so it names no kind; an unread mode names none either.
+    if (!allowed && count >= 1) {
+        word = StateWords.permissions(mode)
+        if (word) entry.hint = word
+    }
+    return entry
 }
 
 // Only a single cursor-row regular file with a shebang and no execute bit.
@@ -287,6 +335,13 @@ function canMakeExecutable(mode, count, hasShebang, cursorIsTarget) {
     var bits = Number(mode) || 0
     if ((bits & Format.S_IFMT) !== Format.S_IFREG) return false
     return (bits & Format.ANY_EXECUTE_BIT) === 0
+}
+
+// Exactly two marked regular files; kinds holds each item's own type bits, so links stay links.
+// Sample input: [0o100000, 0o100000] is true; [0o100000, 0o040000], [0o100000] and a link left at 0o120000 are false.
+function canCompare(kinds) {
+    if (!Lists.isList(kinds) || kinds.length !== 2) return false
+    return kinds.every(function (kind) { return ((Number(kind) || 0) & Format.S_IFMT) === Format.S_IFREG })
 }
 
 // The Copy as flyout: six leaves in board order, letters on keyHint.
@@ -408,14 +463,18 @@ function isHidden(hiddenActions, action) {
     return false
 }
 
-// The one state toggle either menu draws. The label flips with the state, the house pattern
-// (ui/MenuRow.qml draws no checkmark), and the verb is the key's own.
+// Hidden-files labels and glyphs flip with state; MenuRow draws no checkmark.
 function hiddenRow(showHidden) {
     return {
         label: showHidden ? "Hide hidden files" : "Show hidden files",
         action: "toggleHidden",
         glyph: showHidden ? "eye-off" : "eye"
     }
+}
+
+// Code icons use the hidden-files row's label flip and the existing code glyph.
+function codeIconsRow(langMarks) {
+    return { label: langMarks !== false ? "Hide code icons" : "Show code icons", action: "toggleLangMarks", glyph: "code" }
 }
 
 // ui/Header.qml's own rows, on a right click over the column titles. Name is not among them: it is
