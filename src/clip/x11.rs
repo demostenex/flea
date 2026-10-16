@@ -1,7 +1,7 @@
 // X11 file clipboard adapter. xclip owns the GNOME file selection after Flea exits;
 // a small Xlib watcher notices selection-owner changes for other Flea windows.
-use super::control::OfferFiles;
 use super::{format, reply};
+use super::control::OfferFiles;
 use crate::backend::opsreq::OpMsg;
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -33,6 +33,9 @@ extern "C" {
         actual_kind: *mut c_ulong, actual_format: *mut c_int,
         count: *mut c_ulong, remaining: *mut c_ulong, data: *mut *mut u8) -> c_int;
     fn XFree(data: *mut c_void) -> c_int;
+    fn XSetErrorHandler(handler: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>)
+        -> Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>;
+    fn XSelectInput(display: *mut c_void, window: c_ulong, event_mask: c_long) -> c_int;
     fn setsid() -> c_int;
 }
 
@@ -46,6 +49,12 @@ static X11_INIT: Once = Once::new();
 const MAX_PAYLOAD: u64 = 64 * 1024 * 1024;
 const READ_WAIT: Duration = Duration::from_secs(3);
 const WATCH_EVERY: Duration = Duration::from_millis(150);
+const PROPERTY_CHANGE_MASK: c_long = 1 << 22;
+const PROPERTY_NOTIFY: c_int = 28;
+
+// A clipboard owner may disappear between querying its XID and reading its property.
+// Xlib's default error handler exits the whole backend for that ordinary race.
+unsafe extern "C" fn ignore_x_error(_display: *mut c_void, _event: *mut c_void) -> c_int { 0 }
 
 struct Display {
     raw: *mut c_void,
@@ -57,7 +66,10 @@ struct Display {
 
 impl Display {
     fn open() -> Result<Self, String> {
-        X11_INIT.call_once(|| { unsafe { XInitThreads(); } });
+        X11_INIT.call_once(|| unsafe {
+            XInitThreads();
+            XSetErrorHandler(Some(ignore_x_error));
+        });
         let raw = unsafe { XOpenDisplay(std::ptr::null()) };
         if raw.is_null() {
             return Err("the X11 display could not be opened".to_string());
@@ -121,13 +133,23 @@ impl Display {
         Some(event_base)
     }
 
+    fn watch_owner_token(&self, owner: c_ulong) {
+        if owner != 0 {
+            unsafe {
+                XSelectInput(self.raw, owner, PROPERTY_CHANGE_MASK);
+                XSync(self.raw, 0);
+            }
+        }
+    }
+
     fn selection_event_pending(&self, event_base: c_int) -> bool {
         let mut changed = false;
         while unsafe { XPending(self.raw) } > 0 {
             // XEvent is a union of 24 longs; only its first int (type) is needed.
             let mut event = [0 as c_ulong; 24];
             unsafe { XNextEvent(self.raw, event.as_mut_ptr().cast()); }
-            if unsafe { *(event.as_ptr().cast::<c_int>()) } == event_base { changed = true; }
+            let kind = unsafe { *(event.as_ptr().cast::<c_int>()) };
+            if kind == event_base || kind == PROPERTY_NOTIFY { changed = true; }
         }
         changed
     }
@@ -184,7 +206,7 @@ fn read_files(display: &Display, owner: c_ulong) -> Result<OfferFiles, String> {
         if let Some((op, paths, skipped)) = format::parse_gnome(&bytes) {
             if !paths.is_empty() {
                 format::check_path_cap(&paths)?;
-                return Ok(OfferFiles { op, paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
+                return Ok(OfferFiles { op: op, paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
             }
         }
     }
@@ -298,6 +320,9 @@ pub fn watch(replies: mpsc::Sender<OpMsg>) {
         let mut ticks = 0;
         loop {
             let owner = display.owner();
+            // Subscribe before reading: a token added after the read then triggers
+            // PropertyNotify. If it was added during subscription, the read sees it.
+            if owner != last_owner && event_base.is_some() { display.watch_owner_token(owner); }
             // On servers without XFixes, re-read each second: XIDs can be reused.
             let notified = event_base.is_some_and(|base| display.selection_event_pending(base));
             ticks += 1;
