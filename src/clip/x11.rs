@@ -206,7 +206,7 @@ fn read_files(display: &Display, owner: c_ulong) -> Result<OfferFiles, String> {
         if let Some((op, paths, skipped)) = format::parse_gnome(&bytes) {
             if !paths.is_empty() {
                 format::check_path_cap(&paths)?;
-                return Ok(OfferFiles { op: op, paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
+                return Ok(OfferFiles { op, paths, token: display.get_token(owner).unwrap_or_default(), skipped, owner_pid: None });
             }
         }
     }
