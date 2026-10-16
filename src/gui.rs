@@ -14,6 +14,8 @@ extern "C" {
 
 // exec rather than spawn, so the shell replaces this process and no pid is orphaned.
 pub fn exec_qs(ui: &Path, start: Option<&str>, select: Option<&str>) -> i32 {
+    // Quickshell keeps dead entries forever, so Flea prunes only its own shells before qs starts.
+    crate::qsregistry::prune_dead(&[crate::paths::SHELL_ID, crate::paths::PICKER_SHELL_ID]);
     // One helper fork for the launch: the page-cache list and the gvfs head start together.
     let list = prefetch::list_path();
     let prepared: Option<(PathBuf, u64)> = start.and_then(crate::gvfsprefetch::prepare);
@@ -73,7 +75,7 @@ pub(crate) fn launch_warm_command(exe: &Path, list: Option<&Path>, gvfs: Option<
 }
 
 // The launcher's side: one spawn and one fork-wait for both jobs, true when the helper started.
-fn warm_all(list: Option<&Path>, gvfs: Option<(&str, &Path)>) -> bool {
+pub(crate) fn warm_all(list: Option<&Path>, gvfs: Option<(&str, &Path)>) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let Some(mut cmd) = launch_warm_command(&exe, list, gvfs) else { return false };
     // The child forks and its parent exits at once, so this wait is only the fork.
@@ -130,13 +132,55 @@ pub fn pick(reply: &str) -> i32 {
         eprintln!("{}", paths::missing_ui_message());
         return 2;
     };
+    // Quickshell keeps dead entries forever, so Flea prunes only its own shells before qs starts.
+    crate::qsregistry::prune_dead(&[crate::paths::SHELL_ID, crate::paths::PICKER_SHELL_ID]);
     let mut cmd = qs_command(ui.join(paths::PICKER_ENTRY));
     cmd.env("FLEA_PICKER_REPLY", reply);
     exec(cmd)
 }
 
+// What the automatic arm hands qs: Vulkan, the hasvk fallback, or the unusable-loader downgrade.
+enum LaunchRenderer {
+    Vulkan(Vec<(u32, u32, u32)>),
+    HasvkFallback,
+    UnusableFallback(String),
+}
+
+// Sample input: Ok(vec![(0x8086, 0x0412, 1)]) for a Haswell-only box, Err for no Vulkan at all.
+fn automatic_renderer(probe: Result<Vec<(u32, u32, u32)>, String>) -> LaunchRenderer {
+    match probe {
+        Err(reason) => LaunchRenderer::UnusableFallback(reason),
+        Ok(devices) if vulkan::hasvk_only(&devices) => LaunchRenderer::HasvkFallback,
+        Ok(devices) => LaunchRenderer::Vulkan(devices),
+    }
+}
+
+// The env the automatic arm hands qs, split so a test can read it back through override_of.
+fn apply_renderer(cmd: &mut Command, renderer: LaunchRenderer) {
+    match renderer {
+        LaunchRenderer::UnusableFallback(reason) => {
+            // A silent downgrade hides a 2.4x memory regression, so the reason the probe found is said once.
+            eprintln!("flea: Vulkan is unusable, {reason}, so the shell starts on OpenGL");
+            cmd.env("QSG_RHI_BACKEND", "opengl");
+            cmd.env_remove("FLEA_RENDERER_AUTOMATIC");
+        }
+        LaunchRenderer::HasvkFallback => {
+            // Issue #160: hasvk draws garbled text, so the fallback names the driver and retries nothing.
+            eprintln!("flea: the only Vulkan GPU is hasvk (Intel Ivy Bridge to Broadwell), which draws garbled text, so the shell starts on OpenGL");
+            cmd.env("QSG_RHI_BACKEND", "opengl");
+            cmd.env_remove("FLEA_RENDERER_AUTOMATIC");
+        }
+        LaunchRenderer::Vulkan(devices) => {
+            // Vulkan is the measured fast path, and the marker is what permits the QML arm its one retry.
+            cmd.env("QSG_RHI_BACKEND", "vulkan");
+            cmd.env("FLEA_RENDERER_AUTOMATIC", "1");
+            pin_display_icd(cmd, Some(&devices));
+        }
+    }
+}
+
 // The qs invocation both entry points share, including the renderer chosen at the last hand-off point.
-fn qs_command(target: PathBuf) -> Command {
+pub(crate) fn qs_command(target: PathBuf) -> Command {
     let mut cmd = Command::new("qs");
     cmd.arg("-p").arg(target);
     // Only the main window records a prefetch list; a chooser started from a Flea terminal must not overwrite it.
@@ -146,6 +190,8 @@ fn qs_command(target: PathBuf) -> Command {
     cmd.env_remove(crate::gvfsprefetch::PREFETCH_ENV);
     cmd.env_remove(crate::gvfsprefetch::PATH_ENV);
     cmd.env_remove(crate::gvfsprefetch::START_ENV);
+    // A shell started under an --unlock window must not replay its dialog; unlock_command sets it back for the one launch.
+    cmd.env_remove(crate::unlock::ENV);
     skip_gtk_platform_theme(&mut cmd);
     // An explicit choice is the operator's; map_or because is_none_or needs Rust 1.82 over the 1.77 floor.
     if std::env::var_os("FLEA_BIN").map_or(true, |value| value.is_empty()) {
@@ -153,6 +199,8 @@ fn qs_command(target: PathBuf) -> Command {
             cmd.env("FLEA_BIN", binary);
         }
     }
+    // Before the probe and qs in every arm, so neither loads a driver for a GPU vendor this box does not hold.
+    crate::icdexclude::exclude_absent_vendors();
     // Empty is absent, the rule paths::has_display() applies: a wrapper's unset variable is not a choice.
     if std::env::var_os("QSG_RHI_BACKEND").is_some_and(|value| !value.is_empty()) {
         // An explicit choice is the operator's, so it is neither replaced nor offered a retry.
@@ -162,26 +210,13 @@ fn qs_command(target: PathBuf) -> Command {
             pin_display_icd(&mut cmd, None);
         }
     } else {
-        match vulkan::usable() {
-            Err(reason) => {
-                // A silent downgrade hides a 2.4x memory regression, so the reason the probe found is said once.
-                eprintln!("flea: Vulkan is unusable, {reason}, so the shell starts on OpenGL");
-                cmd.env("QSG_RHI_BACKEND", "opengl");
-                cmd.env_remove("FLEA_RENDERER_AUTOMATIC");
-            }
-            Ok(devices) => {
-                // Vulkan is the measured fast path, and the marker is what permits the QML arm its one retry.
-                cmd.env("QSG_RHI_BACKEND", "vulkan");
-                cmd.env("FLEA_RENDERER_AUTOMATIC", "1");
-                pin_display_icd(&mut cmd, Some(&devices));
-            }
-        }
+        apply_renderer(&mut cmd, automatic_renderer(crate::vkprobecache::usable()));
     }
     cmd
 }
 
 // `already` carries the automatic arm's probe result, so a hybrid launch does not pay for Vulkan twice.
-fn pin_display_icd(cmd: &mut Command, already: Option<&[(u32, u32)]>) {
+fn pin_display_icd(cmd: &mut Command, already: Option<&[(u32, u32, u32)]>) {
     if operator_chose_icd(
         std::env::var_os("VK_DRIVER_FILES").as_deref(),
         std::env::var_os("VK_ICD_FILENAMES").as_deref(),
@@ -191,7 +226,7 @@ fn pin_display_icd(cmd: &mut Command, already: Option<&[(u32, u32)]>) {
     let owned;
     let devices = match already {
         Some(devices) => devices,
-        None => match vulkan::usable() {
+        None => match crate::vkprobecache::usable() {
             Ok(devices) => {
                 owned = devices;
                 owned.as_slice()
@@ -267,12 +302,12 @@ fn apply_theme_restore(command: &mut Command, marker: Option<&OsStr>) {
     command.env_remove(THEME_MARKER);
 }
 
-fn exec(mut cmd: Command) -> i32 {
+pub(crate) fn exec(mut cmd: Command) -> i32 {
     // The setting is preserved across exec, so this is the last point that can hand it to qs.
     thp::disable();
     // exec() only returns on failure; the reason is elided, never shown raw.
     let _ = cmd.exec();
-    eprintln!("flea: could not start the shell, qs is not on PATH or failed to run");
+    eprintln!("flea: the window could not start: Quickshell is not installed or could not run");
     1
 }
 
@@ -355,6 +390,44 @@ mod tests {
         apply_display_pin(&mut cmd, vulkan::DisplayPin::Unmatched { vendor: 0x10de });
         assert_eq!(override_of(&cmd, "VK_DRIVER_FILES"), None);
         assert_eq!(override_of(&cmd, "VK_ICD_FILENAMES"), None);
+    }
+
+    // Issue #160: the only usable device is hasvk, so the launch is OpenGL with no retry left.
+    #[test]
+    fn a_hasvk_only_probe_starts_on_opengl_with_no_retry() {
+        match automatic_renderer(Ok(vec![(0x8086, 0x0412, 1)])) {
+            LaunchRenderer::HasvkFallback => {}
+            _ => panic!("a Haswell-only probe must fall back"),
+        }
+        let mut cmd = Command::new("true");
+        apply_renderer(&mut cmd, automatic_renderer(Ok(vec![(0x8086, 0x0412, 1)])));
+        assert_eq!(override_of(&cmd, "QSG_RHI_BACKEND").as_deref(), Some("opengl"));
+        assert!(removed(&cmd, "FLEA_RENDERER_AUTOMATIC"));
+    }
+
+    // hasvk beside another usable device keeps Vulkan, with the retry the automatic arm permits.
+    #[test]
+    fn a_probe_beside_hasvk_starts_on_vulkan_with_retry() {
+        for probe in [vec![(0x8086, 0x0412, 1), (0x10de, 0x27e0, 2)], vec![(0x8086, 0xa788, 1)]] {
+            assert!(matches!(automatic_renderer(Ok(probe.clone())), LaunchRenderer::Vulkan(_)));
+            let mut cmd = Command::new("true");
+            apply_renderer(&mut cmd, automatic_renderer(Ok(probe)));
+            assert_eq!(override_of(&cmd, "QSG_RHI_BACKEND").as_deref(), Some("vulkan"));
+            assert_eq!(override_of(&cmd, "FLEA_RENDERER_AUTOMATIC").as_deref(), Some("1"));
+        }
+    }
+
+    // No Vulkan at all is the existing downgrade, unchanged by the hasvk arm beside it.
+    #[test]
+    fn no_vulkan_at_all_is_the_existing_downgrade() {
+        match automatic_renderer(Err(String::from("vkCreateInstance answered -9"))) {
+            LaunchRenderer::UnusableFallback(reason) => assert!(reason.contains("vkCreateInstance"), "{reason}"),
+            _ => panic!("an unusable loader must downgrade"),
+        }
+        let mut cmd = Command::new("true");
+        apply_renderer(&mut cmd, automatic_renderer(Err(String::from("vkCreateInstance answered -9"))));
+        assert_eq!(override_of(&cmd, "QSG_RHI_BACKEND").as_deref(), Some("opengl"));
+        assert!(removed(&cmd, "FLEA_RENDERER_AUTOMATIC"));
     }
 
     // The argv a launch helper carries, read back from the built command.

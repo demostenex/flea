@@ -6,6 +6,7 @@ use crate::backend::proto::{parse_request, Request, TRANSFER_CANCEL};
 use crate::backend::thumbs::Done;
 use crate::error::{from_io, FleaError};
 use std::io::{self, BufRead};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -19,9 +20,29 @@ pub enum Event {
     FsInfo(crate::backend::fsinforeq::Done),
     // A write operation's own thread reports here, so the loop stays the only writer of stdout.
     Op(OpMsg),
+    // Issue 144: a list's scan, so a slow mount's read_dir never holds the loop; see src/backend/listwork.rs.
+    List(crate::backend::listwork::Done),
+    // A flash worker's own thread reports here, on the same single receiver as every other event.
+    Flash(super::flashslot::FlashMsg),
     // The watch descriptor that saw it, so a burst belonging to the directory the client has already
     // left is dropped rather than answered for the new one; see src/backend/watch.rs.
     Changed(i32),
+    // The watch descriptor whose mount went away, so the pane leaves the volume instead of re-listing it.
+    Unmounted(i32),
+    // A network folder's mtime moved between polls, which inotify never delivers; the open path only.
+    PollChanged(PathBuf),
+    // A list worker that outlived its call hands back the watch it armed; the loop drops it unless live.
+    AbandonWatch(i32),
+    // A peek armed a watch on a column's directory; the loop holds it and names it when it fires.
+    PeekArmed(i32, PathBuf),
+    // The peek watch descriptor that saw a change, answered as a changed line for that column's directory.
+    PeekChanged(i32),
+    // The kernel dropped a peek watch itself, a deleted or unmounted directory, so the loop stops holding it.
+    PeekGone(i32),
+    // A session walk landed; the loop re-runs the standing query once when it is still the newest.
+    SearchWalked,
+    // A query held while a session walk runs reached the listing swap's cap; the loop answers it from the partial index.
+    SearchHeld,
     ReadError(FleaError),
     Closed,
 }

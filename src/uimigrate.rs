@@ -3,7 +3,8 @@ use crate::jsondoc::Json;
 use crate::uischema::STATE_VERSION;
 
 // Each change by the stateVersion it arrived in, oldest first; a file stamped below one has not had it.
-const STEPS: &[(f64, fn(Json) -> Json)] = &[(1.0, show_unmounted_drives)];
+const STEPS: &[(f64, fn(Json) -> Json)] =
+    &[(1.0, show_unmounted_drives), (2.0, hide_new_menu_rows), (3.0, hide_run_rows)];
 
 // The file as found carries the stamp: the merged document already holds the shipped one in its place.
 pub fn migrated(found: &Json, merged: Json) -> Json {
@@ -22,10 +23,58 @@ fn stored_version(found: &Json) -> f64 {
     found.get(STATE_VERSION).and_then(Json::as_f64).unwrap_or(0.0)
 }
 
-// GM's 0.3.3 ruling: turned on once for every file written before it, including one switched off in 0.3.2.
+// Decided in 0.3.3: turned on once for every file written before it, including one switched off in 0.3.2.
 fn show_unmounted_drives(state: Json) -> Json {
     let places = state.get("places").cloned().unwrap_or(Json::Obj(Vec::new()));
     with_key(state, "places", with_key(places, "showUnmounted", Json::Bool(true)))
+}
+
+// A 0.3.7 file that hid "copypath" keeps hiding its replacement "copyAs" where it stood.
+fn hide_new_menu_rows(state: Json) -> Json {
+    let menu = state.get("menu").cloned().unwrap_or(Json::Obj(Vec::new()));
+    let items = match menu.get("hidden").and_then(Json::as_array) {
+        Some(items) => items.to_vec(),
+        None => return state,
+    };
+    if items.iter().any(|item| !matches!(item, Json::Str(_))) {
+        return state;
+    }
+    // copypath becomes copyAs where it stands; a file that held both keeps the first.
+    let mut kept: Vec<String> = Vec::with_capacity(items.len() + 2);
+    for item in items.iter().filter_map(Json::as_str) {
+        let name = if item == "copypath" { "copyAs" } else { item };
+        if name == "copyAs" && kept.iter().any(|held| held == "copyAs") {
+            continue;
+        }
+        kept.push(name.to_string());
+    }
+    for owned in ["pasteAs", "invertSelection"] {
+        if !kept.iter().any(|name| name == owned) {
+            kept.push(owned.to_string());
+        }
+    }
+    let hidden = Json::Arr(kept.into_iter().map(Json::Str).collect());
+    with_key(state, "menu", with_key(menu, "hidden", hidden))
+}
+
+// The run card's own rows ship hidden, so a 0.3.8 file that never named them hides them once.
+fn hide_run_rows(state: Json) -> Json {
+    let menu = state.get("menu").cloned().unwrap_or(Json::Obj(Vec::new()));
+    let items = match menu.get("hidden").and_then(Json::as_array) {
+        Some(items) => items.to_vec(),
+        None => return state,
+    };
+    if items.iter().any(|item| !matches!(item, Json::Str(_))) {
+        return state;
+    }
+    let mut kept: Vec<String> = items.iter().filter_map(Json::as_str).map(str::to_string).collect();
+    for owned in ["run", "openAsText"] {
+        if !kept.iter().any(|name| name == owned) {
+            kept.push(owned.to_string());
+        }
+    }
+    let hidden = Json::Arr(kept.into_iter().map(Json::Str).collect());
+    with_key(state, "menu", with_key(menu, "hidden", hidden))
 }
 
 // Replaced where it stands, so the key order a rewrite renders is the merge's and not this file's.
@@ -59,6 +108,18 @@ mod tests {
         state.get(STATE_VERSION).and_then(Json::as_f64)
     }
 
+    // The stamp STEPS leaves on a fully migrated file.
+    const LATEST: f64 = super::STEPS[super::STEPS.len() - 1].0;
+
+    fn hidden(state: &Json) -> Vec<String> {
+        state
+            .get("menu")
+            .and_then(|m| m.get("hidden"))
+            .and_then(Json::as_array)
+            .map(|items| items.iter().filter_map(Json::as_str).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
     fn patch(text: &str) -> Json {
         jsondoc::parse(text).expect("the patch parses")
     }
@@ -78,14 +139,14 @@ mod tests {
     fn a_0_3_2_file_that_stored_the_switch_off_reads_on_and_a_write_records_the_stamp() {
         let read = from_file(OLD);
         assert_eq!(shown(&read), Some(true));
-        assert_eq!(stamp(&read), Some(1.0));
+        assert_eq!(stamp(&read), Some(LATEST));
         assert_eq!(read.get("density").and_then(Json::as_str), Some("comfortable"), "the migration touches one leaf");
         assert_eq!(read.get("places").and_then(|p| p.get("driveSize")).and_then(Json::as_bool), Some(true));
         let d = TestDir::new("uimigrate-write");
         let s = store_with(&d, OLD);
         s.update(&patch(r#"{"hidden":true}"#)).expect("an unrelated write");
         let stored = on_disk(&d);
-        assert_eq!((shown(&stored), stamp(&stored)), (Some(true), Some(1.0)), "the write carries the migration down");
+        assert_eq!((shown(&stored), stamp(&stored)), (Some(true), Some(LATEST)), "the write carries the migration down");
         assert_eq!(stored.get("hidden").and_then(Json::as_bool), Some(true));
     }
 
@@ -110,7 +171,7 @@ mod tests {
         let s = store_with(&d, OLD);
         s.settle().expect("the first 0.3.3 launch");
         let stored = on_disk(&d);
-        assert_eq!((shown(&stored), stamp(&stored)), (Some(true), Some(1.0)));
+        assert_eq!((shown(&stored), stamp(&stored)), (Some(true), Some(LATEST)));
         let ino = fs::metadata(d.join("state/flea/ui.json")).expect("meta").ino();
         s.settle().expect("the second launch");
         assert_eq!(fs::metadata(d.join("state/flea/ui.json")).expect("meta").ino(), ino, "one migration is one write");
@@ -121,9 +182,9 @@ mod tests {
     fn a_fresh_install_reads_on_and_its_own_switch_off_stays_off() {
         let d = TestDir::new("uimigrate-fresh");
         let s = Store::at(&d.dir("state"), &d.dir("config"));
-        assert_eq!((shown(&s.read()), stamp(&s.read())), (Some(true), Some(1.0)));
+        assert_eq!((shown(&s.read()), stamp(&s.read())), (Some(true), Some(LATEST)));
         s.update(&patch(r#"{"places":{"showUnmounted":false}}"#)).expect("switched off on a fresh install");
-        assert_eq!(stamp(&on_disk(&d)), Some(1.0), "the first write is stamped");
+        assert_eq!(stamp(&on_disk(&d)), Some(LATEST), "the first write is stamped");
         assert_eq!(shown(&s.read()), Some(false));
     }
 
@@ -145,11 +206,68 @@ mod tests {
     #[test]
     fn a_patch_onto_an_old_file_keeps_the_migration_and_cannot_move_the_stamp() {
         let next = patched(&from_file(OLD), &patch(r#"{"view":"list"}"#)).expect("patch applies");
-        assert_eq!((shown(&next), stamp(&next)), (Some(true), Some(1.0)));
+        assert_eq!((shown(&next), stamp(&next)), (Some(true), Some(LATEST)));
         let off = patched(&from_file(OLD), &patch(r#"{"places":{"showUnmounted":false}}"#)).expect("patch applies");
-        assert_eq!((shown(&off), stamp(&off)), (Some(false), Some(1.0)), "the patch is the operator's and lands last");
+        assert_eq!((shown(&off), stamp(&off)), (Some(false), Some(LATEST)), "the patch is the operator's and lands last");
         let refused = patched(&from_file(OLD), &patch(r#"{"stateVersion":0}"#)).expect_err("the stamp is not a setting");
         assert!(refused.contains(STATE_VERSION), "{}", refused);
+    }
+
+    // MenuAdditions040: Copy as replaces the hidden-by-default Copy path row, and Paste as and
+    // Invert selection ship hidden too, so a 0.3.7 file is owed that hiding once.
+    #[test]
+    fn a_0_3_7_file_that_hid_copy_path_hides_its_replacement_at_the_same_position() {
+        let read = from_file(
+            r#"{"stateVersion":1,"places":{"showUnmounted":true},"menu":{"hidden":["delete","openTerminal","placeMenu","runScript","moveto","copyto","properties","permissions","copypath","extThumbs"]}}"#,
+        );
+        assert_eq!(
+            hidden(&read),
+            ["delete", "openTerminal", "placeMenu", "runScript", "moveto", "copyto", "properties", "permissions", "copyAs", "extThumbs", "pasteAs", "invertSelection", "run", "openAsText"],
+            "copypath becomes copyAs where it stood, the other two are appended, then the run rows"
+        );
+        assert_eq!(stamp(&read), Some(LATEST));
+        assert_eq!(shown(&read), Some(true), "the 1.0 step does not run again for a stamped file");
+    }
+
+    #[test]
+    fn a_0_3_7_file_that_showed_copy_path_keeps_copy_as_visible() {
+        let read = from_file(
+            r#"{"stateVersion":1,"places":{"showUnmounted":true},"menu":{"hidden":["delete","openTerminal","placeMenu","runScript","moveto","copyto","properties","permissions","extThumbs"]}}"#,
+        );
+        let got = hidden(&read);
+        assert!(!got.iter().any(|id| id == "copyAs" || id == "copypath"), "Copy as replaces that row: {}", got.join(","));
+        assert!(got.iter().any(|id| id == "pasteAs") && got.iter().any(|id| id == "invertSelection"));
+        assert!(got.iter().any(|id| id == "run") && got.iter().any(|id| id == "openAsText"));
+        assert_eq!(stamp(&read), Some(LATEST));
+    }
+
+    #[test]
+    fn a_file_already_at_2_keeps_a_shown_row_shown() {
+        let read = from_file(
+            r#"{"stateVersion":2,"menu":{"hidden":["delete","copyAs","invertSelection"]}}"#,
+        );
+        assert_eq!(hidden(&read), ["delete", "copyAs", "invertSelection", "run", "openAsText"], "pasteAs stays shown");
+        assert_eq!(stamp(&read), Some(LATEST));
+    }
+
+    #[test]
+    fn a_0_3_2_file_gets_all_three_steps_in_one_read() {
+        let read = from_file(r#"{"places":{"showUnmounted":false},"menu":{"hidden":["delete","copypath"]}}"#);
+        assert_eq!((shown(&read), stamp(&read)), (Some(true), Some(LATEST)));
+        assert_eq!(hidden(&read), ["delete", "copyAs", "pasteAs", "invertSelection", "run", "openAsText"]);
+    }
+
+    // The run card's own rows ship hidden, so a stored list that never named them gains them once.
+    #[test]
+    fn a_0_3_8_file_lacking_the_run_rows_hides_them_once() {
+        let read = from_file(
+            r#"{"stateVersion":2,"places":{"showUnmounted":true},"menu":{"hidden":["delete","openTerminal","placeMenu","runScript","moveto","copyto","properties","permissions","copyAs","pasteAs","invertSelection","extThumbs"]}}"#,
+        );
+        let got = hidden(&read);
+        assert_eq!(got[got.len() - 2..], ["run".to_string(), "openAsText".to_string()]);
+        assert_eq!(stamp(&read), Some(LATEST));
+        let again = from_file(r#"{"stateVersion":3,"menu":{"hidden":["delete"]}}"#);
+        assert_eq!(hidden(&again), ["delete"], "a stamped file that shows the run rows keeps them shown");
     }
 
     // Two windows and the TUI write under one lock: whoever migrates first, the stamp rides every later write.
@@ -166,7 +284,7 @@ mod tests {
             }
         });
         let stored = on_disk(&d);
-        assert_eq!((shown(&stored), stamp(&stored)), (Some(false), Some(1.0)));
+        assert_eq!((shown(&stored), stamp(&stored)), (Some(false), Some(LATEST)));
         assert_eq!(stored.get("keys").and_then(Json::as_str), Some("mac"));
         assert_eq!(stored.get("view").and_then(Json::as_str), Some("columns"));
         assert_eq!(stored.get("density").and_then(Json::as_str), Some("comfortable"));

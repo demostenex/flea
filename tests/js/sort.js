@@ -1,4 +1,5 @@
 .import "../../ui/js/Sort.js" as Sort
+.import "sourcefixture.js" as Source
 
 // Header clicks and the s/S keys share this path; tests/protocol.sh checks the resulting backend order.
 
@@ -8,19 +9,28 @@ function pane(sortBy, sortDesc) {
     var p = {
         windowSize: 200,
         total: 40,
+        recentMode: "",
         thumbState: "stale",
         dirSizeState: "stale",
         cursor: -1,
         cleared: 0,
         said: [],
-        sent: []
+        sent: [],
+        renamingIndex: -1,
+        renamePending: false,
+        pendingSort: null,
+        listInFlight: false,
+        committed: 0
     }
     p.message = function (text, isError) { p.said.push(text) }
     p.clearSelection = function () { p.cleared += 1 }
     p.setCursor = function (index) { p.cursor = index }
+    p.commitOpenRename = function () { p.committed += 1 }
     p.backend = {
         sortBy: sortBy,
         sortDesc: sortDesc,
+        running: true,
+        quitting: false,
         sort: function (by, desc) { p.sent.push("sort " + by + " " + (desc ? "desc" : "asc")) },
         window: function (start, count) { p.sent.push("window " + start + " " + count) }
     }
@@ -139,4 +149,78 @@ function run(check) {
     Sort.next(stray)
     check("s from an order that is not in the list still lands on name",
           stray.sent.join(","), "sort name asc,window 0 200")
+
+    // A walk's rows are matches, so sorting them writes no folder sort.
+    var walk = pane("name", false)
+    walk.searchMode = "results"
+    walk.remembered = []
+    walk.backend.rememberFolderSort = function (folder, key, desc) { walk.remembered.push(folder + "|" + key) }
+    Sort.resort(walk, "size", false)
+    check("sorting a search walk still sorts and re-reads",
+          walk.sent.join(","), "sort size asc,window 0 200")
+    check("but writes no folder sort for its scope", walk.remembered.length, 0)
+
+    // A sort while an edit is open never retargets the editor: it is held and
+    // the open edit is committed the way a click-away commits, applying once
+    // the rename settles and never dropped.
+    var editing = pane("name", false)
+    editing.renamingIndex = 7
+    Sort.resort(editing, "size", false)
+    check("a sort with an edit open sends nothing", editing.sent.join(","), "")
+    check("and holds the requested order instead", JSON.stringify(editing.pendingSort), JSON.stringify({ key: "size", desc: false }))
+    check("and commits the open edit like a click-away", editing.committed, 1)
+    check("and moves neither the cursor nor the caches under the editor",
+          editing.cursor + "|" + editing.thumbState + "|" + editing.dirSizeState + "|" + editing.cleared, "-1|stale|stale|0")
+    var pending = pane("name", false)
+    pending.renamePending = true
+    Sort.resort(pending, "size", false)
+    check("a sort with a rename pending sends nothing either", pending.sent.join(","), "")
+    check("and holds it without recommitting a write already in flight",
+          JSON.stringify(pending.pendingSort) + "|" + pending.committed, JSON.stringify({ key: "size", desc: false }) + "|0")
+    var settled = pane("name", false)
+    settled.pendingSort = { key: "size", desc: false }
+    settled.backend.running = true
+    Sort.applyPending(settled)
+    check("the held sort applies once the edit ends",
+          settled.sent.join(","), "sort size asc,window 0 200")
+    check("and is spent, never applied twice",
+          JSON.stringify(settled.pendingSort) + "|" + settled.backend.sortBy, "null|size")
+    var unsettled = pane("name", false)
+    unsettled.pendingSort = { key: "size", desc: false }
+    unsettled.renamePending = true
+    Sort.applyPending(unsettled)
+    check("a rename still pending keeps the hold", unsettled.sent.join(",") + "|" + JSON.stringify(unsettled.pendingSort),
+          "|" + JSON.stringify({ key: "size", desc: false }))
+
+    // A navigation during a slow rename strands the hold with no edit open:
+    // Nav.forget sets renamingIndex -1 and leaves the request pending, so no
+    // index change fires when it settles. The pending-false arm applies it.
+    var stranded = pane("name", false)
+    stranded.renamingIndex = -1
+    stranded.renamePending = true
+    Sort.resort(stranded, "size", false)
+    check("a sort with only a pending rename holds", JSON.stringify(stranded.pendingSort),
+          JSON.stringify({ key: "size", desc: false }))
+    stranded.renamePending = false
+    Sort.applyPending(stranded)
+    check("a hold taken with no edit open applies once the pending rename settles",
+          stranded.sent.join(","), "sort size asc,window 0 200")
+    var wired = Source.source("ui/Pane.qml")
+    // Sample input: "    onRenamePendingChanged: if (!root.renamePending) Sort.applyPending(root)".
+    check("the pending-false arm applies the held sort",
+          /^\s*onRenamePendingChanged: if \(!root\.renamePending\) Sort\.applyPending\(root\)/m.test(wired), true)
+    var inflight = pane("name", false)
+    inflight.pendingSort = { key: "size", desc: false }
+    inflight.listInFlight = true
+    Sort.applyPending(inflight)
+    check("a hold outlives its listing and sends nothing while it is out", inflight.sent.join(","), "")
+    check("and keeps the hold while the listing is out", JSON.stringify(inflight.pendingSort),
+          JSON.stringify({ key: "size", desc: false }))
+    inflight.listInFlight = false
+    Sort.applyPending(inflight)
+    check("the hold applies to the rows that landed", inflight.sent.join(","), "sort size asc,window 0 200")
+    var flightSrc = Source.source("ui/Pane.qml")
+    // Sample input: "    onListInFlightChanged: if (!root.listInFlight) { preferences.restart(); Sort.applyPending(root) }".
+    check("a hold that outlived its listing applies once the rows land",
+          /^\s*onListInFlightChanged: if \(!root\.listInFlight\) \{[^}]*Sort\.applyPending\(root\)/m.test(flightSrc), true)
 }

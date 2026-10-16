@@ -17,6 +17,23 @@ function displayState(textSize, baseSize, monitorScale) {
              monitorScale: monitorScale === undefined ? 1 : monitorScale, cornerRadius: 8 }
 }
 
+// Runs body with the rows for the given actions taken out of the generated tables, then puts them back where they were.
+function withoutKeys(actions, body) {
+    var tables = [Keymap.PRESET_KEYS, Keymap.SHARED_KEYS], held = []
+    for (var t = 0; t < tables.length; t++) {
+        for (var i = tables[t].length - 1; i >= 0; i--) {
+            if (actions.indexOf(tables[t][i].action) >= 0) held.push({ table: tables[t], at: i, row: tables[t].splice(i, 1)[0] })
+        }
+    }
+    Keymap.setPreset(Keymap.preset)
+    try {
+        body()
+    } finally {
+        for (var h = held.length - 1; h >= 0; h--) held[h].table.splice(held[h].at, 0, held[h].row)
+        Keymap.setPreset(Keymap.preset)
+    }
+}
+
 function kinds(rows) {
     return rows.map(function (row) { return row.kind }).join("|")
 }
@@ -45,9 +62,9 @@ function runRows(check) {
     // An Omarchy size that is not one of the seven still marks a stop, the nearest one.
     var between = Settings.rows("display", displayState(TextSize.follow(), 13))
     check("a size between two stops marks the nearer one", between[2].index, 3)
-    // HANDOFF rule 8: one short line, which at this panel's width is 47 characters, measured.
-    check("the hint is down to the two chords, on one line", display[3].label,
-          "Ctrl+Shift +/- walks them, Ctrl+Shift+0 follows.")
+    // The keys come from the running preset, spelled as a chord; the default preset binds these three.
+    check("the hint names the keys that step through the stops and the one that follows Omarchy", display[3].label,
+          "Ctrl+Shift++ and Ctrl+Shift+- step through them; Ctrl+Shift+0 follows Omarchy again.")
     // And Effective stays, because in Follow it is the size running and the ruler's mark is not.
     check("Effective reports the size actually running", display[4].label + "|" + display[4].value + "|" + display[4].role,
           "Effective|14 px|live")
@@ -60,7 +77,7 @@ function runRows(check) {
     check("and an unanswered query says so rather than claiming 1x",
           Settings.rows("display", displayState(TextSize.follow(), 14, 0))[6].value, "not reported")
     check("its hint is the board's own sentence, so no reader expects a control",
-          display[7].label, "Flea follows the compositor value and does not step or cycle it.")
+          display[7].label, "Flea follows Hyprland's scale and does not change it.")
     check("the board icon override defaults off", display[9].id + "|" + display[9].on, "display.hyprlandIcons|false")
 
     // Switching to Override adds the stop row, and nothing else about the section moves.
@@ -94,9 +111,9 @@ function runRows(check) {
     check("the current menu controls include Permissions, Update Flea and the retained hints preference",
           menus.filter(function (r) { return r.kind === "check" })
                .map(function (r) { return r.id }).join(","),
-          "cut,copy,paste,duplicate,rename,trash,delete,openwith,openTerminal,moveto,copyto,properties,permissions,copypath,shelf,compress,extract,convert,taildrop,localsend,dropbox,sharelink,runScript,placeMenu,updateFlea,extThumbs,keyHints")
-    // The one check that is not a menu action: it says how every row is drawn, not whether it is. GM's ruling of 2026-09-10 turns it off by default, with the rail's own detail rows, and src/uischema.rs stores that default, so an absent preference reads off and not on.
-    check("the hints row defaults off, as GM ruled over the boards",
+          "cut,copy,paste,duplicate,rename,trash,delete,openwith,run,openAsText,openTerminal,moveto,copyto,properties,permissions,makeExecutable,copyAs,showOriginal,tags,shelf,compress,extract,convert,flashDrive,taildrop,localsend,dropbox,sharelink,runScript,placeMenu,updateFlea,toggleLangMarks,extThumbs,pasteAs,invertSelection,keyHints")
+    // The one check that is not a menu action: it says how every row is drawn, not whether it is. Since 2026-09-10 it is off by default, with the rail's own detail rows, and src/uischema.rs stores that default, so an absent preference reads off and not on.
+    check("the hints row defaults off, as ruled over the boards",
           find(menus, "keyHints").label + "|" + find(menus, "keyHints").on,
           "Show keyboard hints|false")
     check("and it reads the value it is given",
@@ -183,13 +200,42 @@ function runPresets(check) {
         }
     }
     check("preset check denominator covers all effective bindings", total > 100, true)
+    // A key the preset leaves unbound is named by no hint: the hint is left out and never drawn empty or with a hole in its sentence.
+    var running = Keymap.preset, hollow = []
+    try {
+        for (var h = 0; h < Settings.PRESETS.length; h++) {
+            Keymap.setPreset(Settings.PRESETS[h])
+            var drawn = Settings.rows("display", displayState(TextSize.follow(), 14)).concat(Settings.rows("keys", { preset: Settings.PRESETS[h] }),
+                Settings.rows("preview", { data: { preview: { loadOn: "manual" } } }))
+            var bare = drawn.filter(function (r) { return r.kind === "hint" && (String(r.label).trim().length === 0 || /^ | {2}/.test(r.label)) })
+            if (bare.length > 0 || /^ | {2}/.test(TextSize.announce({ mode: 16 }, 14))) hollow.push(Settings.PRESETS[h])
+        }
+    } finally {
+        Keymap.setPreset(running)
+    }
+    check("no preset draws an empty hint row or a sentence with a key missing from it", hollow.join(","), "")
+    // Every shipped preset binds the four actions, so the omitting branches only run on a table that leaves them unbound; the control first shows the bound rows draw both hints.
+    var hintCount = function (test) { return Settings.rows("display", displayState(TextSize.follow(), 14)).concat(Settings.rows("preview", { data: { preview: { loadOn: "manual" } } })).filter(function (r) { return r.kind === "hint" && test.test(String(r.label)) }).length }
+    check("with the keys bound both hints draw, so the zeros below are not vacuous", Math.min(hintCount(/step through them/), hintCount(/loads the current selection/)) >= 1, true)
+    withoutKeys(["textSizeUp", "textSizeDown", "textSizeReset", "loadPreview"], function () {
+        check("an unbound text size key leaves its hint out of Display", hintCount(/step through them/), 0)
+        check("an unbound load key leaves its hint out of Preview", hintCount(/loads the current selection/), 0)
+        check("no hint left on those panes is empty or holed", hintCount(/^\s*$|^ | {2}| [.,;]/), 0)
+        check("an override with no reset key announces the size alone", TextSize.announce({ mode: 16 }, 14), "Text size 16px")
+    })
     var menuRows = Settings.menuRows([], true)
-    check("SettingsMenus contains exactly 26 action switches", menuRows.filter(function (r) { return r.kind === "check" && r.id !== "keyHints" }).length, 26)
+    check("SettingsMenus contains exactly 35 action switches", menuRows.filter(function (r) { return r.kind === "check" && r.id !== "keyHints" }).length, 35)
+    // The board's Tags row is one of those switches.
+    check("the added switch is the Tags menu row", find(menuRows, "tags").label, "Tags")
     check("Delete permanently is visually destructive", find(menuRows, "delete").role, "error")
     check("Delete permanently explains its default", find(menuRows, "delete").value, "off by default")
 }
 
 function runCompletionRows(check) {
+    var code = find(Settings.rows("view", {}), "langMarks")
+    check("code icons have an on-by-default View checkbox", [code.kind, code.label, code.glyph, code.on].join("|"), "check|Show code icons|code|true")
+    check("the View checkbox respects saved OFF", find(Settings.rows("view", { data: { langMarks: false } }), "langMarks").on, false)
+    check("invalid code-icon values heal to the enabled checkbox", find(Settings.rows("view", { data: { langMarks: "false" } }), "langMarks").on, true)
     var places = Settings.rows("places", {})
     check("Places spells the manager group Favorites", places[0].label, "Favorites")
     // SettingsRest rules 3 and 4: Add rides the heading it governs, and nothing floats under the list.
@@ -198,11 +244,24 @@ function runCompletionRows(check) {
           "addFavourite|Add this folder|true")
     check("and the two buttons under the list are gone",
           places.filter(function (row) { return row.kind === "favouriteActions" }).length, 0)
+    // Sidebar040: a favourite's path reads as the person writes it, while value keeps the stored absolute path.
+    var homed = Settings.rows("places", { home: "/home/gm", data: { places: { favourites: [
+        { label: "Projects", path: "/home/gm/Projects" }, { label: "flea", path: "~/Documents/claude/flea" },
+        { label: "Archive", path: "/srv/archive" }, { label: "Sibling", path: "/home/gmx/s" }] } } })
+    check("a favourite inside home shows ~/ and keeps the absolute value",
+          [find(homed, "favourite:0").display, find(homed, "favourite:0").value].join("|"), "~/Projects|/home/gm/Projects")
+    check("a stored tilde path shows the same tilde form", find(homed, "favourite:1").display, "~/Documents/claude/flea")
+    check("a favourite outside home shows its absolute path", find(homed, "favourite:2").display, "/srv/archive")
+    check("a sibling named like home is outside it", find(homed, "favourite:3").display, "/home/gmx/s")
+    check("no home published shows the stored path", find(Settings.rows("places", { data: { places: { favourites: [{ label: "P", path: "/home/gm/P" }] } } }), "favourite:0").display, "/home/gm/P")
     check("optional rail details default off", [find(places, "places.driveSize").on, find(places, "places.trashCount").on].join(","), "false,false")
-    // GM's 0.3.3 ruling: unmounted drives ship on, and an off the file stored is still the operator's.
+    // Decided in 0.3.3: unmounted drives ship on, and an off the file stored is still the operator's.
     check("Show unmounted drives defaults on and a stored off reads off", [find(places, "places.showUnmounted").on,
           find(Settings.rows("places", { data: { places: { showUnmounted: false } } }), "places.showUnmounted").on].join(","), "true,false")
-    check("the Rail controls follow the ruled order", places.slice(-7, -2).map(function (row) { return row.label }).join("|"), "Show Trash count|Show unmounted drives|Auto-hide sidebar|Show sidebar|Sidebar width")
+    // Sidebar040: Recent is a Built in row like Home and Trash, and it ships off.
+    check("Recent ships off and a stored on reads back on", [find(places, "places.showRecent").label + "|" + find(places, "places.showRecent").on,
+          find(Settings.rows("places", { data: { places: { showRecent: true } } }), "places.showRecent").on].join(","), "Recent|false,true")
+    check("the Rail controls follow the ruled order", places.slice(-7, -2).map(function (row) { return row.label }).join("|"), "Show unmounted drives|Show tags|Auto-hide sidebar|Show sidebar|Sidebar width")
     // Directive 74: two handles on one remembered state, so the row reads the word ctrl-b writes.
     check("Show sidebar is checked while the rail is shown", find(places, "places.rail").on, true)
     check("and auto-hide ships off, so nothing hides itself", find(places, "places.autoHide").on, false)
@@ -213,7 +272,7 @@ function runCompletionRows(check) {
           [find(hiding, "places.rail").available, Settings.focusable(find(hiding, "places.rail"))].join("|"), "false|false")
     check("and it is a control again with auto-hide off",
           [find(places, "places.rail").available, Settings.focusable(find(places, "places.rail"))].join("|"), "true|true")
-    // The 30 day sweep's own row, at the foot of Places under its own eyebrow. Off unless ui.json says otherwise, which is the whole of GM's opt-in ruling as the panel sees it.
+    // The 30 day sweep's own row, at the foot of Places under its own eyebrow. Off unless ui.json says otherwise, which is the whole of the opt-in behavior as the panel sees it.
     check("Places ends with the Trash group and its one row",
           places.slice(-2).map(function (row) { return row.label }).join("|"),
           "Trash|Empty after 30 days")
@@ -234,6 +293,36 @@ function runCompletionRows(check) {
     check("Preview rail mark differs from the three-column view", Settings.SECTIONS[Settings.sectionIndex("preview")].glyph, "preview")
     check("grouping explains the categories before it is enabled", find(view, "groupByKind").caption, "folders, photos, files")
     check("wrapping explains the boundary before it is enabled", find(view, "wrapAtEnds").caption, "arrow-up at the top")
+    // Issue 29 and ClickAndRefresh: Escape stays put until switched on, one tap opens only in
+    // single mode, and the slow click renames while double mode is on.
+    check("Escape goes up a folder ships off", find(view, "escapeUp").label + "|" + find(view, "escapeUp").on,
+          "Escape goes up a folder|false")
+    check("and explains when it climbs", find(view, "escapeUp").caption, "with nothing to close")
+    check("and a stored on reads back on",
+          find(Settings.rows("view", { data: { escapeUp: true } }), "escapeUp").on, true)
+    check("opening defaults to a double click", find(view, "openMode").selected, "double")
+    check("and its two values are the board's own",
+          find(view, "openMode").values.join(",") + "|" + find(view, "openMode").labels.join("|"),
+          "double,single|Double click|Single click")
+    check("the slow click ships on", find(view, "clickRename").label + "|" + find(view, "clickRename").on,
+          "Click a selected name to rename|true")
+    var single = Settings.rows("view", { data: { openMode: "single" } })
+    check("single mode reads back", find(single, "openMode").selected, "single")
+    check("and greys the slow click in place rather than hiding it",
+          [find(single, "clickRename").available, Settings.focusable(find(single, "clickRename"))].join("|"),
+          "false|false")
+    check("while double mode keeps it a control",
+          [find(view, "clickRename").available, Settings.focusable(find(view, "clickRename"))].join("|"),
+          "true|true")
+    // ClickAndRefresh draws the pointer mark on Open items with and leaves Click a selected name to rename's slot blank; KeyboardFlows leaves Escape's blank too.
+    check("Open items with wears the board's pointer mark",
+          find(view, "openMode").glyph, "pointer")
+    check("Click a selected name to rename draws no mark", find(view, "clickRename").glyph === undefined, true)
+    check("Escape goes up a folder draws no mark", find(view, "escapeUp").glyph === undefined, true)
+    check("Highlight today's dates ships off", find(view, "highlightToday").label + "|" + find(view, "highlightToday").on, "Highlight today's dates|false")
+    check("and a stored on reads back on", find(Settings.rows("view", { data: { highlightToday: true } }), "highlightToday").on, true)
+    check("Columns view limit ships at 3", find(view, "columnsLimit").selected, 3)
+    check("and a stored cap reads back", find(Settings.rows("view", { data: { columnsLimit: 4 } }), "columnsLimit").selected, 4)
     check("save feedback is a separate footer", view[view.length - 1].footer, true)
 
     // Settings > View > Opening, which is where a window and a new tab begin. ui/js/Startup.js turns the values into a path and tests/js/startup.js drives that; this is only what the panel draws.
@@ -250,6 +339,21 @@ function runCompletionRows(check) {
     check("a chosen folder is named by its own path", find(opened, "startFolder").value, "/home/gm/Work")
     check("and the mode beside it reads back", find(opened, "startIn").selected, "folder")
     check("the tab setting reads back too", find(opened, "newTab").selected, "home")
+    // Tabs040 callout 2: the board's own sentence under "Flea opens in", only while Last folder
+    // is chosen. A hint is read-only, so it is never the cursor; kinds() pins that separately.
+    var hinted = Settings.rows("view", { data: { startIn: "last" } })
+    var hints = hinted.filter(function (row) { return row.label === "Last folder reopens every tab you had." })
+    check("Last folder carries the tab restore hint", hints.length, 1)
+    check("as a hint and not a control", hints[0].kind, "hint")
+    check("sitting under the control it explains",
+          hinted.indexOf(hints[0]) - hinted.indexOf(find(hinted, "startIn")), 1)
+    var unhinted = Settings.rows("view", { data: { startIn: "folder" } })
+          .filter(function (row) { return row.label === "Last folder reopens every tab you had." })
+    check("while Chosen folder shows no such hint", unhinted.length, 0)
+    check("and neither does Home",
+          Settings.rows("view", {}).filter(function (row) {
+              return row.label === "Last folder reopens every tab you had."
+          }).length, 0)
     check("the save failure keeps its message and error role",
           Settings.rows("view", { saveStatus: "Could not save settings" }).slice(-1).map(function (row) {
               return row.label + "|" + row.role + "|" + row.footer
@@ -257,16 +361,16 @@ function runCompletionRows(check) {
     var preview = Settings.rows("preview", state)
     check("preview visibility is independent of loading", find(preview, "preview.column").on, false)
     check("manual preview reports the stored load mode", find(preview, "preview.loadOn").value, "Manual")
-    check("all four thumbnail display stops remain available", find(preview, "preview.thumbSize").values.join(","), "small,medium,large,xlarge")
+    check("all six thumbnail display stops remain available", find(preview, "preview.thumbSize").values.join(","), "small,medium,large,xlarge,huge,largest")
     check("thumbnail source policy remains separate", find(preview, "preview.thumbnails").selected, "off")
     check("ctrl zoom can be disabled", find(preview, "preview.ctrlZoom").on, false)
     // HANDOFF rule 3: nothing is indented, so no row carries the flag that stepped its mark right.
     check("no preview row is indented", preview.filter(function (row) { return row.indented }).length, 0)
-    var sizes = ["small", "medium", "large", "xlarge"]
+    var sizes = ["small", "medium", "large", "xlarge", "huge", "largest"]
     check("the size row names the stop and no figure, one value per row", sizes.map(function (size) {
         var row = find(Settings.rows("preview", { data: { preview: { thumbSize: size } } }), "preview.thumbSize")
         return (row.caption === undefined ? "-" : row.caption) + "|" + row.value
-    }).join(","), "-|Small,-|Medium,-|Large,-|Extra large")
+    }).join(","), "-|Small,-|Medium,-|Large,-|Extra large,-|Huge,-|Largest")
     // Rule 3: the sentence explaining Load sits under Load, inside its own group, not in a footer two hairlines away.
     check("the load hint sits under the control it explains", preview[3].kind + "|" + preview[3].label + "|" + (preview[3].footer === undefined),
           "hint|Ctrl+Space loads the current selection.|true")

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Sourced by ui.sh; every state and listing path belongs to its marked fixture root.
+# Sidebar040 built-in group, then the Rail group of directives 38, 74 and 77, then the Trash group.
+PLACES_ROW_LABELS='["Built in","Home","Recent","Network","Devices","Trash","Sidebar","Show drive size","Show Trash count","Show unmounted drives","Auto-hide sidebar","Show sidebar","Sidebar width","Trash","Empty after 30 days"]'
 rail_assert_details() {
     local enabled="$1" count="$2" state background surface foreground muted rest
     state=$(ipc railDetails) || fail "rail: native detail observations unavailable"
@@ -59,7 +61,7 @@ rail_details_native() {
     rail_assert_details false 0
     settings_open_key; settle
     settings_section places
-    ipc settingsModel | jq -e '.[0].label == "Favorites" and ([.[-3:][] | .label] == ["Show drive size", "Show Trash count", "Sidebar width"])' >/dev/null \
+    ipc settingsModel | jq -e --argjson want "$PLACES_ROW_LABELS" '.[0].label == "Favorites" and ([.[] | .label] | index("Built in") as $built | .[$built:] == $want)' >/dev/null \
         || fail "rail: Places labels/control order differ from the ruled board"
     trash_shot settings-places-details-off
     for flag in driveSize trashCount; do
@@ -221,6 +223,9 @@ places_drag_row() {
 places_concurrent() (
     local dir="$1" expected="$2" first_pid first_id second_pid="" second_id="" second_address=""
     local instance pid address attempt rows width cursor active permissions_checks=0
+    local addition="$dir/rail-add"
+    sandbox_require "$addition"
+    mkdir "$addition" || fail "places: distinct rail identity fixture creation failed"
     first_pid=$(flea_pid)
     first_id=$(qs list --all --json | jq -er --arg path "$flea_ui/boot/shell.qml" --argjson pid "$first_pid" '.[] | select(.config_path == $path and .pid == $pid) | .id')
     key -M ctrl -k n -m ctrl >/dev/null
@@ -351,6 +356,10 @@ places_concurrent() (
         places_wait_records "$expected"
     }
     local group target original_target target_path
+    # Beta is already saved. Use an unfavourited folder so each add moves the rail by one row.
+    places_use "$second_id" "$second_pid"
+    key -M ctrl -k l -m ctrl "$addition" -k Return >/dev/null
+    wait_path "$addition"; wait_listing 0
     for group in network device; do
         places_use "$first_id" "$first_pid"
         target=$(ipc railEntries | jq -er --arg group "$group" \
@@ -363,9 +372,12 @@ places_concurrent() (
         [[ "$(ipc settingsOpen)" == true ]] || { settings_open_key; settle; }
         settings_section places
         settings_focus_row addFavourite
+        [[ "$(ipc path)" == "$addition" ]] || fail "places: rail identity Add names another folder"
+        jq -e --arg path "$addition" 'all(.[]; .path? != $path)' <<< "$expected" >/dev/null \
+            || fail "places: rail identity Add would repeat an existing favourite"
         places_require_store
         key -k Return >/dev/null; settle
-        expected=$(jq -c --arg path "$dir/listing/Beta" '. + [{label:"Beta",path:$path}]' <<< "$expected")
+        expected=$(jq -c --arg path "$addition" '. + [{label:"rail-add",path:$path}]' <<< "$expected")
         places_wait_records "$expected"
         places_use "$first_id" "$first_pid"
         places_wait_records "$expected"
@@ -464,6 +476,13 @@ places_external_failure() {
     places_wait_records "$expected"
     cmp "$doc.broken" "$dir/malformed.original" || fail "places: native recovery did not retain the exact malformed backup"
 
+    # The retry must add a new place, rather than ask the writer to deduplicate the listing again.
+    key -k Escape >/dev/null; settle
+    key -M ctrl -k l -m ctrl "$dir/listing/Beta" -k Return >/dev/null
+    wait_path "$dir/listing/Beta"; wait_listing 0
+    settings_open_key; settle
+    settings_section places
+    settings_focus_row addFavourite
     mode=$(stat -c %a "$doc")
     cp "$doc" "$dir/readable.original"
     places_require_store
@@ -505,7 +524,7 @@ places_external_failure() {
     settings_section places
     settings_focus_row addFavourite
     key -k Return >/dev/null; settle
-    expected=$(jq -c '. + .' <<< "$expected")
+    expected=$(jq -c --arg path "$dir/listing/Beta" '. + [{label:"Beta",path:$path}]' <<< "$expected")
     places_wait_records "$expected"
     shot places-read-failure-recovery
     printf 'PLACES_FAILURE missing-retention empty-retention malformed-retention exact-backup unreadable-refusal native-retry=ok\n'
@@ -537,7 +556,7 @@ case_settingsplaces() {
     initial=$(jq -cn --arg path "$dir/listing" '[{label:"listing",path:$path}]')
     places_wait_records "$initial"
     key -k Return >/dev/null; settle
-    expected=$(jq -c '. + .' <<< "$initial")
+    expected="$initial"
     places_wait_records "$expected"
     key -k Escape >/dev/null; settle
 
@@ -558,7 +577,11 @@ case_settingsplaces() {
     key -k Escape >/dev/null; settle
     click_background; settle
     places_click_menu 'Add to Favorites'
-    expected=$(jq -c --arg path "$dir/listing" '. + [{label:"listing",path:$path}]' <<< "$expected")
+    places_wait_records "$expected"
+    seek_row_named Beta
+    click_row "$(ipc cursor)" right; settle
+    places_click_menu 'Add to Favorites'
+    expected=$(jq -c --arg path "$dir/listing/Beta" '. + [{label:"Beta",path:$path}]' <<< "$expected")
     places_wait_records "$expected"
     shot places-listing-add
 
@@ -605,7 +628,8 @@ case_settingsplaces() {
     index=$(ipc railEntries | jq -er 'map(.kind) | index("favourite")')
     click_rail_row "$index" right; settle
     places_require_store
-    places_click_menu Remove
+    # A rail favourite's menu is the folder menu, so its row is Remove from Favorites.
+    places_click_menu 'Remove from Favorites'
     expected=$(jq -c 'del(.[0])' <<< "$expected")
     places_wait_records "$expected"
     launch "$dir/listing"; wait_listing 3
@@ -652,13 +676,13 @@ case_settingsplaces() {
         || fail "places: original labels, invalid rows, or URI scheme changed"
     settings_focus_row favourite:3
     key -k Return >/dev/null; settle
-    [[ "$(ipc lastMessage)" == *'path must be absolute'* && "$(ipc path)" == "$dir/listing" ]] \
+    [[ "$(ipc lastMessage)" == *'use a full path'* && "$(ipc path)" == "$dir/listing" ]] \
         || fail "places: invalid path activation did not explain its refusal"
     settings_focus_row favourite:4
     key -k Return >/dev/null; settle
     ipc statusActivityState | jq -e '.errors == 2' >/dev/null \
         || fail "places: invalid record did not queue its error: $(ipc statusActivityState); message=$(ipc lastMessage)"
-    [[ "$(ipc lastMessage)" == *'path must be absolute'* ]] || fail "places: a new error displaced the unacknowledged error"
+    [[ "$(ipc lastMessage)" == *'use a full path'* ]] || fail "places: a new error displaced the unacknowledged error"
     key -k Escape >/dev/null; settle
     key -k Escape >/dev/null; settle
     [[ "$(ipc lastMessage)" == *'invalid favorite record'* ]] || fail "places: acknowledging the first error did not reveal the invalid record error: $(ipc lastMessage)"
@@ -674,7 +698,7 @@ case_settingsplaces() {
     wait_listing 0
     settings_focus_row addFavourite
     key -k Return >/dev/null; settle
-    expected=$(jq -c --arg path "$dir/listing/Alpha" '. + [{label:"Alpha",path:$path}]' <<< "$records")
+    expected="$records"
     places_wait_records "$expected"
     key -k Escape >/dev/null; settle
     launch "$dir/listing"; wait_listing 3

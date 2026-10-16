@@ -8,12 +8,15 @@ import qs.Commons
 import "." as Flea
 import "js/Picker.js" as Picker
 import "js/Keymap.js" as Keymap
+import "js/Thumbs.js" as Thumbs
+// ControlReader.js loads with IpcControls.qml on the first cohesionControls call, never with the picker's first frame.
 
 // One portal request, one window: the org.freedesktop.impl.portal.FileChooser dialog every caller on
 // the box gets, opened by flea --pick and answered through the reply file tools/flea-portal reads.
 // The same Backend, Row, Theme and places the browser window draws with, and none of its operations:
 // a chooser that can rename or delete is a file manager wearing a dialog's clothes.
 ShellRoot {
+    property alias pickerWin: win
     FloatingWindow {
         id: win
 
@@ -56,12 +59,64 @@ ShellRoot {
         readonly property int shownTotal: win.total
         onFilterChanged: if (win.path.length) win.openWithoutHistory(win.path)
 
+        // The view the listing draws in; a launch reads pickerView and only setView writes it.
+        property string viewMode: "list"
+        function setView(mode) {
+            var before = win.actionFocus()
+            var next = Picker.viewSwitch(win.viewMode, mode)
+            if (!next) { win.restoreActionFocus(before); return }
+            win.viewMode = next
+            // The user's own switch, and only that, is what the next launch reopens: a launch
+            // reads, and cursor moves never owe the file anything.
+            ViewState.changeKey("pickerView", next)
+            // A reshow owns its window: the shown view moves to the cursor and refetches there.
+            var at = Math.max(0, Math.min(win.cursorIndex, win.total - 1))
+            if (next === "grid") grid.reshow(at)
+            else list.reshow(at)
+            win.restoreActionFocus(before)
+        }
+        function viewItem() { return win.viewMode === "grid" ? grid : list }
+        function focusView() { win.viewItem().forceActiveFocus() }
+        function actionFocus() {
+            var view = win.viewItem()
+            if (view.activeFocus) return view
+            var field = save.fieldItem
+            return field.activeFocus ? { field: field, cursor: field.cursorPosition,
+                anchor: field.cursorPosition === field.selectionStart ? field.selectionEnd : field.selectionStart } : null
+        }
+        function restoreActionFocus(before) {
+            if (before === list || before === grid) win.focusView()
+            else if (before) {
+                var field = before.field
+                if (!field.activeFocus) {
+                    field.forceActiveFocus()
+                    field.select(before.anchor, before.cursor)
+                }
+            }
+            else win.focusDefault()
+        }
+        // Automatic returns keep a save on Filename; Tab and row clicks can still focus the listing.
+        function focusDefault() {
+            if (win.saving) save.selectStem()
+            else win.focusView()
+        }
+        // Whether the listing shows the directory's dotfiles. The worker never sends what a
+        // request did not ask for, so the window re-reads the standing directory when this flips.
+        property bool showHidden: false
+        // The grid's visible-only thumbnail plan, owned here so both views share one map the way
+        // the main pane owns its views' states; only the grid ever asks.
+        property var thumbState: Thumbs.empty()
+        // Seven screens of history at the picker's row height, the main pane's own bound.
+        readonly property int thumbCap: 240
+        // The directory's storage class beside its fsinfo line, never per row; unknown holds the
+        // first settle the way the main pane holds its own, see ui/js/ExtThumbs.js.
+        property string storageClass: ""
+        property bool storageKnown: false
+
         // Where Back goes, and it only ever goes back: Parent is its own button and pushes here too.
         property var history: []
-        // The save mode's own name, which starts as the caller's suggestion only when that
-        // suggestion is a filename: tools/flea-portal passes current_name through verbatim, so a
-        // separator in it would put a path outside this folder in the field before anyone typed.
-        property string saveName: Picker.validName(win.req.name) ? win.req.name : ""
+        // The save mode's own name. It starts empty and Component.onCompleted seeds it from the caller's name.
+        property string saveName: ""
         onSaveNameChanged: win.invalidateSave()
         property int nextCheck: 0
         property int markRequest: 0
@@ -75,11 +130,18 @@ ShellRoot {
         readonly property string saveKey: JSON.stringify([win.path, win.saveName])
         readonly property bool saveReady: win.saveReview.key === win.saveKey
         readonly property bool saveCollision: win.saveReady && win.saveReview.collision
+        // Return asked once for a name that exists; the review stands until the name, folder or listing changes.
+        property bool reviewAsked: false
+        // The review is the asked review of a name the backend still reports as taken: Replace, its error line and its role read this alone.
+        readonly property bool collisionReview: win.reviewAsked && win.saveCollision
         readonly property bool submitting: win.acceptMarks || win.reviewRequest > 0
-        // Submission disables its initiating control; keep cancellation on the enabled focus path.
-        onSubmittingChanged: if (win.submitting) win.stepFocus(null, false)
+        // Submission keeps Cancel reachable and restores its initiating control only on refusal.
+        onSubmittingChanged: chrome.submissionChanged()
+        readonly property bool marksAllowed: win.req.multiple && !win.saving
+        readonly property var cursorRow: win.rowFor(win.cursorIndex)
+        readonly property bool cursorFile: win.listingState === "ready" && !win.listingFailed && win.cursorRow !== null && !Picker.directory(win.cursorRow)
         readonly property bool canAccept: !win.backendUnavailable && !win.submitting && !win.markRequest && (win.saving
-            ? win.saveReady : win.marks.length > 0 || (win.folderMode && !win.recent && win.listingState !== "loading"))
+            ? win.saveReady : win.marks.length > 0 || (!win.folderMode && win.cursorFile) || (win.folderMode && !win.recent && win.listingState !== "loading"))
 
         // SendPicker.html draws every rule and control frame in one ink, a lift over whatever plane
         // it sits on. Theme.color.surface is a drop on these palettes and vanishes against the chrome
@@ -92,10 +154,16 @@ ShellRoot {
 
         readonly property bool saving: win.req.mode === "save"
         readonly property bool folderMode: win.req.directory || win.req.mode === "savefiles"
-        readonly property int windowSize: list.visibleRows + 60
+        // Twice the wider view's screen plus slack, so the screen still fits after the quarter lead.
+        readonly property int windowSize: Picker.windowSize(list.visibleRows, grid.visibleTileRows, grid.columns)
+        // Both views refetch through one interval and lead, the main views' own 16 ms and quarter window.
+        readonly property int coalesceMs: 16
+        readonly property real windowLead: 0.25
 
         // Exactly one answer leaves this window, whichever way it is asked for.
         property bool answered: false
+        // The typed-path probe: the mark that has the backend refuse a typed file in a save or folder dialog.
+        property int pathProbe: 0
 
         function rowFor(index) {
             var at = index - win.held
@@ -121,7 +189,8 @@ ShellRoot {
                 recents.refresh()
                 return
             }
-            win.requestListing(backend.listRequest(next, win.windowSize, list.showHidden))
+            backend.resetSort(next)
+            win.requestListing(backend.listRequest(next, win.windowSize, win.showHidden))
         }
 
         function requestListing(request) {
@@ -131,26 +200,36 @@ ShellRoot {
 
         // Rows are named by index, so a replaced listing is dropped whole; emptying the model returns the viewport to the top.
         function clearListing() {
+            selection.reset()
             win.total = 0
             win.held = 0
             win.rows = []
             win.cursorIndex = 0
             win.listingState = "loading"
             win.receivingLatestListing = false
+            // A replaced listing renumbers every row, so no thumb answer may outlive it.
+            win.thumbState = Thumbs.empty()
+            win.storageClass = ""
+            win.storageKnown = false
         }
 
-        // Sort reorders the worker's filtered listing without re-reading the folder, so marks and save review stay; never written to ui.json.
+        // Sort reorders the worker's listing, marks stay; remembers folder sort and default sort in ui.json.
         function requestSort(order) {
+            var before = win.actionFocus()
             if (!order || !win.sortable || (backend.sortBy === order.key && backend.sortDesc === order.desc))
                 return
             backend.sortBy = order.key
             backend.sortDesc = order.desc
+            // A user sort writes its folder only while remembering is on; the default follows every sort.
+            if (!win.recent && win.path.length > 0 && ViewState.state.rememberSort !== false)
+                backend.rememberFolderSort(win.path, order.key, order.desc)
+            ViewState.changeLeaf("sort", { key: order.key === "mtime" ? "date" : order.key, reverse: order.desc })
             win.clearListing()
             win.pendingListings = 1
-            listing.sort(order.key, order.desc, ViewState.state.foldersFirst !== false, ViewState.state.groupByKind === true)
+            listing.sort(order.key, order.desc, ViewState.state.foldersFirst !== false, ViewState.state.groupByKind === true, ViewState.state.hiddenLast === true)
             // sort answers a listed line and no rows of its own, so the reordered window is asked for.
             listing.window(0, win.windowSize)
-            list.forceActiveFocus()
+            win.restoreActionFocus(before)
         }
 
         function filterRequest() {
@@ -164,16 +243,11 @@ ShellRoot {
             return request.id
         }
 
-        function validateMarks(accepting) {
-            if (win.backendUnavailable) return
-            if (!win.marks.length && !win.markRequest) return
-            if (win.markRequest) { win.marksDirty = true; return }
-            win.acceptMarks = accepting
-            win.markRequest = win.check({op: "validate"})
-        }
+        function validateMarks(accepting) { selection.validate(accepting) }
 
         function invalidateSave() {
             win.saveReview = ({})
+            win.reviewAsked = false
             win.saveError = ""
             if (win.saving) Qt.callLater(win.probeSave)
         }
@@ -204,20 +278,12 @@ ShellRoot {
                 win.open(up)
         }
 
-        // Space. A directory is markable only when the request asked for one, and a file only when
-        // it did not: the board draws no check at all on the rows the caller cannot receive.
-        function toggleMark(index) {
-            if (win.backendUnavailable) return
-            if (win.markRequest || win.submitting) { win.say("Selection is still being checked."); return }
-            var row = win.rowFor(index)
-            if (!row || Picker.directory(row) !== win.folderMode)
-                return
-            win.markRequest = win.check({op: "mark", path: Picker.rowPath(win.path, row.n), directory: win.folderMode, multiple: win.req.multiple})
-        }
+        function toggleMark(index) { selection.toggle(index) }
+        function markRange(was, index) { selection.range(was, index) }
+        function selectAll() { selection.all() }
+        function endRange() { selection.endRange() }
 
-        // Enter. A directory is always walked into, even in the folder request the board draws it
-        // marked in, and a file submits what is checked: nothing checked is nothing to submit, which
-        // is the board's own rule and what keeps a stray Enter from sending.
+        // Enter walks folders and submits the checked files, or the cursor file when none are checked.
         function activate(index) {
             var row = win.rowFor(index)
             if (!row)
@@ -229,7 +295,34 @@ ShellRoot {
             win.accept()
         }
 
-        function accept(reviewed) {
+        // File double clicks toggle marks in several-file requests; one-file requests mark when needed, then accept.
+        function doubleActivate(index, rowPath, firstPath) {
+            var row = win.rowFor(index)
+            var choice = Picker.doubleAction(win.req, row, rowPath, firstPath, win.marks)
+            if (choice === Picker.DOUBLE_OPEN) {
+                win.open(Picker.rowPath(win.path, row.n))
+                return
+            }
+            if (choice === Picker.DOUBLE_MARK) {
+                win.toggleMark(index)
+                return
+            }
+            if (choice !== Picker.DOUBLE_ACCEPT && choice !== Picker.DOUBLE_MARK_ACCEPT) {
+                return
+            }
+            if (win.backendUnavailable || win.markRequest || win.submitting) {
+                win.say("Selection is still being checked.")
+                return
+            }
+            if (choice === Picker.DOUBLE_ACCEPT) {
+                win.accept()
+                return
+            }
+            win.acceptMarks = true
+            win.markRequest = win.check({op: "mark", path: rowPath, directory: false, multiple: win.req.multiple})
+        }
+
+        function accept() {
             if (win.backendUnavailable || win.submitting || win.markRequest) return
             if (win.saving) {
                 if (win.saveName.length === 0) {
@@ -243,8 +336,12 @@ ShellRoot {
                     return
                 }
                 if (!win.saveReady) { win.probeSave(); return }
-                if (win.saveCollision && reviewed !== true) { save.focusCancel(); return }
-                win.reviewRequest = win.check({op: "review", review: win.saveReview.review})
+                // Return, the field and a file row only ask: the review starts on a taken name and stays until Replace answers.
+                if (win.saveCollision) {
+                    if (!win.reviewAsked) { win.reviewAsked = true; save.selectStem() }
+                    return
+                }
+                win.submitSave()
                 return
             }
             // A folder request with nothing checked takes the directory the window is standing in,
@@ -260,15 +357,28 @@ ShellRoot {
                 return
             }
             if (win.marks.length === 0) {
-                win.say("Press Space to select a file first")
+                if (!win.cursorFile) return
+                win.acceptMarks = true
+                win.markRequest = win.check({op: "mark", path: Picker.rowPath(win.path, win.cursorRow.n), directory: false, multiple: false})
                 return
             }
             win.validateMarks(true)
         }
 
+        // Replace is the only answer that overwrites; Enter or Space on it, or a click, arrives here and nothing else does.
+        function replace() {
+            if (win.backendUnavailable || win.submitting || win.markRequest || !win.collisionReview) return
+            win.submitSave()
+        }
+
+        function submitSave() { win.reviewRequest = win.check({op: "review", review: win.saveReview.review}) }
+
         function cancel() {
             win.finish(Picker.RESPONSE_CANCELLED, [])
         }
+
+        // ":" and Ctrl+L are the main window's own pathBar rows; keys.toml is not edited.
+        function openPathBar() { chrome.startEdit() }
 
         // The portal reads this reply after exit, so its atomic write must finish before teardown.
         function finish(response, list) {
@@ -334,7 +444,7 @@ ShellRoot {
         Flea.Backend {
             id: backend
             pickerOnly: true
-            // The saved order seeds the first listing only: a window re-sorting later would move the mark over rows that never moved.
+            // Each listing resolves its folder explicitly; between requests the mark must keep describing the held rows.
             preserveSort: true
 
             onListed: function (n, readMs, sortMs) {
@@ -343,12 +453,29 @@ ShellRoot {
                 win.receivingLatestListing = true
                 win.total = n
                 win.listingState = n === 0 ? "empty" : "ready"
+                // Grid needs the storage class, so ask fsinfo except on Recent.
+                if (!win.recent)
+                    listing.fsinfo()
             }
             onRows: function (start, items, ms, kinds) {
                 if (!win.receivingLatestListing) return
                 win.held = start
                 win.rows = items
                 win.kindNames = kinds
+            }
+            // A thumbed line for the previous listing is still in the pipe when clearListing
+            // emptied the map, so only the live listing's answers land.
+            onThumbed: function (row, file) {
+                if (!win.receivingLatestListing) return
+                win.thumbState = Thumbs.remember(win.thumbState, row, file, win.thumbCap)
+            }
+            // The worker stats its own base after the rows, so the class lands after them; a
+            // settle fired in between held on unknown, and restarts now that it is named.
+            onFsInfo: function (fs, free, path, storageClass) {
+                if (path.length > 0 && path !== win.path) return
+                win.storageClass = storageClass || ""
+                win.storageKnown = true
+                grid.restartSettle()
             }
             onFailed: function (where, input, msg, mode) {
                 if (where === "backend") {
@@ -361,16 +488,18 @@ ShellRoot {
                     win.acceptMarks = false
                     win.marksDirty = false
                     win.saveReview = ({})
-                    win.saveError = msg
-                    win.say(msg + "; cancel and reopen this request.", true)
+                    win.saveError = "Flea stopped responding."
+                    win.say("Flea stopped responding. Cancel and reopen this request.", true)
                     win.stepFocus(null, false)
                     return
                 }
                 if (where === "scan" || where === "sort") {
+                    selection.reset()
                     win.pendingListings = 0
                     win.listingFailed = true
                 }
-                win.listingState = "empty"
+                // A worker lost over held rows keeps them and the footer error; only a listing that holds nothing reads as empty.
+                if (win.total === 0) win.listingState = "empty"
                 win.say(msg, true)
             }
             onChanged: function (path) {
@@ -378,17 +507,8 @@ ShellRoot {
             }
             onPickerResult: function (message) {
                 if (win.answered || win.backendUnavailable) return
-                if (message.id === win.markRequest) {
-                    win.markRequest = 0
-                    var accepting = win.acceptMarks
-                    win.acceptMarks = false
-                    if (!message.ok) { win.say(message.error, true); return }
-                    win.marks = Picker.reviewedMarks(win.marks, message.marks)
-                    if (message.removed) win.say(message.removed === 1
-                        ? "1 selected item moved or changed; select it again."
-                        : message.removed + " selected items moved or changed; select them again.", true)
-                    else if (accepting && win.marks.length) { win.finish(Picker.RESPONSE_OK, win.marks); return }
-                    if (win.marksDirty) { win.marksDirty = false; win.validateMarks(false) }
+                if (message.id === win.markRequest || message.id === win.pathProbe) {
+                    selection.received(message)
                 } else if (message.id === win.saveRequest) {
                     win.saveRequest = 0
                     if (win.probeKey !== win.saveKey) { win.probeSave(); return }
@@ -404,6 +524,13 @@ ShellRoot {
                     win.finish(Picker.RESPONSE_OK, [message.path])
                 }
             }
+        }
+
+        Flea.PickerSelection {
+            id: selection
+            picker: win
+            listing: listing
+            backend: backend
         }
 
         // The history the Recent location lists, read only when that location is opened. The listing
@@ -426,11 +553,11 @@ ShellRoot {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 picker: win
-                onCancelRequested: win.cancel()
-                onAcceptRequested: win.accept()
-                onBackRequested: { list.forceActiveFocus(); win.goBack() }
-                onUpRequested: { list.forceActiveFocus(); win.goUp() }
-                onChipChosen: function (index) { win.filterIndex = index }
+                listing: listing
+                backend: backend
+                onBackRequested: { win.focusDefault(); win.goBack() }
+                onUpRequested: { win.focusDefault(); win.goUp() }
+                onViewChosen: function (mode) { win.setView(mode) }
             }
 
             Flea.PickerPlaces {
@@ -443,9 +570,9 @@ ShellRoot {
                 current: win.path
                 edge: win.edge
                 offerRecent: !win.saving
-                onChosen: function (path) { win.open(path); list.forceActiveFocus() }
-                onNetworkCompleted: function(requestId, uri, success, reason) {
-                    if (networkDialog.item) networkDialog.item.mountFinished(requestId, uri, success, reason)
+                onChosen: function (path) { win.open(path); win.focusDefault() }
+                onNetworkCompleted: function(requestId, uri, success, reason, connectFailed) {
+                    if (networkDialog.item) networkDialog.item.mountFinished(requestId, uri, success, reason, connectFailed)
                 }
             }
 
@@ -456,14 +583,15 @@ ShellRoot {
                 anchors.top: chrome.bottom
                 picker: win
                 backend: backend
-                leadingSlot: list.checkSize + Theme.spacing.gap
-                // The save form keeps the room it had before this header, which yields when it and one row do not fit.
-                visible: save.y - chrome.height >= implicitHeight + Theme.rowHeight
+                leadingSlot: win.marksAllowed ? list.checkSize + Theme.spacing.gap : 0
+                // Only the list heads columns; the save form keeps its old room, so the header yields when it and one row do not fit.
+                visible: win.viewMode === "list" && save.y - chrome.height >= implicitHeight + Theme.rowHeight
                 height: visible ? implicitHeight : 0
             }
 
             Flea.PickerList {
                 id: list
+                visible: win.viewMode === "list"
                 anchors.left: places.right
                 anchors.right: parent.right
                 anchors.top: header.bottom
@@ -471,12 +599,34 @@ ShellRoot {
                 picker: win
                 backend: listing
                 clip: true
-                focus: true
+                focus: win.viewMode === "list"
                 enabled: !win.submitting && !win.backendUnavailable
+            }
+
+            // The grid draws the same rows through the main window's tiles, with its own
+            // visible-only thumbnail plan; see ui/PickerGrid.qml.
+            Flea.PickerGrid {
+                id: grid
+                visible: win.viewMode === "grid"
+                anchors.left: places.right
+                anchors.right: parent.right
+                anchors.top: header.bottom
+                anchors.bottom: save.top
+                picker: win
+                backend: listing
+                clip: true
+                focus: win.viewMode === "grid"
+                enabled: !win.submitting && !win.backendUnavailable
+            }
+
+            Connections {
+                target: grid
+                function onThumbsApplied(work) { win.thumbState = Thumbs.applied(win.thumbState, work) }
             }
 
             // The same empty hero the browser window draws, over the list area alone.
             Flea.EmptyState {
+                id: hero
                 x: list.x
                 y: list.y
                 width: list.width
@@ -509,21 +659,25 @@ ShellRoot {
                 }
                 Connections {
                     target: shares.item
-                    function onClosed() { list.forceActiveFocus() }
+                    function onClosed() { win.focusDefault() }
                     function onActivated(uri, label) { places.openChild(uri, label) }
                 }
             }
 
             Flea.PickerSave {
                 id: save
+                keyTarget: win.viewItem()
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: status.top
-                maximumHeight: Math.max(0, status.y - chrome.height - Theme.rowHeight)
+                anchors.bottom: answers.top
+                maximumHeight: Math.max(0, answers.y - chrome.height - Theme.rowHeight)
                 picker: win
                 onNameEdited: function (text) { win.saveName = text }
                 onAccepted: win.accept()
             }
+
+            // The answer row stands under the listing and the save area in every mode; the footer is under it.
+            Flea.PickerAnswers { id: answers; anchors.bottom: status.top; picker: win }
 
             // The footer: what is checked on the left, the keys that act on it on the right.
             Item {
@@ -553,8 +707,8 @@ ShellRoot {
                     anchors.right: statusHints.left
                     anchors.rightMargin: Theme.spacing.gap
                     anchors.verticalCenter: parent.verticalCenter
-                    text: win.message.length > 0 ? win.message : Picker.statusLine(win.marks.length, Picker.totalBytes(win.marks))
-                    color: win.messageError ? Theme.color.error : Theme.color.foreground
+                    text: win.message.length > 0 ? win.message : !win.marksAllowed ? "" : Picker.statusLine(win.marks.length, Picker.totalBytes(win.marks))
+                    color: win.messageError ? Theme.color.errorOnSurface : Theme.color.foreground
                     font.family: Theme.font.family
                     font.pixelSize: Theme.font.caption
                     textFormat: Text.PlainText
@@ -583,7 +737,7 @@ ShellRoot {
                 active: false
                 sourceComponent: Component {
                     Flea.NetworkDialog {
-                        onClosed: list.forceActiveFocus()
+                        onClosed: win.focusDefault()
                         onMountRequested: function(requestId, uri, label, password) { places.retry(requestId, uri, label, password) }
                         onCancelRequested: function(requestId) { places.cancelNetwork(requestId) }
                     }
@@ -605,10 +759,13 @@ ShellRoot {
             // Only an absolute path is a folder, so a caller cannot name the Recent token, or any
             // other text, as the directory this window opens on.
             var start = win.req.folder.charAt(0) === "/" ? win.req.folder : win.home
+            win.showHidden = typeof win.req.hidden === "boolean" ? win.req.hidden : ViewState.state.hidden === true
+            win.viewMode = Picker.rememberedView(ViewState.pickerView)
+            // A one-time seed of a filename only: a binding would read first inside saveReady, and flea-portal passes current_name verbatim.
+            win.saveName = Picker.validName(win.req.name) ? win.req.name : ""
             win.openWithoutHistory(start)
-            // Measured on the box: without this the window has the keyboard but the list does not,
-            // so Escape reached the surface below and every other key was dropped.
-            list.forceActiveFocus()
+            // Seed focus explicitly: saves start on Filename, other requests on the listing.
+            win.focusDefault()
         }
 
         // The seam tests/picker.sh drives, the same read-only shape ui/Ipc.qml has for the window.
@@ -628,25 +785,38 @@ ShellRoot {
             function chip(): int { return win.filterIndex }
             function saveName(): string { return win.saveName }
             function message(): string { return win.message }
+            function pathBarOpen(): bool { return chrome.editing }
             function checks(): string { return JSON.stringify({marksBusy: win.markRequest > 0, saveBusy: win.saveRequest > 0, submitting: win.submitting, canAccept: win.canAccept, saveReady: win.saveReady, collision: win.saveCollision, review: win.saveReview.review || 0}) }
             function markedUris(): string { return JSON.stringify(win.marks.map(function(mark) { return mark.uri })) }
-            function controls(): string { return JSON.stringify(chrome.controls().concat(header.controls(), save.controls(), places.controls())) }
-            function rowCentre(index: int): string { return win.centre(list.itemAtIndex(index)) }
+            function controls(): string { return JSON.stringify(chrome.controls().concat(answers.controls(), header.controls(), save.controls(), places.controls())) }
+            function rowCentre(index: int): string { return win.centre(win.viewItem().itemAtIndex(index)) }
             function saveState(): string { return JSON.stringify({name: win.saveName, path: win.saveReview.path || "", collision: win.saveCollision, error: win.saveError, field: win.centre(save.fieldItem)}) }
+            // The cohesion captures' reader over the picker, see ui/js/ControlReader.js; its answer and chrome marks are inline components, and its filter is PickerFilter.
+            function cohesionControls(): string {
+                var kinds = /^(DialogButton|ChromeButton|SidebarRow|Answer|Mark|PickerFilter)(?:_QML|\()/
+                var alias = {Answer: "DialogButton", Mark: "ChromeButton"}
+                return Qt.createComponent("IpcControls.qml").createObject(null).read(win.contentItem ? win.contentItem.Window.window : null, win.contentItem, kinds, alias)
+            }
             function snapshot(): string {
+                // One reader answers path, field and Jump together, so a poll reads one instant.
+                var jumpItem = chrome.jump
+                var jumpFrame = jumpItem ? jumpItem.dropItem : null
+                var jumpVisible = jumpFrame ? Math.floor((jumpFrame.height - 2 * Theme.spacing.rowPaddingY) / Theme.rowHeight) : 0
                 return JSON.stringify({path: win.path, total: win.total, held: win.held, rows: win.rows,
+                    pathBarOpen: chrome.editing, pathFieldText: chrome.jump ? chrome.jump.query : "",
+                    jump: {open: !!jumpItem && jumpItem.shown, rows: jumpItem ? jumpItem.entries.length : 0, visibleRows: jumpVisible, contentY: jumpFrame ? jumpFrame.scrollY : 0, cursor: jumpItem ? jumpItem.cursor : -1, paths: jumpItem ? jumpItem.entries.map(function(entry) { return entry.path }) : []},
                     cursor: win.cursorIndex, cursorName: win.rowFor(win.cursorIndex) ? win.rowFor(win.cursorIndex).n : "",
-                    marks: win.marks, state: win.listingState, listingFailed: win.listingFailed, sortBy: backend.sortBy, sortDesc: backend.sortDesc, sortable: win.sortable, filter: win.filterIndex, history: win.history,
+                    marks: win.marks, state: win.listingState, emptyHero: hero.visible, emptyRest: hero.atRest, listingFailed: win.listingFailed, sortBy: backend.sortBy, sortDesc: backend.sortDesc, sortable: win.sortable, filter: win.filterIndex, history: win.history,
+                    view: win.viewMode, thumbPending: Object.keys(win.thumbState.file).filter(function(index) { return win.thumbState.file[index] === null || win.thumbState.file[index] === "cache-asked" }).length,
                     marksBusy: win.markRequest > 0, saveBusy: win.saveRequest > 0, submitting: win.submitting, backendUnavailable: win.backendUnavailable,
-                    canAccept: win.canAccept, saveReady: win.saveReady, collision: win.saveCollision,
+                    canAccept: win.canAccept, saveReady: win.saveReady, collision: win.saveCollision, collisionReview: win.collisionReview,
                     saveName: win.saveName, saveError: win.saveError, message: win.message, messageError: win.messageError, hints: statusHints.text,
-                    controls: chrome.controls().concat(header.controls(), save.controls(), places.controls()), headerMark: header.sortBy, listFocus: list.activeFocus,
+                    controls: chrome.controls().concat(answers.controls(), header.controls(), save.controls(), places.controls()), headerMark: header.sortBy, listFocus: list.activeFocus, gridFocus: grid.activeFocus,
                     railFocus: places.focusItem.activeFocus, preset: Flea.ViewState.keysPreset,
                     bodySmall: Theme.font.bodySmall, body: Theme.font.body, width: win.width, height: win.height,
+                    themeLoaded: Theme.ready, themeForeground: String(Theme.color.foreground),
                     geometry: {chrome: chrome.height, header: header.height, rail: places.width, row: Theme.rowHeight, footer: status.height,
-                        save: save.height, list: list.height, saveViewport: win.bounds(save.scrollItem), saveScroll: save.scrollItem.contentY},
-                    outputUri: {text: save.uri, offset: save.uriItem.contentX,
-                        maximum: Math.max(0, save.uriItem.contentWidth - save.uriItem.width)}, title: win.title, app: win.req.app})
+                        save: save.height, list: list.height, saveViewport: win.bounds(save.scrollItem), saveScroll: save.scrollItem.contentY}, title: win.title, app: win.req.app})
             }
         }
 
@@ -664,11 +834,11 @@ ShellRoot {
             return [point.x, point.y, item.width, item.height]
         }
         function stepFocus(from, back) {
-            var items = chrome.focusItems().concat([places.focusItem, list], save.focusItems())
-                .filter(function(item) { return item.visible && item.enabled && item.activeFocusOnTab })
+            var items = Picker.tabOrder({chrome: chrome.focusItems(), rail: places.focusItem, view: win.viewItem(), save: save.focusItems(), answers: answers.focusItems()})
             if (!items.length) return
             var at = items.indexOf(from)
-            var next = items[(at + (back ? -1 : 1) + items.length) % items.length]
+            // No origin lands on Cancel: a submission or a lost backend disables Filter and Open, and Filter is still enabled when this runs.
+            var next = from ? items[(at + (back ? -1 : 1) + items.length) % items.length] : (items.indexOf(answers.cancelItem) >= 0 ? answers.cancelItem : items[0])
             if (next === list && shares.item && shares.item.active) shareFocus.forceActiveFocus(Qt.TabFocusReason)
             else next.forceActiveFocus(Qt.TabFocusReason)
         }

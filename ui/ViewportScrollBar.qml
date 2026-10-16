@@ -1,4 +1,5 @@
 import QtQuick
+import qs.Commons
 import "." as Flea
 import "js/Scroll.js" as Scroll
 
@@ -10,11 +11,17 @@ Item {
     property int orientation: Qt.Vertical
     property var ctrlWheelAction: null
     property real endInset: 0
+    // The operator took the view: a press on the lane or a wheel over it, never the owner's own position writes.
+    signal userScrolled()
 
     readonly property bool vertical: root.orientation === Qt.Vertical
-    readonly property real contentLength: root.vertical ? root.flickable.contentHeight : root.flickable.contentWidth
+    // A flickable scrolls from origin less its leading margin to its content end plus the trailing margin, so the bar measures that span.
+    readonly property real leadMargin: root.vertical ? root.flickable.topMargin : root.flickable.leftMargin
+    readonly property real trailMargin: root.vertical ? root.flickable.bottomMargin : root.flickable.rightMargin
+    readonly property real contentLength: (root.vertical ? root.flickable.contentHeight : root.flickable.contentWidth)
+                                          + root.leadMargin + root.trailMargin
     readonly property real viewportLength: root.vertical ? root.flickable.height : root.flickable.width
-    readonly property real origin: root.vertical ? root.flickable.originY : root.flickable.originX
+    readonly property real origin: (root.vertical ? root.flickable.originY : root.flickable.originX) - root.leadMargin
     readonly property real contentPosition: root.vertical ? root.flickable.contentY : root.flickable.contentX
     readonly property real trackLength: Math.max(0, (root.vertical ? root.height : root.width) - root.endInset)
     readonly property real handleLength: Scroll.handleLength(root.trackLength, root.contentLength,
@@ -24,6 +31,8 @@ Item {
                                                               root.trackLength, Theme.hitMin)
     readonly property bool overflow: Scroll.range(root.contentLength, root.viewportLength) > Scroll.OVERFLOW_PX
     readonly property bool dragging: pointer.pressed && pointer.onHandle
+    // What the lane test reads beside the bar's own rect: the knob's drawn box in window pixels.
+    readonly property alias knobItem: handle
     // Finder's overlay scroller: drawn only while the view moves, the pointer is in the lane or a press is down.
     property bool moving: false
     // A new listing resets the position in the same frame its length changes, which is not a scroll.
@@ -42,7 +51,8 @@ Item {
         Qt.callLater(function() { root.settling = false })
     }
     onContentPositionChanged: {
-        if (root.settling)
+        // A hidden view's move is no scroll anyone saw, so it never shows the bar on the view's return.
+        if (root.settling || !root.flickable.visible)
             return
         root.moving = true
         hold.restart()
@@ -65,10 +75,13 @@ Item {
 
     function setPosition(value) {
         root.flickable.cancelFlick()
+        Scroll.stopTail(root.flickable)
         if (root.vertical)
-            root.flickable.contentY = Scroll.bounded(value, root.origin, root.contentLength, root.viewportLength)
+            root.flickable.contentY = Scroll.bounded(value, root.flickable.originY, root.flickable.contentHeight,
+                root.flickable.height, root.flickable.topMargin, root.flickable.bottomMargin)
         else
-            root.flickable.contentX = Scroll.bounded(value, root.origin, root.contentLength, root.viewportLength)
+            root.flickable.contentX = Scroll.bounded(value, root.flickable.originX, root.flickable.contentWidth,
+                root.flickable.width, root.flickable.leftMargin, root.flickable.rightMargin)
     }
 
     function page(direction) {
@@ -105,7 +118,7 @@ Item {
             NumberAnimation { duration: Scroll.FADE_MS }
         }
 
-        // The track fills the lane with the pointer in it, with a hairline on the content side.
+        // The track fills the lane with the pointer in it, never a line along it.
         Rectangle {
             visible: root.wide
             x: 0
@@ -113,11 +126,6 @@ Item {
             width: root.vertical ? root.width : root.trackLength
             height: root.vertical ? root.trackLength : root.height
             color: Qt.rgba(Theme.color.foreground.r, Theme.color.foreground.g, Theme.color.foreground.b, Scroll.TRACK_ALPHA)
-            Rectangle {
-                width: root.vertical ? Theme.spacing.hairline : parent.width
-                height: root.vertical ? parent.height : Theme.spacing.hairline
-                color: Qt.rgba(Theme.color.foreground.r, Theme.color.foreground.g, Theme.color.foreground.b, Scroll.TRACK_LINE_ALPHA)
-            }
         }
 
         Rectangle {
@@ -126,7 +134,7 @@ Item {
             y: root.vertical ? root.handleOffset : root.height - root.knobInset - height
             width: root.vertical ? root.knobWidth : root.handleLength
             height: root.vertical ? root.handleLength : root.knobWidth
-            radius: Math.min(width, height) / 2
+            radius: Scroll.knobRadius(Style.cornerRadius, width, height)
             color: Qt.rgba(Theme.color.foreground.r, Theme.color.foreground.g, Theme.color.foreground.b, root.knobAlpha)
         }
     }
@@ -144,6 +152,7 @@ Item {
         property bool savedInteractive: true
 
         onPressed: function(mouse) {
+            root.userScrolled()
             var at = root.localAt(mouse)
             var start = root.handleOffset
             if (at < start || at > start + root.handleLength) {
@@ -158,6 +167,7 @@ Item {
             pointer.savedInteractive = root.flickable.interactive
             root.flickable.interactive = false
             root.flickable.cancelFlick()
+            Scroll.stopTail(root.flickable)
             var win = root.Window.window
             if (win && win.contentItem)
                 pointer.parent = win.contentItem
@@ -180,5 +190,6 @@ Item {
         parent: root
         flickable: root.flickable
         ctrlWheelAction: root.ctrlWheelAction
+        onWheeled: root.userScrolled()
     }
 }

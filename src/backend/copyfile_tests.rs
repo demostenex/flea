@@ -1,10 +1,10 @@
 use super::*;
 use crate::backend::testdir::TestDir;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::AtomicBool;
 
 fn quiet<'a>(flag: &'a AtomicBool, sink: &'a mut dyn FnMut(u64, u64)) -> Progress<'a> {
-    Progress { cancel: flag, on_bytes: sink, partial: None, tree: None, manifest: None, durability: None }
+    Progress { cancel: flag, on_bytes: sink, partial: None, tree: None, manifest: None, durability: None, for_move: false }
 }
 
 // copy_any sends a symlink to copy_symlink, so a symlink reaching copy_file was swapped in after
@@ -79,6 +79,101 @@ fn a_symlink_is_copied_as_a_symlink_and_never_followed() {
         std::fs::read_link(d.join("copied.txt")).unwrap(),
         std::path::PathBuf::from("target.txt")
     );
+}
+
+// A copy keeps the source mtime, best effort, so a copied tree still sorts by the files' own history.
+#[test]
+fn a_copy_keeps_the_source_mtime() {
+    let d = TestDir::new("copymtime");
+    let src = d.file("src.bin", "0123456789");
+    let status = std::process::Command::new("touch").arg("-d").arg("2001-02-03 04:05:06").arg(&src).status().expect("touch sets the source mtime");
+    assert!(status.success(), "touch must run for this pin");
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    copy_any(&src, &d.join("dst.bin"), &mut quiet(&flag, &mut sink)).expect("copy");
+    let src_mtime = src.metadata().unwrap().mtime();
+    let dst_mtime = d.join("dst.bin").metadata().unwrap().mtime();
+    assert_eq!(dst_mtime, src_mtime, "the copy carries the source mtime, not the copy time");
+}
+
+// A source filesystem with no real modes lends no exec bits: exfat and ntfs take the umask default.
+#[test]
+fn a_modeless_source_takes_umask_modes() {
+    assert_eq!(mode_for_source(Some(0x2011BAB0), 0o755, false) & 0o111, 0, "an exfat file lends no exec bit");
+    assert_eq!(mode_for_source(Some(0x5346544E), 0o777, false) & 0o111, 0, "an ntfs file lends no exec bit");
+    let umask = super::umask();
+    let want = 0o777 & !umask & 0o111;
+    assert_eq!(mode_for_source(Some(0x7366746e), 0o777, true) & 0o111, want, "an ntfs3 dir keeps the umask's exec bits");
+    assert_ne!(mode_for_source(Some(0xEF53), 0o755, false) & 0o111, 0, "an ext4 file keeps its exec bit");
+    assert_ne!(mode_for_source(None, 0o755, false) & 0o111, 0, "an unknown filesystem keeps its exec bit");
+}
+
+// Sample input: a tree with a.txt and link->a.txt copied under test_force_linkless(true).
+#[test]
+fn a_linkless_folder_copy_names_the_link_and_keeps_the_folder_mtime() {
+    let d = TestDir::new("linklessfolder");
+    let src = d.dir("tree");
+    std::fs::write(src.join("a.txt"), "a").unwrap();
+    std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+    let status = std::process::Command::new("touch").arg("-d").arg("2001-02-03 04:05:06").arg(&src).status().expect("touch sets the source dir mtime");
+    assert!(status.success(), "touch must run for this pin");
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    crate::backend::unheld::test_force_linkless(true);
+    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: None, for_move: false };
+    let outcome = copy_any(&src, &d.join("clone"), &mut p);
+    let refused = crate::backend::unheld::take();
+    crate::backend::unheld::test_force_linkless(false);
+    let error = outcome.expect_err("a folder that lost its link is not a whole copy");
+    assert_eq!(error.msg, "link could not be copied: this drive cannot hold links");
+    assert_eq!(refused, vec![(d.join("clone/link"), "this drive cannot hold links".to_string())], "the link is named");
+    assert_eq!(std::fs::read_to_string(d.join("clone/a.txt")).unwrap(), "a");
+    assert!(d.join("clone/link").symlink_metadata().is_err(), "the link is nowhere, counted and not copied");
+    let src_mtime = src.metadata().unwrap().mtime();
+    let dst_mtime = d.join("clone").metadata().unwrap().mtime();
+    assert_eq!(dst_mtime, src_mtime, "the folder carries the source mtime too");
+}
+
+// Sample input: test_set_precheck(Some(0), Some(0), None) lets a 3-byte copy_any through.
+#[test]
+fn a_precheck_with_unknown_room_lets_copy_any_through() {
+    let d = TestDir::new("precheckunknown");
+    let src = d.file("src.txt", "abc");
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    test_set_precheck(Some(0), Some(0), None);
+    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: None, for_move: false };
+    let outcome = copy_any(&src, &d.join("dst.txt"), &mut p);
+    test_set_precheck(None, None, None);
+    outcome.expect("unknown room never refuses");
+    assert_eq!(std::fs::read_to_string(d.join("dst.txt")).unwrap(), "abc");
+    test_set_precheck(Some(2), Some(100), None);
+    let mut q = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: None, for_move: false };
+    let error = copy_any(&src, &d.join("dst2.txt"), &mut q).expect_err("no room still refuses");
+    test_set_precheck(None, None, None);
+    assert_eq!(error.msg, "dst2.txt needs 3 B, and the drive has 2 B free", "the room refusal names the file and both sizes");
+}
+
+// A 4 GiB file never starts onto vfat, and a file bigger than the free room never starts anywhere, so both refuse up front.
+#[test]
+fn a_copy_refuses_a_file_the_destination_cannot_hold() {
+    assert_eq!(refuse_for_size("big.iso", Some(VFAT_MAGIC), u64::MAX, 100, FOUR_GIB).unwrap(),
+        "a file of 4 GiB or more does not fit on a FAT32 drive");
+    assert!(refuse_for_size("big.iso", Some(VFAT_MAGIC), u64::MAX, 100, FOUR_GIB - 1).is_none());
+    assert!(refuse_for_size("big.iso", Some(0xEF53), u64::MAX, 100, FOUR_GIB).is_none(), "ext4 has no 4 GiB file limit");
+    assert_eq!(refuse_for_size("photo.heic", None, 1_100_000_000, 100, 4_200_000_000).unwrap(),
+        "photo.heic needs 4.2 GB, and the drive has 1.1 GB free", "the room refusal leads with the name and reads sizes");
+    assert!(refuse_for_size("a.txt", None, 101, 100, 101).is_none(), "a file that exactly fits is let through");
+}
+
+// A statfs with zero total blocks reports unknown room, so a gvfs mount that omits free never refuses.
+#[test]
+fn a_statfs_with_zero_blocks_is_unknown_room() {
+    assert!(refuse_for_size("a.txt", None, 0, 0, 1).is_none(), "zero blocks skips the free test");
+    assert!(refuse_for_size("a.txt", Some(0xEF53), 0, 0, 4096).is_none(), "unknown room holds any size");
+    assert_eq!(refuse_for_size("big.iso", Some(VFAT_MAGIC), 0, 0, FOUR_GIB).unwrap(),
+        "a file of 4 GiB or more does not fit on a FAT32 drive");
+    assert!(refuse_for_size("a.txt", None, 0, 100, 1).is_some(), "zero free on a real filesystem still refuses");
 }
 
 // The Copying card sat still for a whole tree because a directory item reported nothing at all:
@@ -311,7 +406,7 @@ fn a_cross_device_move_confirms_the_destination_before_removing_the_source() {
     let mut sink = |_: u64, _: u64| {};
     let mut durability = crate::backend::durable::Durability::begin(&dst);
     assert!(durability.durable, "the marked sandbox is a durable destination");
-    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: Some(&mut durability) };
+    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: Some(&mut durability), for_move: false };
     crate::backend::durable::test_set_fail_dirs(true);
     let error = move_cross_device(&src, &dst, &mut p).expect_err("a failed folder confirm must not remove the source");
     assert_eq!(error.msg, crate::backend::durable::DIR_UNCONFIRMED);
@@ -409,4 +504,191 @@ fn a_cancel_removes_a_tree_holding_a_directory_the_copy_made_unwritable() {
     let e = copy_any(&src, &clone, &mut quiet(&flag, &mut sink)).expect_err("cancelled");
     assert_eq!(e.msg, "cancelled");
     assert!(!clone.exists(), "a half-copied tree goes, even when the copy left it unwritable");
+}
+
+// A batch single-item move settles its held file before removing its source.
+#[test]
+fn a_batch_cross_device_move_settles_before_removing_its_source() {
+    let d = TestDir::new("movexdevbatch");
+    let src = d.file("moving.txt", "body");
+    let dst = d.join("moved.txt");
+    crate::backend::durable::test_reset();
+    crate::backend::durable::test_mark_durable(d.path());
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    let mut durability = crate::backend::durable::Durability::begin(&dst);
+    durability.batch_syncfs = true;
+    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: Some(&mut durability), for_move: false };
+    move_cross_device(&src, &dst, &mut p).expect("a batch move confirms");
+    let order = crate::backend::durable::test_order();
+    let syncfs_at = order.iter().position(|s| s == "syncfs").expect("one syncfs in the order");
+    let dir_at = order.iter().position(|s| s == "dir").expect("one folder fsync in the order");
+    let release_at = order.iter().position(|s| s == "release").expect("held file closes");
+    assert!(syncfs_at < release_at && release_at < dir_at, "syncfs, release, folder fsync, then source removal: {:?}", order);
+    assert!(!src.exists(), "the source goes only after the confirm");
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "body");
+    crate::backend::durable::test_reset();
+}
+
+// A failing batch syncfs keeps the source of a single-item move, so a crash never loses the file.
+#[test]
+fn a_batch_cross_device_move_keeps_its_source_when_syncfs_fails() {
+    let d = TestDir::new("movexdevbatchfail");
+    let src = d.file("moving.txt", "body");
+    let dst = d.join("moved.txt");
+    crate::backend::durable::test_reset();
+    crate::backend::durable::test_mark_durable(d.path());
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    let mut durability = crate::backend::durable::Durability::begin(&dst);
+    durability.batch_syncfs = true;
+    let mut p = Progress { cancel: &flag, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: Some(&mut durability), for_move: false };
+    crate::backend::durable::test_set_syncfs_errno(crate::backend::durable::EIO);
+    let error = move_cross_device(&src, &dst, &mut p).expect_err("an unconfirmed batch move keeps its source");
+    crate::backend::durable::test_set_syncfs_errno(0);
+    assert_eq!(error.msg, crate::backend::durable::DIR_UNCONFIRMED);
+    assert!(src.exists(), "the source stays: {:?}", error.msg);
+    assert!(dst.exists(), "the landed copy stays beside it");
+    assert_eq!(p.partial.as_deref(), Some(dst.as_path()), "the unconfirmed copy is handed to the caller to journal");
+    assert_eq!(crate::backend::durable::test_syncfs_count(), 0, "a failed syncfs never counts: {:?}", crate::backend::durable::test_order());
+    crate::backend::durable::test_reset();
+}
+
+// A tagged file copy lands tagged, which the journal test alone never proved.
+#[test]
+fn a_file_copy_carries_the_source_tags() {
+    let d = TestDir::new("tagscopyfile");
+    let src = d.file("src.txt", "body");
+    crate::backend::tags::write_names(&src, &["Red".to_string()]).unwrap();
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    copy_any(&src, &d.join("dst.txt"), &mut quiet(&flag, &mut sink)).expect("copy");
+    assert_eq!(crate::backend::tags::read(&d.join("dst.txt")).unwrap(), vec!["Red"]);
+}
+
+// A tagged directory copy lands tagged on the directory and on the child inside it.
+#[test]
+fn a_directory_copy_carries_the_tree_tags() {
+    let d = TestDir::new("tagscopydir");
+    let tree = d.dir("tree");
+    let inner = tree.join("a.txt");
+    std::fs::write(&inner, "a").expect("a.txt");
+    crate::backend::tags::write_names(&tree, &["Green".to_string()]).unwrap();
+    crate::backend::tags::write_names(&inner, &["Red".to_string()]).unwrap();
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    let clone = d.join("tree-copy");
+    copy_any(&tree, &clone, &mut quiet(&flag, &mut sink)).expect("copy");
+    assert_eq!(crate::backend::tags::read(&clone).unwrap(), vec!["Green"]);
+    assert_eq!(crate::backend::tags::read(&clone.join("a.txt")).unwrap(), vec!["Red"]);
+}
+
+// A same-device move is a rename, so the tags ride the inode to the new name.
+#[test]
+fn a_same_device_move_keeps_the_tags() {
+    let d = TestDir::new("tagsmove");
+    let src = d.file("src.txt", "body");
+    crate::backend::tags::write_names(&src, &["Red".to_string()]).unwrap();
+    let dst = d.join("dst.txt");
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    move_any(&src, &dst, &mut quiet(&flag, &mut sink)).expect("move");
+    assert_eq!(crate::backend::tags::read(&dst).unwrap(), vec!["Red"]);
+    assert!(!src.exists(), "the rename leaves no source behind");
+}
+
+// A cross-device move copies first, so the tags must arrive on the copy.
+#[test]
+fn a_cross_device_move_carries_the_tags() {
+    let d = TestDir::new("tagsmoveexdev");
+    let src = d.file("src.txt", "body");
+    crate::backend::tags::write_names(&src, &["Blue".to_string()]).unwrap();
+    let dst = d.join("dst.txt");
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    test_force_exdev(true);
+    let outcome = move_any(&src, &dst, &mut quiet(&flag, &mut sink));
+    test_force_exdev(false);
+    outcome.expect("move");
+    assert_eq!(crate::backend::tags::read(&dst).unwrap(), vec!["Blue"]);
+    assert!(!src.exists(), "the copy-then-remove leaves no source behind");
+}
+
+// A twin move through move_any keeps the stranded message, so a redo and a transfer item name the temp leaf.
+#[test]
+fn a_twin_move_through_move_any_names_its_temp() {
+    let d = TestDir::new("movetwinstranded");
+    let from = d.file("a.txt", "body");
+    let twin = d.join("A.txt");
+    std::fs::hard_link(&from, &twin).unwrap();
+    crate::backend::renamecompat::test_fail_twin_back();
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    let mut p = quiet(&flag, &mut sink);
+    let error = move_any(&from, &twin, &mut p).expect_err("a failed move-back strands the file");
+    assert_eq!(error.where_, "rename-stranded", "a stranded twin answers its own kind");
+    assert!(error.msg.starts_with("the file was left as .flea-case-"), "msg names temp leaf: {}", error.msg);
+    let leaf = error.msg.split(" as ").nth(1).unwrap().split(" in ").next().unwrap();
+    assert!(d.path().join(leaf).is_file(), "the temp holds the file");
+}
+
+// Forces fuse.rclone's EINVAL answer to RENAME_NOREPLACE on a directory (issue 282) and its copy fallback.
+fn rclone_move(src: &Path, dst: &Path, p: &mut Progress) -> Result<(), FleaError> {
+    crate::backend::renamecompat::test_force_fallback(true);
+    crate::backend::renamecompat::test_force_copy_fallback(true);
+    let outcome = move_any(src, dst, p);
+    crate::backend::renamecompat::test_force_copy_fallback(false);
+    crate::backend::renamecompat::test_force_fallback(false);
+    outcome
+}
+
+// Two files and a subfolder holding a third, the shape a folder move must carry whole.
+fn small_tree(d: &TestDir) -> std::path::PathBuf {
+    let src = d.dir("tree");
+    std::fs::write(src.join("a.txt"), "alpha").unwrap();
+    std::fs::write(src.join("b.txt"), "beta").unwrap();
+    std::fs::create_dir(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub/c.txt"), "gamma").unwrap();
+    src
+}
+
+fn assert_small_tree(root: &Path) {
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "alpha");
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "beta");
+    assert_eq!(std::fs::read_to_string(root.join("sub/c.txt")).unwrap(), "gamma");
+}
+
+#[test]
+fn a_directory_move_takes_the_copy_fallback_when_noreplace_answers_einval() {
+    let d = TestDir::new("movefusefallback");
+    let src = small_tree(&d);
+    let dst = d.join("moved");
+    d.assert_contains(&src);
+    d.assert_contains(&dst);
+    let flag = AtomicBool::new(false);
+    let mut seen = Vec::new();
+    let mut sink = |done: u64, total: u64| seen.push((done, total));
+    rclone_move(&src, &dst, &mut quiet(&flag, &mut sink)).expect("an EINVAL noreplace still moves through the copy fallback");
+    assert!(!seen.is_empty(), "the copy reports its bytes to the transfer's progress");
+    assert!(!src.exists(), "the source goes only once the destination is whole");
+    assert_small_tree(&dst);
+}
+
+// The fallback keeps no-clobber: an existing destination refuses and both trees stay untouched.
+#[test]
+fn a_fallback_directory_move_onto_an_existing_name_refuses_and_keeps_both_trees() {
+    let d = TestDir::new("movefuseclobber");
+    let src = small_tree(&d);
+    let dst = d.dir("taken");
+    std::fs::write(dst.join("keep.txt"), "keep").unwrap();
+    d.assert_contains(&src);
+    d.assert_contains(&dst);
+    let flag = AtomicBool::new(false);
+    let mut sink = |_: u64, _: u64| {};
+    let error = rclone_move(&src, &dst, &mut quiet(&flag, &mut sink)).expect_err("the fallback must refuse a taken name");
+    assert_eq!(error.msg, "already exists");
+    assert_eq!(error.where_, "copy", "the refusal comes from the copy fallback, not the plain rename");
+    assert_small_tree(&src);
+    assert_eq!(std::fs::read_to_string(dst.join("keep.txt")).unwrap(), "keep");
+    assert!(dst.join("a.txt").symlink_metadata().is_err(), "nothing of the source lands under the taken name");
 }

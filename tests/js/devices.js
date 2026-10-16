@@ -6,6 +6,20 @@
 // from the listing that follows it. Split out of tests/js/mounts.js with ui/js/Devices.js, which
 // keeps the gvfs half and the rail's shared vocabulary.
 
+function powerQueue(listing, disk, entries) {
+    var expected = ""
+    try {
+        // Sample input: {"blockdevices":[{"name":"sda","path":"/dev/sda","mountpoints":[null],"type":"disk"}]}, a valid lsblk listing with no fallback warning.
+        JSON.parse(String(listing || ""))
+    } catch (e) {
+        expected = "Device listing for " + disk + " could not be parsed (" + e.message + "); mounted rail volumes were queued instead."
+    }
+    console.log("power-off warning begin: " + expected)
+    var queue = Devices.powerOffQueue(listing, disk, entries)
+    console.log("power-off warning end")
+    return queue
+}
+
 function run(check) {
     // minipc's own listing, taken live on 2026-09-11 with one stick in: the encrypted root carries
     // four mountpoints including /, which is why the parser reads MOUNTPOINTS and not MOUNTPOINT.
@@ -34,6 +48,20 @@ function run(check) {
     check("a volume with a mountpoint reads as mounted", d[1].mounted, true)
     check("a removable volume is marked removable, which is what offers it Eject", d[1].removable, true)
     check("a loop device is not a device row", d.map(function (e) { return e.label }).join(","), "nvme0n1,128GB")
+    check("a real removable volume is not marked loop", d[1].loop, false)
+
+    var wholeStick = { blockdevices: [{ name: "sdb", path: "/dev/sdb", type: "disk", rm: true, tran: "usb",
+        fstype: "iso9660", label: "WHOLE_STICK", mountpoints: ["/run/media/user/WHOLE_STICK"], children: [
+            { name: "sdb1", path: "/dev/sdb1", type: "part", fstype: "iso9660", mountpoints: ["/run/media/user/CHILD"], rm: true },
+            { name: "sdb2", path: "/dev/sdb2", type: "part", mountpoints: [null], rm: true }] }] }
+    var wholeRows = Devices.parseDevices(JSON.stringify(wholeStick))
+    var whole = wholeRows.filter(function (e) { return e.device === "/dev/sdb" })[0]
+    check("a stick mounted whole is a row even with a partition table", wholeRows.length, 2)
+    check("the whole stick keeps its mountpoint", whole ? whole.path : "missing", "/run/media/user/WHOLE_STICK")
+    check("the whole stick still ejects through gio mount -e", whole ? Devices.ejectCommand(whole).join(" ") : "missing",
+          "gio mount -e /run/media/user/WHOLE_STICK")
+    check("the mounted whole stick still recurses into its mounted child", wholeRows.some(function (e) { return e.device === "/dev/sdb1" }), true)
+
     // The system disk is the one place the walk never goes: /boot and /home are the box's own
     // plumbing, and the disk row above already stands for that drive.
     check("no partition of the system disk becomes a row of its own",
@@ -53,8 +81,8 @@ function run(check) {
     check("it opens where it is mounted", two[1].path, "/mnt/vault")
     check("it reads as mounted", two[1].mounted, true)
     check("and it is not removable, so nothing offers to eject a fixed disk", two[1].removable, false)
-    check("a fixed internal volume is offered no release at all",
-          Mounts.railMenu({ group: "device", kind: "volume", mounted: true, removable: false }).length, 0)
+    var fixedMenu = Mounts.railMenu({ group: "device", kind: "volume", mounted: true, removable: false })
+    check("a fixed internal volume offers Open and Unmount", fixedMenu.filter(function (r) { return r.separator !== true }).map(function (r) { return r.label }).join(","), "Open,Unmount")
 
     // Which disk is "the" disk was guessed as the first non-removable one, so a second internal drive
     // listed ahead of the system disk took the / row and the real system disk got none.
@@ -76,15 +104,15 @@ function run(check) {
                + '{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[null],"rm":false,"tran":"nvme","size":256060514304,"type":"disk","model":"KBG40ZNS256G",'
                + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"tran":null,"size":256060514304,"type":"part","model":null}]},'
                + '{"name":"sdb","path":"/dev/sdb","label":null,"mountpoints":[null],"rm":false,"tran":"usb","size":2000398934016,"type":"disk","model":"My Passport 25E2",'
-               + '"children":[{"name":"sdb1","path":"/dev/sdb1","label":"Passport","mountpoints":["/run/media/gm/Passport"],"rm":false,"tran":null,"size":2000398934016,"type":"part","model":null}]}'
+               + '"children":[{"name":"sdb1","path":"/dev/sdb1","label":"Passport","mountpoints":["/run/media/gm/Passport"],"rm":false,"tran":null,"size":2000398934016,"type":"part","model":null,"fstype":"vfat"}]}'
                + ']}'
     var usb = Devices.parseDevices(bridge)
     check("a mounted USB bridge is a rail row", usb.length + "|" + usb[1].label, "2|Passport")
     check("and it is removable however its RM column reads, because it unplugs", usb[1].removable, true)
     // The parsed row itself, not a hand-built one: the menu reads group, kind and mounted too.
-    check("so the rail offers it the release a stick gets",
+    check("so the rail offers it Open, Unmount, Eject and Flash image",
           Mounts.railMenu(Object.assign({ group: "device" }, usb[1]))
-                .filter(function (r) { return r.separator !== true }).map(function (r) { return r.label }).join(","), "Open,Eject")
+                .filter(function (r) { return r.separator !== true }).map(function (r) { return r.label }).join(","), "Open,Unmount,Eject,Flash image")
     // The same drive with nothing mounted is still a row, the way an unplugged stick is.
     check("an unmounted USB bridge is a row too",
           Devices.parseDevices(bridge.replace('["/run/media/gm/Passport"]', "[null]")).length, 2)
@@ -101,8 +129,8 @@ function run(check) {
     var locked = Devices.parseDevices(lockedUsb)
     check("an unlocked volume on a USB drive is the one row, as it always was",
           locked.length + "|" + locked[locked.length - 1].label, "2|vault")
-    check("and it is not marked removable, so the transport stopped at the partition",
-          locked[locked.length - 1].removable, false)
+    check("and it is marked removable, which is what offers the unlocked row Eject",
+          locked[locked.length - 1].removable, true)
 
     // An internal partition nothing mounted stays out: a spare EFI or recovery partition is not a
     // place to browse, and Flea offers no way to mount one.
@@ -123,6 +151,12 @@ function run(check) {
                  + '"children":[{"name":"sdb1","path":"/dev/sdb1","label":null,"mountpoints":["[SWAP]"],"rm":false,"size":17179869184,"type":"part","model":null}]}'
                  + ']}'
     check("a swap partition on another drive is not a row", Devices.parseDevices(swapDisk).length, 1)
+
+    // glib's exact system list carries /run (GLIB_RUNSTATEDIR) and neither /efi nor /boot/efi.
+    check("a volume mounted only at /run hides with the system mounts", Devices.isSystemPath("/run"), true)
+    check("a volume mounted only at /boot hides with the system mounts", Devices.isSystemPath("/boot"), true)
+    check("/efi is no system path, so a non-ESP volume there stays a row", Devices.isSystemPath("/efi"), false)
+    check("/boot/efi is no system path either", Devices.isSystemPath("/boot/efi"), false)
 
     // Only a leaf is a volume. An encrypted stick lists the partition and the unlocked crypt under
     // it, and emitting both would put one drive in the rail twice.
@@ -147,7 +181,7 @@ function run(check) {
 
     // Present and unmounted: the state a stick sits in on this box, which automounts nothing.
     var unmounted = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"disk","model":"USB Flash Disk",'
-                  + '"children":[{"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":[null],"rm":true,"size":124656812032,"type":"part","model":null}]}]}'
+                  + '"children":[{"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":[null],"rm":true,"size":124656812032,"type":"part","model":null,"fstype":"vfat"}]}]}'
     var u = Devices.parseDevices(unmounted)
     check("an unmounted stick is still a row", u.length, 1)
     check("an unmounted volume reads as unmounted", u[0].mounted, false)
@@ -158,7 +192,7 @@ function run(check) {
     // Issue 143's three states, with a USB disk beside the optical device as the negative control: empty rom hidden, inserted and mounted iso9660 rows retained.
     var opticalSystem = '{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[null],"rm":false,"size":256060514304,"type":"disk","model":"KBG40ZNS256G",'
                      + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"size":256060514304,"type":"part","model":null}]},'
-    var opticalUsb = '{"name":"sdb","path":"/dev/sdb","label":"USB","mountpoints":[null],"rm":true,"size":34359738368,"type":"disk","model":"USB Flash Disk"}'
+    var opticalUsb = '{"name":"sdb","path":"/dev/sdb","label":"USB","mountpoints":[null],"rm":true,"size":34359738368,"type":"disk","model":"USB Flash Disk","fstype":"vfat"}'
     var opticalEmpty = '{"blockdevices":[' + opticalSystem
                      + '{"name":"sr0","path":"/dev/sr0","label":null,"mountpoints":[null],"rm":true,"size":0,"type":"rom","model":"MATSHITA DVD+/-RW UJ8FB"},'
                      + opticalUsb + ']}'
@@ -184,8 +218,8 @@ function run(check) {
              + '{"name":"nvme1n1","path":"/dev/nvme1n1","label":null,"mountpoints":[null],"rm":false,"size":1000000000000,"type":"disk","model":"Second NVMe"},'
              + '{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"disk","model":"USB Flash Disk",'
              + '"children":[{"name":"sda1","path":"/dev/sda1","label":"first","mountpoints":["/run/media/gm/first"],"rm":true,"size":62277025792,"type":"part","model":null},'
-             + '{"name":"sda2","path":"/dev/sda2","label":"second","mountpoints":[null],"rm":true,"size":62277025792,"type":"part","model":null}]},'
-             + '{"name":"sdb","path":"/dev/sdb","label":"CARD","mountpoints":[null],"rm":true,"size":34359738368,"type":"disk","model":"SD Reader"}'
+             + '{"name":"sda2","path":"/dev/sda2","label":"second","mountpoints":[null],"rm":true,"size":62277025792,"type":"part","model":null,"fstype":"vfat"}]},'
+             + '{"name":"sdb","path":"/dev/sdb","label":"CARD","mountpoints":[null],"rm":true,"size":34359738368,"type":"disk","model":"SD Reader","fstype":"vfat"}'
              + ']}'
     var m = Devices.parseDevices(many)
     check("four rows come out of two sticks, the system disk and one bare internal drive", m.length, 4)
@@ -199,28 +233,28 @@ function run(check) {
 
     // The label ladder: filesystem label, then the drive's product name, then the kernel name.
     var noLabel = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"disk","model":"USB Flash Disk",'
-                + '"children":[{"name":"sda1","path":"/dev/sda1","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"part","model":null}]}]}'
+                + '"children":[{"name":"sda1","path":"/dev/sda1","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"part","model":null,"fstype":"vfat"}]}]}'
     check("an unlabelled volume falls back to the drive's product name", Devices.parseDevices(noLabel)[0].label, "USB Flash Disk")
     var noModel = '{"blockdevices":[{"name":"sdb","path":"/dev/sdb","label":null,"mountpoints":[null],"rm":true,"size":34359738368,"type":"disk","model":null,'
-                + '"children":[{"name":"sdb1","path":"/dev/sdb1","label":null,"mountpoints":[null],"rm":true,"size":34359738368,"type":"part","model":null}]}]}'
+                + '"children":[{"name":"sdb1","path":"/dev/sdb1","label":null,"mountpoints":[null],"rm":true,"size":34359738368,"type":"part","model":null,"fstype":"vfat"}]}]}'
     check("a volume with neither label nor model falls back to the kernel name", Devices.parseDevices(noModel)[0].label, "sdb1")
 
     // A label is a name off somebody else's filesystem, so it is data: the parser never rewrites it
     // and ui/SidebarRow.qml draws it through Text.PlainText.
     var awkward = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":8589934592,"type":"disk","model":null,'
-                + '"children":[{"name":"sda1","path":"/dev/sda1","label":"Sauvegarde & Co \\"2026\\" <b>","mountpoints":[null],"rm":true,"size":8589934592,"type":"part","model":null}]}]}'
+                + '"children":[{"name":"sda1","path":"/dev/sda1","label":"Sauvegarde & Co \\"2026\\" <b>","mountpoints":[null],"rm":true,"size":8589934592,"type":"part","model":null,"fstype":"vfat"}]}]}'
     check("an awkward label survives the parse verbatim", Devices.parseDevices(awkward)[0].label, 'Sauvegarde & Co "2026" <b>')
 
     var longName = "Photographs and scans of every receipt from two thousand and twenty six, quarter one through quarter four"
     var longLabel = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":8589934592,"type":"disk","model":null,'
-                  + '"children":[{"name":"sda1","path":"/dev/sda1","label":"' + longName + '","mountpoints":[null],"rm":true,"size":8589934592,"type":"part","model":null}]}]}'
+                  + '"children":[{"name":"sda1","path":"/dev/sda1","label":"' + longName + '","mountpoints":[null],"rm":true,"size":8589934592,"type":"part","model":null,"fstype":"vfat"}]}]}'
     check("a very long label is elided by the row, never truncated by the parser", Devices.parseDevices(longLabel)[0].label, longName)
 
     // A mountpoint with a space needs no decoding here, and that is measured rather than assumed:
     // the kernel writes /tmp/.../USB\040Drive in /proc/self/mountinfo, and lsblk --json was run
     // against a real vfat mount at that path and printed "/tmp/.../USB Drive" with a literal space.
     var spaced = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":8589934592,"type":"disk","model":null,'
-               + '"children":[{"name":"sda1","path":"/dev/sda1","label":"USB Drive","mountpoints":["/run/media/gm/USB Drive"],"rm":true,"size":8589934592,"type":"part","model":null}]}]}'
+               + '"children":[{"name":"sda1","path":"/dev/sda1","label":"USB Drive","mountpoints":["/run/media/gm/USB Drive"],"rm":true,"size":8589934592,"type":"part","model":null,"fstype":"vfat"}]}]}'
     check("a mountpoint with a space is opened verbatim", Devices.parseDevices(spaced)[0].path, "/run/media/gm/USB Drive")
 
     // A trust boundary: a node with no name would build "/dev/undefined" and hand it to gio.
@@ -254,12 +288,29 @@ function run(check) {
     check("an empty device name is unknown, never safe", Eject.verdict(live, ""), "unknown")
 
     // Only the safe verdict may say safe; the other two tell the user to leave the stick in.
-    check("the safe verdict earns the unplug sentence", Eject.sentence("safe", "128GB").text, "Ejected 128GB, it is safe to unplug.")
+    check("the safe verdict earns the unplug sentence", Eject.sentence("safe", "128GB").text, "Ejected 128GB. It is safe to unplug.")
     check("the safe verdict is not an error", Eject.sentence("safe", "128GB").isError, false)
+    check("a real drive keeps the safe unplug sentence", Eject.sentence("safe", "128GB", [], false).text, "Ejected 128GB. It is safe to unplug.")
+    check("a loop image's safe verdict says only that it was ejected", Eject.sentence("safe", "OMARCHY_202608", [], true).text, "Ejected OMARCHY_202608.")
+    check("a loop image's safe verdict is not an error", Eject.sentence("safe", "ISO", [], true).isError, false)
+    check("a loop image's successful eject never says unplug", /unplug/i.test(Eject.sentence("safe", "ISO", [], true).text), false)
+    check("a failed loop detach keeps its exact sentence", Eject.sentence("attached", "ISO", [], true).text, "Unmounted ISO, but its loop device is still attached.")
+    var imageOtherVerdicts = [
+        { verdict: "attached", blockers: [] },
+        { verdict: "mounted", blockers: [] },
+        { verdict: "mounted", blockers: ["first"] },
+        { verdict: "mounted", blockers: ["first", "second"] },
+        { verdict: "unknown", blockers: [] }
+    ]
+    imageOtherVerdicts.forEach(function (test) {
+        check("loop identity preserves the " + test.verdict + " verdict with " + test.blockers.length + " blockers",
+              JSON.stringify(Eject.sentence(test.verdict, "ISO", test.blockers, true)),
+              JSON.stringify(Eject.sentence(test.verdict, "ISO", test.blockers, false)))
+    })
     check("the mounted verdict with the row itself still mounted says try again", Eject.sentence("mounted", "128GB", []).text, "128GB is still mounted; close what is using it.")
     check("the mounted verdict is an error", Eject.sentence("mounted", "128GB", []).isError, true)
-    check("a sibling blocker is named instead of an instruction that would do nothing", Eject.sentence("mounted", "second", ["first"]).text, "second could not be ejected; first on the same drive is still mounted, eject that instead.")
-    check("two blockers are both named", Eject.sentence("mounted", "third", ["first", "second"]).text, "third could not be ejected; first, second on the same drive are still mounted, eject those instead.")
+    check("a sibling blocker is named instead of an instruction that would do nothing", Eject.sentence("mounted", "second", ["first"]).text, "second could not be ejected because first on the same drive is still mounted. Eject that instead.")
+    check("two blockers are both named", Eject.sentence("mounted", "third", ["first", "second"]).text, "third could not be ejected because first, second on the same drive are still mounted. Eject those instead.")
     check("the unknown verdict says do not unplug", Eject.sentence("unknown", "128GB").text, "Could not confirm 128GB was ejected; do not unplug it yet.")
     check("the unknown verdict is an error", Eject.sentence("unknown", "128GB").isError, true)
     var others = ["mounted", "unknown", "", undefined, "SAFE"]
@@ -271,4 +322,116 @@ function run(check) {
     check("an unmounted partition names its mounted crypt child", Eject.blockers(crypt, "/dev/sda1").join(","), "vault")
     check("a vanished device names nothing", Eject.blockers(gone, "/dev/sda1").join(","), "")
     check("garbage names nothing", Eject.blockers("not json", "/dev/sda1").join(","), "")
+
+    // Defect 7: the mount wait starts when gio exits 0, never at launch, so a slow polkit
+    // prompt is a slow prompt and not a mount that never reported a folder to open.
+    check("an exited gio starts the wait", Devices.mountTimerStart(0), true)
+    check("a refused gio never starts it", Devices.mountTimerStart(1), false)
+    check("a killed gio never starts it", Devices.mountTimerStart(137), false)
+
+    // Defect 9: a power-off unmounts every mounted volume on the disk before stopping it.
+    var vols = JSON.stringify({ blockdevices: [
+        { name: "sda", path: "/dev/sda", mountpoints: [null], type: "disk", children: [
+            { name: "sda1", path: "/dev/sda1", label: "EFI", mountpoints: ["/run/media/u/EFI"], fstype: "vfat", type: "part", parttype: "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" },
+            { name: "sda2", path: "/dev/sda2", label: "DATA", mountpoints: ["/run/media/u/DATA"], fstype: "hfsplus", type: "part" },
+            { name: "sda3", path: "/dev/sda3", label: null, mountpoints: [null], fstype: "vfat", type: "part" },
+            { name: "sda4", path: "/dev/sda4", label: null, mountpoints: ["/boot"], fstype: "vfat", type: "part" } ] },
+        { name: "sdb", path: "/dev/sdb", mountpoints: ["/run/media/u/c"], type: "disk" }] })
+    check("both mounted volumes on the disk queue, the hidden ESP too", powerQueue(vols, "/dev/sda").map(function (q) { return q.device }).join(","), "/dev/sda1,/dev/sda2")
+    check("a queued leg carries its mountpoint from the listing", powerQueue(vols, "/dev/sda")[1].path, "/run/media/u/DATA")
+    check("the other disk queues only its own", powerQueue(vols, "/dev/sdb").map(function (q) { return q.device }).join(","), "/dev/sdb")
+    check("no listing queues nothing", powerQueue(null, "/dev/sda").length, 0)
+    var railVols = [
+        { kind: "volume", device: "/dev/sda1", path: "/run/media/u/a", mounted: true },
+        { kind: "volume", device: "/dev/sda2", path: "/run/media/u/b", mounted: true },
+        { kind: "volume", device: "/dev/sdb1", path: "/run/media/u/c", mounted: true },
+        { kind: "volume", device: "/dev/sda3", path: "", mounted: false },
+        { kind: "disk", device: "/dev/sda", path: "/", mounted: true } ]
+    var railQueue = JSON.stringify([
+        { device: "/dev/sda1", path: "/run/media/u/a" },
+        { device: "/dev/sda2", path: "/run/media/u/b" } ])
+    check("an unparsable listing falls back to mounted rail volumes on this disk",
+          JSON.stringify(powerQueue("not json", "/dev/sda", railVols)), railQueue)
+    check("a truncated listing keeps the same rail fallback",
+          JSON.stringify(powerQueue(vols.slice(0, -1), "/dev/sda", railVols)), railQueue)
+    check("an empty listing keeps the same rail fallback",
+          JSON.stringify(powerQueue(null, "/dev/sda", railVols)), railQueue)
+    check("a valid listing keeps hidden nodes and its own mountpoints instead of the fallback",
+          powerQueue(vols, "/dev/sda", railVols)[0].path, "/run/media/u/EFI")
+    var shared = { name: "dm-0", path: "/dev/mapper/vg-data", mountpoints: ["/mnt/data"], type: "lvm", uuid: "shared" }
+    var mapped = JSON.stringify({ blockdevices: [
+        { name: "sdc", path: "/dev/sdc", mountpoints: [null], type: "disk", children: [
+            { name: "sdc1", path: "/dev/sdc1", mountpoints: [null], type: "part", children: [shared] },
+            { name: "sdc2", path: "/dev/sdc2", mountpoints: [null], type: "part", children: [shared,
+                { name: "dm-1", path: "/dev/mapper/vg-other", mountpoints: ["/mnt/other"], type: "lvm", uuid: "shared" } ] } ] } ] })
+    check("a dm node repeated under two partitions queues once, distinct device paths both stay",
+          JSON.stringify(powerQueue(mapped, "/dev/sdc")), JSON.stringify([
+              { device: "/dev/mapper/vg-data", path: "/mnt/data" },
+              { device: "/dev/mapper/vg-other", path: "/mnt/other" } ]))
+    // The eject chain watches the disk's write counter, so a flushing leg restarts its deadline.
+    check("a disk path answers its sysfs block name", Devices.sysBase("/dev/sda"), "sda")
+    check("an nvme disk answers whole", Devices.sysBase("/dev/nvme0n1"), "nvme0n1")
+    check("a non-device answers nothing", Devices.sysBase(""), "")
+    check("a stat read answers its written sectors", Devices.writtenSectors("   1 0 2 3 0 0 42 0 0 0 0 0 0 0 0"), "42")
+    check("a short read answers nothing", Devices.writtenSectors("1 2 3"), "")
+
+    // A real multi-boot system disk (Windows, this install under LUKS, a second Arch) with its live GPT parttype GUIDs: its siblings follow Show unmounted drives.
+    var multiboot = '{"blockdevices":[{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[],"rm":false,"tran":"nvme","size":512110190592,"type":"disk","model":"Micron_2450",'
+                  + '"children":['
+                  + '{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":"ESP","mountpoints":[],"rm":false,"size":272629760,"type":"part","model":null,"fstype":"vfat","parttypename":"EFI System","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"},'
+                  + '{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","label":null,"mountpoints":[],"rm":false,"size":16777216,"type":"part","model":null,"fstype":null,"parttypename":"Microsoft reserved","parttype":"e3c9e316-0b5c-4db8-817d-f92df00215ae"},'
+                  + '{"name":"nvme0n1p3","path":"/dev/nvme0n1p3","label":"Acer","mountpoints":[],"rm":false,"size":221029335040,"type":"part","model":null,"fstype":"ntfs","parttypename":"Microsoft basic data","parttype":"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"},'
+                  + '{"name":"nvme0n1p4","path":"/dev/nvme0n1p4","label":null,"mountpoints":[],"rm":false,"size":53491007488,"type":"part","model":null,"fstype":"ntfs","parttypename":"Microsoft basic data","parttype":"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"},'
+                  + '{"name":"nvme0n1p5","path":"/dev/nvme0n1p5","label":"OMARCHY_EFI","mountpoints":["/boot"],"rm":false,"size":2147484160,"type":"part","model":null,"fstype":"vfat","parttypename":"EFI System","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"},'
+                  + '{"name":"nvme0n1p6","path":"/dev/nvme0n1p6","label":null,"mountpoints":[],"rm":false,"size":158911693312,"type":"part","model":null,"fstype":"crypto_LUKS","parttypename":"Linux filesystem","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4",'
+                  + '"children":[{"name":"omarchy_root","path":"/dev/mapper/omarchy_root","label":"OMARCHY","mountpoints":["/var/cache/pacman/pkg","/var/log","/home","/"],"rm":false,"size":158894916096,"type":"crypt","model":null,"fstype":"btrfs"}]},'
+                  + '{"name":"nvme0n1p7","path":"/dev/nvme0n1p7","label":"Recovery","mountpoints":[],"rm":false,"size":1073741824,"type":"part","model":null,"fstype":"ntfs","parttypename":"EFI System","parttype":"c12a7328-f81f-11d2-ba4b-00a0c93ec93b"},'
+                  + '{"name":"nvme0n1p8","path":"/dev/nvme0n1p8","label":"RYOKUBOOT","mountpoints":[],"rm":false,"size":2147483648,"type":"part","model":null,"fstype":"vfat","parttypename":"Linux extended boot","parttype":"bc13c2ff-59e6-4262-a352-b275fd6f7172"},'
+                  + '{"name":"nvme0n1p9","path":"/dev/nvme0n1p9","label":"ryoku","mountpoints":[],"rm":false,"size":73015492608,"type":"part","model":null,"fstype":"btrfs","parttypename":"Linux filesystem","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4"}'
+                  + ']}]}'
+    var withSiblings = Devices.parseDevices(multiboot, true)
+    check("with the switch on, the system disk lists its real volumes beside the disk row",
+          withSiblings.map(function (e) { return e.label }).join(","), "nvme0n1,Acer,Micron_2450,ryoku")
+    check("an unlabeled sibling falls back to the drive's product name",
+          withSiblings.length > 2 ? withSiblings[2].label : "", "Micron_2450")
+    check("with the switch off, a multi-boot disk is still the one disk row",
+          Devices.parseDevices(multiboot, false).map(function (e) { return e.label }).join(","), "nvme0n1")
+    check("both ESPs stay out with the switch on",
+          withSiblings.some(function (e) { return e.label === "ESP" || e.label === "OMARCHY_EFI" }), false)
+    check("and they stay out with the switch off",
+          Devices.parseDevices(multiboot, false).some(function (e) { return e.label === "ESP" || e.label === "OMARCHY_EFI" }), false)
+    check("the reserved partition stays out on either switch value",
+          withSiblings.some(function (e) { return e.device === "/dev/nvme0n1p2" })
+          || Devices.parseDevices(multiboot, false).some(function (e) { return e.device === "/dev/nvme0n1p2" }), false)
+    check("the Recovery partition stays out on either switch value",
+          withSiblings.some(function (e) { return e.label === "Recovery" })
+          || Devices.parseDevices(multiboot, false).some(function (e) { return e.label === "Recovery" }), false)
+    check("RYOKUBOOT stays out on either switch value",
+          withSiblings.some(function (e) { return e.label === "RYOKUBOOT" })
+          || Devices.parseDevices(multiboot, false).some(function (e) { return e.label === "RYOKUBOOT" }), false)
+    check("the root leaf itself is not a second row, the disk row above already opens it",
+          withSiblings.some(function (e) { return e.path === "/" && e.kind === "volume" }), false)
+    check("and it stays out with the switch off too",
+          Devices.parseDevices(multiboot, false).some(function (e) { return e.path === "/" && e.kind === "volume" }), false)
+    check("a sibling volume is not offered an eject", withSiblings.length > 1 ? withSiblings[1].removable : true, false)
+    // A sibling the operator mounted stays a row on either setting; one mounted only where the system lives never is.
+    var winDisk = '{"blockdevices":[{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[],"rm":false,"size":256060514304,"type":"disk","model":"KBG40ZNS256G",'
+                + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"size":128060514304,"type":"part","model":null,"fstype":"btrfs","parttypename":"Linux filesystem","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4"},'
+                + '{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","label":"Win","mountpoints":["/mnt/win"],"rm":false,"size":128000000000,"type":"part","model":null,"fstype":"ntfs","parttypename":"Microsoft basic data","parttype":"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"}]}]}'
+    check("a sibling mounted at /mnt/win is a row with the switch off",
+          Devices.parseDevices(winDisk, false).map(function (e) { return e.label }).join(","), "nvme0n1,Win")
+    var homeDisk = '{"blockdevices":[{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[],"rm":false,"size":256060514304,"type":"disk","model":"KBG40ZNS256G",'
+                + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"size":128060514304,"type":"part","model":null,"fstype":"btrfs","parttypename":"Linux filesystem","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4"},'
+                + '{"name":"nvme0n1p2","path":"/dev/nvme0n1p2","label":"homevol","mountpoints":["/home"],"rm":false,"size":128000000000,"type":"part","model":null,"fstype":"ext4","parttypename":"Linux filesystem","parttype":"0fc63daf-8483-4772-8e79-3d69d8477de4"}]}]}'
+    check("a sibling mounted only at /home is no row with the switch off",
+          Devices.parseDevices(homeDisk, false).length, 1)
+    check("and it stays out with the switch on",
+          Devices.parseDevices(homeDisk, true).length, 1)
+    var winRows = Devices.parseDevices(winDisk, false)
+    var winRow = null
+    for (var w = 0; w < winRows.length; w++) if (winRows[w].label === "Win") winRow = winRows[w]
+    check("a mounted sibling offers Open and Unmount",
+          Mounts.railMenu(Object.assign({ group: "device" }, winRow)).filter(function (r) { return r.separator !== true }).map(function (r) { return r.label }).join(","), "Open,Unmount")
+    check("an unmounted sibling offers Mount",
+          Mounts.railMenu(Object.assign({ group: "device" }, withSiblings[1])).filter(function (r) { return r.separator !== true }).map(function (r) { return r.label }).join(","), "Mount")
 }

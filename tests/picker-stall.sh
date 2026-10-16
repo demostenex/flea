@@ -28,7 +28,8 @@ PYEND
 trap cleanup EXIT
 mkdir -p "$fixture/flea/js"
 cp ui/PickerListing.qml ui/PickerLifecycle.qml ui/Backend.qml "$fixture/flea/"
-cp ui/js/Messages.js "$fixture/flea/js/"
+# The js files import each other (FolderSorts.js imports Sort.js), so the fixture takes the whole folder.
+cp ui/js/*.js "$fixture/flea/js/"
 # A test-only method fixes the rare cancel-before-FailedToStart event order, never the handler under test.
 python3 - "$fixture/flea/Backend.qml" <<'PYEND'
 from pathlib import Path
@@ -61,7 +62,7 @@ for scenario in navigate cancel early missing early-missing missing-order; do
     : > "$fixture/requests"
     helper="$fixture/helper"
     [[ $scenario != *missing* ]] || helper="$fixture/missing"
-    if ! QT_QPA_PLATFORM=offscreen FLEA_BIN="$helper" FLEA_PICKER_CASE="$scenario" FLEA_PICKER_FIXTURE="$fixture" \
+    if ! QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic FLEA_BIN="$helper" FLEA_PICKER_CASE="$scenario" FLEA_PICKER_FIXTURE="$fixture" \
         timeout 6 qs -p "$fixture/shell.qml" > "$fixture/output" 2>&1; then
         cat "$fixture/output"; exit 1
     fi

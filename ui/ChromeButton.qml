@@ -1,8 +1,9 @@
 import QtQuick
 import qs.Commons
 import "." as Flea
+import "js/Buttons.js" as Buttons
 
-// A live chrome control inks in foreground; active and focused ones use the accent.
+// A live chrome control inks in foreground; an active one uses the accent and the keyboard draws its own foreground frame.
 Item {
     id: root
 
@@ -15,11 +16,10 @@ Item {
     // DragThreshold lets a drag that starts on a chrome bar button move the window; an overlay's instance passes ReleaseWithinBounds.
     property int gesturePolicy: TapHandler.DragThreshold
     property real glyphSize: Theme.chromeMarkSize
+    // Rows at the bottom of the hit box that a strip's own rule takes; the frame and the glyph centre in the rows above them.
+    property int ruleRows: 0
 
     signal activated()
-
-    // A control with nowhere to go keeps its slot so the bar never reflows, and says so by dimming.
-    property real disabledOpacity: Theme.disabledOpacity
 
     property string accessName: {
         if (root.glyph === "arrow-left")
@@ -37,10 +37,17 @@ Item {
         return root.glyph
     }
 
+    // The pointer's own state, read by Quick Look's IPC and by the native capture harness to prove a driven hover or press landed.
+    readonly property bool hovered: hover.hovered
+    readonly property bool pressed: tap.pressed
+    // The keyboard frame and the glyph, read by tests/chromering.sh.
+    readonly property Item ringItem: ring
+    readonly property Item markItem: mark
+
     // The mark stays the chrome token; the hit box is at least 24 px wide and the strip's height.
     implicitWidth: Math.max(Theme.hitMin, Theme.chromeMarkSize)
     implicitHeight: Theme.chromeHeight
-    scale: tap.pressed && root.enabled && !Theme.reducedMotion ? 0.96 : 1
+    scale: tap.pressed && root.enabled && !Theme.reducedMotion ? Buttons.PRESS_SCALE : 1
 
     Accessible.role: Accessible.Button
     Accessible.name: root.accessName
@@ -48,22 +55,47 @@ Item {
 
     Behavior on scale {
         enabled: !Theme.reducedMotion
-        NumberAnimation { duration: 150; easing.type: Easing.OutQuad }
+        NumberAnimation { duration: Buttons.PRESS_MS; easing.type: Easing.OutCubic }
+    }
+
+    // ButtonSystem040 A: the keyboard frames the mark in the foreground, centred in the rows above a strip's rule and trimmed to the control inset clear and the glyph's parity.
+    Item {
+        id: ringBand
+        width: root.width
+        height: root.height - root.ruleRows
+        Rectangle {
+            id: ring
+            readonly property int room: Math.min(Math.max(Theme.hitMin, root.glyphSize), ringBand.height - 2 * Theme.chromeControlInset)
+            anchors.centerIn: parent
+            width: ring.room - (ring.room - root.glyphSize) % 2
+            height: width
+            color: "transparent"
+            border.width: Theme.spacing.hairline
+            border.color: Theme.color.foreground
+            visible: root.keyboardFocused && root.enabled
+        }
     }
 
     Flea.Glyph {
-        anchors.centerIn: parent
+        id: mark
+        anchors.centerIn: ringBand
         width: root.glyphSize
         height: root.glyphSize
         name: root.glyph
-        // Containers Tier A: a chrome glyph wears no box, so the keyboard says where it is by brightness and the caller dims the rest of the strip.
-        color: !root.enabled ? Theme.color.muted
+        color: !root.enabled ? Theme.color.mutedFrame
              : root.active ? Theme.color.accent
              : root.keyboardFocused ? Theme.color.foreground : root.restingColor
-        opacity: root.enabled ? 1 : root.disabledOpacity
+        // A control with nowhere to go keeps its slot so the bar never reflows, and says so by dimming.
+        opacity: root.enabled ? 1 : Theme.disabledOpacity
     }
 
+    // A focused mark answers Return, keypad Enter and Space as a press does; its host owns Tab.
+    Keys.onReturnPressed: function(event) { if (root.enabled) root.activated(); else event.accepted = false }
+    Keys.onEnterPressed: function(event) { if (root.enabled) root.activated(); else event.accepted = false }
+    Keys.onSpacePressed: function(event) { if (root.enabled) root.activated(); else event.accepted = false }
+
     HoverHandler {
+        id: hover
         enabled: root.inputLive
         cursorShape: Qt.PointingHandCursor
     }

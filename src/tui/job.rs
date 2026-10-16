@@ -3,7 +3,7 @@ use crate::oflags::O_NOFOLLOW;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
@@ -53,13 +53,14 @@ fn run(path: &Path, arguments: &mut [String], cancel: &AtomicBool) -> io::Result
     let mut wrapped = sandbox::wrap_readonly(arguments, Path::new("/proc/self/fd/0"));
     let destination = wrapped.len() - arguments.len() - 1;
     wrapped[destination] = "/input".into();
-    let mut child = Command::new(&wrapped[0])
-        .args(&wrapped[1..])
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let output = child
+    sandbox::add_status(&mut wrapped, arguments.len());
+    let mut jailed = crate::backend::jail::spawn_jailed(&wrapped, |cmd| {
+        cmd.stdin(Stdio::from(input));
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+    })?;
+    let output = jailed
+        .child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("Preview output unavailable"))?;
@@ -79,11 +80,11 @@ fn run(path: &Path, arguments: &mut [String], cancel: &AtomicBool) -> io::Result
             || overflow.load(Ordering::Relaxed)
             || started.elapsed() > DEADLINE
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Ends the sandbox init too, and never waits for the output drain.
+            crate::backend::jail::kill_tree(&mut jailed);
             return Err(io::Error::other("Preview cancelled or exceeded its limit"));
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = jailed.child.try_wait()? {
             break status;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -91,8 +92,12 @@ fn run(path: &Path, arguments: &mut [String], cancel: &AtomicBool) -> io::Result
     let bytes = reader
         .join()
         .map_err(|_| io::Error::other("Preview reader stopped"))??;
+    decoded(status, bytes)
+}
+// The decoder's output when it exited cleanly inside the limit, and a plain refusal otherwise.
+fn decoded(status: std::process::ExitStatus, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
     if !status.success() || bytes.len() as u64 > OUTPUT_LIMIT {
-        return Err(io::Error::other("Preview decoder failed"));
+        return Err(io::Error::other("Preview could not be shown"));
     }
     Ok(bytes)
 }
@@ -117,11 +122,21 @@ mod tests {
     }
 
     #[test]
+    fn a_decoder_that_exits_nonzero_or_overflows_reports_the_preview_as_not_shown() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(decoded(std::process::ExitStatus::from_raw(0), b"ok".to_vec()).unwrap(), b"ok");
+        let failed = decoded(std::process::ExitStatus::from_raw(3 << 8), Vec::new()).unwrap_err();
+        assert_eq!(crate::error::io_message(&failed), "Preview could not be shown");
+        let overflow = vec![0; OUTPUT_LIMIT as usize + 1];
+        assert!(decoded(std::process::ExitStatus::from_raw(0), overflow).is_err());
+    }
+
+    #[test]
     fn missing_preview_source_reports_plain_worker_error() {
         if crate::backend::sandboxprobe::skipped() { return; }
         let root = TestDir::new("tui-preview-error");
         let job = Job::start(root.join("missing.pdf"), vec!["/usr/bin/pdfinfo".into(), "{input}".into()]);
         let result = job.result.recv_timeout(Duration::from_secs(5)).expect("preview worker did not finish");
-        assert_eq!(result.unwrap_err(), "file or folder not found");
+        assert_eq!(result.unwrap_err(), "item not found");
     }
 }

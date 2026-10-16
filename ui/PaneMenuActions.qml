@@ -3,8 +3,12 @@ import Quickshell
 import Quickshell.Io
 import "." as Flea
 import "js/LocalSend.js" as LocalSendJs
+import "js/CopyAs.js" as CopyAs
+import "js/Archive.js" as Archive
 import "js/Menu.js" as Menu
+import "js/Format.js" as Format
 import "js/Ops.js" as Ops
+import "js/Search.js" as Search
 
 Loader {
     id: root
@@ -29,34 +33,61 @@ Loader {
     }
 
     // A menu opened without a selection carries no paths, so a row action means the row under the
-    // cursor, which is what Copy path has always read and what the send rows read now.
+    // cursor, joined against the listing's base: on a search the scope or the folder, never the pane's path.
     function targets(paths) {
         if (paths && paths.length) return paths
-        return root.pane.cursorRow ? [root.pane.join(root.pane.path, root.pane.cursorRow.n)] : []
+        return root.pane.cursorRow ? [root.pane.join(Search.baseOf(root.pane), root.pane.cursorRow.n)] : []
     }
 
     // Actions rule 1: every shelf action is a `flea shelf` call, so the menu row makes the same one
     // a drop onto the card makes and nothing here knows the pile's shape.
     function shelve(paths) {
         if (paths.length === 0) { root.pane.message("There is nothing to put on the shelf.", true); return }
-        shelver.count = paths.length
-        shelver.command = [Quickshell.env("FLEA_BIN") || "flea", "shelf", "add"].concat(paths)
-        shelver.running = true
+        if (shelver.running) {
+            // A second add while one runs waits its turn, so each exit reports its own count.
+            shelver.pendingAdds = shelver.pendingAdds.concat([paths])
+            return
+        }
+        shelver.startAdd(paths)
     }
 
     Process {
         id: shelver
         property int count: 0
+        property var pendingAdds: []
         stderr: StdioCollector { waitForEnd: true }
+        function startAdd(paths) {
+            shelver.count = paths.length
+            shelver.command = [Quickshell.env("FLEA_BIN") || "flea", "shelf", "add"].concat(paths)
+            shelver.running = true
+        }
         onExited: function (code, status) {
             if (code === 0) {
-                root.pane.message(shelver.count === 1 ? "Added it to the shelf."
-                                                      : "Added " + shelver.count + " items to the shelf.", false)
-                return
+                root.pane.message(shelver.count === 1 ? Ops.WORDS.shelfOne
+                                                      : Format.fill(Ops.WORDS.shelfMany, shelver.count), false)
+            } else {
+                var said = shelver.stderr.text.trim().split("\n").pop().replace(/^flea: /, "")
+                root.pane.message(said.length > 0 ? said : "The shelf did not take that.", true)
             }
-            var said = shelver.stderr.text.trim().split("\n").pop().replace(/^flea: /, "")
-            root.pane.message(said.length > 0 ? said : "The shelf did not take that.", true)
+            if (shelver.pendingAdds.length > 0) {
+                var next = shelver.pendingAdds[0]
+                shelver.pendingAdds = shelver.pendingAdds.slice(1)
+                shelver.startAdd(next)
+            }
         }
+    }
+
+    // Copy as covers the whole selection, one path per line, through wl-copy; the leaves read the snapshot, whose paths a window cannot hold.
+    property var copyKinds: ({ copyPath: "path", copyName: "name", copyStem: "stem",
+        copydirpath: "dirpath", copyUri: "uri", copyQuoted: "quoted" })
+    function copyVariant(action, paths) {
+        var leaf = action.indexOf("copyAs:") === 0 ? action.substring("copyAs:".length) : action
+        var kind = copyKinds[leaf]
+        if (kind === undefined) return false
+        var taken = root.targets(paths)
+        if (taken.length === 0) return true
+        root.pane.opener.copyText(CopyAs.lines(taken, kind))
+        return true
     }
 
     function perform(action, menuId, paths) {
@@ -65,7 +96,23 @@ Loader {
         if (action.indexOf("taildrop:") === 0) { root.pane.sendTaildrop(action.substring("taildrop:".length), root.targets(paths).length === 1 ? root.targets(paths)[0] : ""); return }
         if (action === "addToShelf") { root.shelve(root.targets(paths)); return }
         if (action === "sharelink") { root.pane.copyShareLink(paths && paths.length === 1 ? paths[0] : ""); return }
-        if (action === "copypath") { root.pane.opener.copyText(paths && paths.length ? paths[0] : root.pane.join(root.pane.path, root.pane.cursorRow.n)); return }
+        // The Places and Locked menus still send the Copy path alias.
+        if (action === "copypath") { root.pane.opener.copyText(paths && paths.length ? paths[0] : root.pane.join(Search.baseOf(root.pane), root.pane.cursorRow.n)); return }
+        if (copyVariant(action, paths)) return
+        // Show original reveals the link target in its own folder.
+        if (action === "showOriginal") {
+            var taken = root.targets(paths)
+            if (taken.length > 0) root.pane.requestLinkTarget(taken[0])
+            return
+        }
+        // Paste as links through the collision card; the source is the file clipboard, never the menu snapshot.
+        if (action.indexOf("pasteAs:") === 0) {
+            var leaf = action.substring("pasteAs:".length)
+            var kind = leaf === "pasteAbsoluteLink" ? "absolute" : leaf === "pasteHardLink" ? "hard" : "relative"
+            root.pane.pasteLink(kind, null)
+            return
+        }
+        if (action === "invertSelection") { root.pane.invertSelection(); return }
         if (action.indexOf("col:") === 0) { ViewState.toggleColumn(action.substring("col:".length)); return }
         root.pane.act(action, menuId, paths)
     }
@@ -86,11 +133,20 @@ Loader {
     property string identity: ""
     property string folder: ""
     property bool ready: false
+    property var selectedKinds: []
     property string pendingAction: ""
     property bool pendingActivation: false
+    // Tag toggles chosen while the first still awaits its snapshot, kept in press order; any other pending action drops them.
+    property var queuedTags: []
+    // A tag activate sent and not yet answered; the backend's menu slot holds one job, so the next queued tag waits for this reply.
+    property bool tagInFlight: false
     property bool activationUsed: false
+    // The request a keymap sheet activation runs under, which lists hidden rows; the next snapshot moves requestId past it.
+    property int sheetRequest: 0
     // Which row a keyboard rename was asked for, so its reply cannot open the editor over another.
     property int pendingRenameIndex: -1
+    // The pointer rename's own reveal context beside it, so a slow click never scrolls; false keeps the keyboard's.
+    property bool pendingRenameStill: false
     property int launchingId: 0
     // OpenWith.html's flyout: the registry for the cursor row, asked for as the menu opens so the
     // submenu is populated by the time the row is reached. The flyout writes nothing; the dialog
@@ -155,10 +211,13 @@ Loader {
         if (deleting || survivorId) return
         requestId++
         ready = false
+        selectedKinds = []
         pendingAction = ""
         pendingActivation = false
+        queuedTags = []
+        tagInFlight = false
         activationUsed = false
-        identity = pane.menuSelectionIdentity
+        identity = pane.menuSelectionIdentity()
         folder = pane.path
         // The registry belongs to the row that was snapshotted. Carrying the last row's answer over
         // offered one file's applications for another, and kept the self-hide rule from ever firing.
@@ -167,7 +226,19 @@ Loader {
         pane.backend.send({c: "menuaction", op: "snapshot", id: requestId,
             rows: rows !== undefined ? rows : Ops.targetIndices(pane), cursor: pane.cursorIndex})
     }
-    function open(action, menuId) {
+    // A ready snapshot over the same selection opens the editor at once, one still in flight takes the F2 route, and a moved selection refuses as activate does.
+    function openRenameFromMenu() {
+        if (pane.renamePending) { pane.message("Rename is still finishing.", false); return }
+        if (deleting || survivorId) { pane.message("The deletion is still finishing.", false); return }
+        var route = Ops.menuRenameRoute(ready, identity, pane.menuSelectionIdentity())
+        if (route === "stale") { pane.message("Selected items changed; reopen the menu.", true); return }
+        if (route === "now" && pane.contextMenu().validateChoice("rename", "")) {
+            show("rename")
+            return
+        }
+        open("rename")
+    }
+    function open(action, menuId, context) {
         if (opened) return
         if (action === "rename" && pane.renamePending) { pane.message("Rename is still finishing.", false); return }
         if (deleting || survivorId) { pane.message("The deletion is still finishing.", false); return }
@@ -179,14 +250,30 @@ Loader {
         }
         // The row the editor will open over, captured now: the cursor can move between this request
         // and its reply, and the editor used to open over wherever it had got to by then.
-        if (action === "rename" && !menuId) pendingRenameIndex = pane.cursorIndex
-        if (!requestId || identity !== pane.menuSelectionIdentity || (action === "rename" && !menuId))
+        if (action === "rename" && !menuId) {
+            pendingRenameIndex = pane.cursorIndex
+            pendingRenameStill = context === 0
+        }
+        if (!requestId || identity !== pane.menuSelectionIdentity() || (action === "rename" && !menuId))
             snapshot(action === "rename" && !menuId ? [pane.cursorIndex] : undefined)
         pendingAction = action
         pendingActivation = false
         if (ready) show(action)
     }
     function activate(action, selected) {
+        // Flash to drive re-reads what the menu showed: the snapshot already proved the selection names it.
+        if (action === "flashDrive") {
+            var flashIdx = Ops.targetIndices(pane)
+            var flashRow = flashIdx.length === 1 ? pane.rowFor(flashIdx[0]) : null
+            if (!requestId || identity !== pane.menuSelectionIdentity() || !flashRow
+                    || !Archive.isDiskImage(flashRow.n, pane.flashZipMember)) {
+                pane.message("Selected items changed; reopen the menu.", true)
+                return
+            }
+            activationUsed = true
+            pane.openFlashImage(pane.join(Search.baseOf(pane), flashRow.n))
+            return
+        }
         if (!selected) {
             if (action === "addFavourite") {
                 if (backgroundFolder !== pane.path) { pane.message("Folder changed; reopen the menu.", true); return }
@@ -196,11 +283,17 @@ Loader {
         }
         if (activationUsed) return
         if (deleting || survivorId) { pane.message("The deletion is still finishing.", false); return }
-        if (!requestId || identity !== pane.menuSelectionIdentity) {
+        if (!requestId || identity !== pane.menuSelectionIdentity()) {
             pane.message("Selected items changed; reopen the menu.", true)
             return
         }
-        activationUsed = true
+        // A tag toggle repeats inside one open menu; every other choice closes it, so one activation is all it gets.
+        if (action.indexOf("tags:") === 0 && (tagInFlight || (pendingActivation && pendingAction.indexOf("tags:") === 0))) {
+            queuedTags = queuedTags.concat([action])
+            return
+        }
+        queuedTags = []
+        activationUsed = action.indexOf("tags:") !== 0
         providerValidated = false
         pendingAction = action
         pendingActivation = true
@@ -213,7 +306,7 @@ Loader {
         pendingActivation = false
         var split = action.indexOf(":")
         if (providerAction(action) && !pane.contextMenu().validateChoice(split < 0 ? action : action.substring(0, split),
-                split < 0 ? "" : action.substring(split + 1))) return
+                split < 0 ? "" : action.substring(split + 1), sheetRequest === requestId)) return
         // OpenWith.html rule 2: the flyout is a one-off override that writes nothing, so a chosen
         // application launches through the same registry op the dialog submits, and the tail row is
         // the only way into the dialog, which stays the one place a default is written.
@@ -226,10 +319,25 @@ Loader {
         }
         pane.backend.send({c: "menuaction", op: "activate", id: requestId, action: action,
             dest: pane.dropboxService ? pane.dropboxService.dropboxPath : ""})
+        tagInFlight = action.indexOf("tags:") === 0
+    }
+    // The answer to a tag activate frees the menu slot, so the next queued tag goes out now.
+    function sendNextTag() {
+        tagInFlight = false
+        if (queuedTags.length === 0) return
+        pendingAction = queuedTags[0]
+        queuedTags = queuedTags.slice(1)
+        pendingActivation = true
+        validateActivation()
     }
     function show(action) {
         pendingAction = ""
-        if (action === "rename") { Ops.startRename(pane, requestId, pendingRenameIndex); pendingRenameIndex = -1; return }
+        if (action === "rename") {
+            Ops.startRename(pane, requestId, pendingRenameIndex, pendingRenameStill ? 0 : undefined)
+            pendingRenameIndex = -1
+            pendingRenameStill = false
+            return
+        }
         dialogFor = action
         active = true
         item.open(action, requestId, folder, pane.listArea)
@@ -240,7 +348,7 @@ Loader {
     function locateSurvivors() {
         if (!survivorId || pane.listInFlight) return
         if (pane.path !== survivorFolder) { survivorId = 0; survivors = []; return }
-        survivorListing = pane.menuSelectionIdentity
+        survivorListing = pane.menuSelectionIdentity()
         pane.backend.send({c: "locate", paths: survivors, id: survivorId, menuId: survivorId})
     }
     Connections {
@@ -288,7 +396,7 @@ Loader {
             root.survivorId = 0
             root.survivors = []
             if (message.directory !== root.pane.path || root.pane.path !== root.survivorFolder
-                    || root.survivorListing !== root.pane.menuSelectionIdentity) return
+                    || root.survivorListing !== root.pane.menuSelectionIdentity()) return
             if (!message.ok) { root.pane.message(message.error, true); return }
             var matches = message.matches || []
             root.pane.selection.clear()
@@ -315,43 +423,58 @@ Loader {
             }
             if (message.op === "providerDestination") {
                 root.providerDestinationPending = false
-                if (!message.ok && root.pane.dropboxService) root.pane.dropboxService.dropboxReason = message.error
+                if (!message.ok && root.pane.dropboxService) {
+                    root.pane.dropboxService.dropboxReason = message.error
+                    root.pane.dropboxService.dropboxCode = ""
+                }
                 root.providersFinished()
                 return
             }
             if (message.op === "snapshot") {
-                root.ready = message.ok === true && root.identity === root.pane.menuSelectionIdentity
+                root.selectedKinds = message.kinds || []
+                root.ready = message.ok === true && root.identity === root.pane.menuSelectionIdentity()
                 if (!root.ready) {
+                    // A late snapshot answers no dismissed menu with nothing awaiting it; an open one keeps its refusal.
+                    var retired = message.ok === true && !root.pane.contextMenu().opened && !root.opened
+                            && !root.pendingAction && !root.pendingActivation
                     root.pendingAction = ""
                     root.pendingActivation = false
+                    root.queuedTags = []
+                    root.tagInFlight = false
                     root.providersRefreshing = false
                     root.identity = ""
-                    root.pane.message(message.error || "Selected items changed; reopen the menu.", true)
+                    if (!retired)
+                        root.pane.message(message.error || "Selected items changed; reopen the menu.", true)
                 } else if (root.pendingAction) {
                     if (root.pendingActivation) root.validateActivation()
                     else root.show(root.pendingAction)
                 }
-                if (root.ready && root.pane.contextMenu().opened && root.pane.contextMenu().hasRow)
+                // Multi-selection has no registry: the backend refuses it, so discovery stays single-item.
+                if (root.ready && message.count === 1 && root.pane.contextMenu().opened && root.pane.contextMenu().hasRow)
                     // No installed flag: the flyout draws the registry alone, and asking for the
                     // whole catalogue here walked every applications directory on every right-click.
                     root.pane.backend.send({c: "menuaction", op: "applications", id: root.requestId})
+                root.pane.contextMenu().refreshProviderRows()
                 root.finishProviders()
                 return
             }
             if (message.op === "activate") {
-                if (!message.ok || root.identity !== root.pane.menuSelectionIdentity) {
+                if (!message.ok || root.identity !== root.pane.menuSelectionIdentity()) {
+                    root.queuedTags = []
+                    root.tagInFlight = false
                     root.pane.message(message.error || "Selected items changed; reopen the menu.", true)
                     return
                 }
                 var split = message.action.indexOf(":")
                 var action = split < 0 ? message.action : message.action.substring(0, split)
                 var subId = split < 0 ? "" : message.action.substring(split + 1)
-                if (root.pane.contextMenu().validateChoice(action, subId)) {
+                if (root.pane.contextMenu().validateChoice(action, subId, root.sheetRequest === message.id)) {
                     if (action === "addFavourite") {
                         if (!message.paths || message.paths.length !== 1) { root.pane.message("The selected folder could not be read.", true); return }
                         root.addFavourite(message.paths[0])
                     } else root.pane.performMenu(message.action, message.id, message.paths)
                 }
+                if (action === "tags") root.sendNextTag()
                 return
             }
             if (root.item) root.item.receive(message)
@@ -364,6 +487,8 @@ Loader {
             root.identity = ""
             root.pendingAction = ""
             root.pendingActivation = false
+            root.queuedTags = []
+            root.tagInFlight = false
             root.providersRefreshing = false
             if (root.opened || root.deleting) root.item.receive({id: root.requestId, op: root.deleting ? "delete" : "", ok: false, error: message})
         }
@@ -378,10 +503,10 @@ Loader {
             root.pane.backend.send(message)
         }
         function onApproved(message) {
-            root.pane.collide.ask({c: "transfer", op: message.action === "moveTo" ? "move" : "copy",
+            root.pane.asks().ask({c: "transfer", op: message.action === "moveTo" ? "move" : "copy",
                 menuId: message.id, dest: message.dest})
         }
-        function onCreated(path) { root.pane.refresh(path); root.pane.message("File created.", false) }
+        function onCreated(path) { root.pane.refresh(path); root.pane.message(Ops.createdLine(path), false) }
         function onDeleted(message) {
             var text = Ops.deletedLine(message)
             root.pane.operationResult(text, message.error || "", message.failed > 0)
@@ -395,7 +520,7 @@ Loader {
             root.ready = false
             root.identity = ""
             // The close op kills the launcher this id was waiting on, so its error is the cancellation
-            // the operator asked for and not something to raise at them.
+            // the user asked for and not something to raise at them.
             root.launchingId = 0
         }
     }

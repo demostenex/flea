@@ -2,10 +2,10 @@
 use crate::backend::dirsizeworker::Done;
 use crate::backend::proto::dirsized_line;
 use crate::backend::state::State;
-use std::io::{self, BufWriter, Write};
+use std::io::Write;
 
 // Answered rows are re-answered at once, matching thumb's own cache-hit shape; only a directory can be asked for.
-pub fn queue_dirsizes(out: &mut BufWriter<io::Stdout>, st: &mut State, rows: &[usize]) {
+pub fn queue_dirsizes(out: &mut impl Write, st: &mut State, rows: &[usize]) {
     for &row in rows {
         if row >= st.listing.len() || !st.listing.is_dir(row) {
             continue;
@@ -50,6 +50,7 @@ pub fn report_done(out: &mut impl Write, st: &mut State, done: Done) {
     if !st.dirsize_worker.accept(&done) { return; }
     let result = done.result;
     st.dirsizes.insert(done.row, (result.bytes, result.partial));
+    crate::backend::answersizes::learn(st, done.row, result);
     writeln!(out, "{}", dirsized_line(done.row, result.bytes, result.partial, done.ms)).ok();
     out.flush().ok();
 }
@@ -73,12 +74,17 @@ mod tests {
             base,
             asked: Vec::new(),
             outstanding: 0,
+            deferred: Default::default(),
+            window_meta: HashMap::new(),
             dirsizes: HashMap::new(),
             dirsize_queue: Vec::new(),
             dirsize_worker: crate::backend::dirsizeworker::Worker::new(events),
             search: None,
+            search_session: None,
             search_reported: Instant::now(),
             generation: 0,
+            held: crate::backend::state::Held::List,
+            clip_watching: false,
         }
     }
 

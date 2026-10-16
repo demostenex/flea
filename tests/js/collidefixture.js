@@ -1,17 +1,19 @@
 // The real ui/CollideHost.qml, ui/FileDrag.qml and ui/RowDrag.qml over a stub pane and backend, for tests/js/collide.js.
+.import "sourcefixture.js" as Source
+.import "../../ui/js/DragOut.js" as DragOut
 
-// A file of this tree, read the way tests/js/settingsabout.js reads its sources.
-function source(path) {
-    var request = new XMLHttpRequest()
-    request.open("GET", Qt.resolvedUrl("../../" + path), false)
-    request.send()
-    return String(request.responseText || "")
+// The shipped key record in ui/js/DragOut.js, the one every built file reads, cleared and renumbered for a fresh drag.
+// Sample input: realDropKeys() answers the record at marker "" with ctrl and shift -1 and no lift stamped yet.
+function realDropKeys() {
+    DragOut.keys.clear()
+    DragOut.keys.lifts = 0
+    return DragOut.keys
 }
 
-// ui/<file> built from its own text beside ui/js, because ui/qmldir's singletons need Quickshell, which qml6 lacks.
+// ui/<file> built beside ui/js (qml6 lacks Quickshell's singletons), reading the shared key record as shipped.
 // Sample input: 'import QtQuick\nimport "js/Drag.js" as DragOps\n\n// Delegate input ...\nItem {\n    id: root\n'
 function built(file, parent, properties) {
-    var text = source("ui/" + file)
+    var text = Source.source("ui/" + file)
     var body = text.search(/^[A-Z]\w* \{/m)
     var imports = text.substring(0, body).replace(/import "js\//g, "import \"")
     var wrapper = Qt.createQmlObject(imports + "QtObject { property Component made: Component { " + text.substring(body) + " } }",
@@ -23,7 +25,7 @@ function built(file, parent, properties) {
 // The failed signal carries production's four arguments (ui/Backend.qml), because CollideHost reads
 // the second: the error line's path, "collisions" for a refused question.
 var BACKEND = "import QtQuick\nimport \"../../ui/js/Swap.js\" as Swap\nQtObject {\n"
-    + "    signal collisions(int id, int total, var names)\n    signal failed(string where, string input, string message, int mode)\n"
+    + "    signal collisions(int id, int total, var names, bool mergeable)\n    signal mergeCollisions(int id, int total, var names)\n    signal failed(string where, string input, string message, int mode)\n"
     + "    property real heldListing: 0\n    property var sent: []\n"
     + "    function send(object) { sent.push(Swap.named(object, heldListing)) }\n}\n"
 
@@ -33,7 +35,7 @@ function verbs(backend) {
 }
 
 // A pane at rest over a folder row in listing held, its card the real one, its drag session and the folder row's drop target.
-function scene(held) {
+function scene(held, said) {
     var parent = Qt.createComponent("QtQuick", "Item").createObject(null)
     var backend = Qt.createQmlObject(BACKEND, parent, Qt.resolvedUrl("backend.qml"))
     backend.heldListing = held
@@ -45,9 +47,11 @@ function scene(held) {
     p.selectedIndices = function () { return [] }
     p.selectionCount = function () { return 0 }
     p.join = function (base, name) { return base + "/" + name }
-    p.message = function () {}
+    p.message = said ? function (text) { said.push(text) } : function () {}
     p.collide = built("CollideHost.qml", parent, { pane: p })
+    p.asks = function () { return p.collide }
+    var keys = realDropKeys()
     var session = built("FileDrag.qml", parent, { pane: p })
     var target = built("RowDrag.qml", parent, { session: session, listingIndex: 2, row: folder[2] })
-    return { parent: parent, backend: backend, pane: p, session: session, target: target }
+    return { parent: parent, backend: backend, pane: p, session: session, target: target, keys: keys }
 }

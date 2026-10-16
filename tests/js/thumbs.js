@@ -114,7 +114,7 @@ function run(check) {
     v = Thumbs.viewport(21, 37, 36, 30)
     check("and that straddled row is still clamped to the last row of the listing", v.last, 29)
 
-    // GM, 2026-09-24: a small original draws at its own size, centred, and is never enlarged to the frame.
+    // Decided 2026-09-24: a small original draws at its own size, centred, and is never enlarged to the frame.
     function drawn(scale, w, h) { return Math.round(w * scale) + "x" + Math.round(h * scale) }
     check("a 120x68 original in the 754x471 frame draws at its own size", drawn(Thumbs.fitScale(754, 471, 120, 68, 1), 120, 68), "120x68")
     check("an original decoded to fit is drawn as decoded", drawn(Thumbs.fitScale(754, 471, 707, 471, 1), 707, 471), "707x471")
@@ -128,4 +128,56 @@ function run(check) {
     check("a cache file smaller than the cache size is the original's own size, never enlarged",
           drawn(Thumbs.fitScale(754, 471, 64, 48, Thumbs.thumbLimit(64, 48, 0, 0)), 64, 48), "64x48")
     check("a frame smaller than the picture still shrinks it", drawn(Thumbs.fitScale(200, 125, 256, 171, Thumbs.thumbLimit(256, 171, 6000, 4000)), 256, 171), "187x125")
+    // A video poster fills the frame the way its player does; an image keeps the never-enlarge cap.
+    check("a video poster is uncapped", Thumbs.posterLimit(true, 256, 256, 64, 64), Infinity)
+    check("an image poster keeps its cap", Thumbs.posterLimit(false, 256, 256, 64, 64), 64 / 256)
+    check("a 64x64 clip poster in the 754x471 frame fills it",
+          drawn(Thumbs.fitScale(754, 471, 256, 256, Thumbs.posterLimit(true, 256, 256, 64, 64)), 256, 256), "471x471")
+    // e81f: a prefetch miss on a generating class leaves the row unasked, else a miss.
+    function missed(generating) {
+        var s = Thumbs.empty()
+        s = Thumbs.applied(s, { ask: [3], drop: [], cacheOnly: true })
+        return Thumbs.miss(s, 3, generating, 240)
+    }
+    var genMiss = missed(true)
+    check("a prefetch miss on a generating class leaves the row undefined", genMiss.file[3], undefined)
+    check("and drops it from the order", genMiss.order.join(","), "")
+    var offMiss = missed(false)
+    check("on a cache-only class it stays a miss", offMiss.file[3], Thumbs.CACHE_MISS)
+    function planned(file) {
+        var s = { file: file, order: [] }
+        for (var k in file) s.order.push(Number(k))
+        var rows = []
+        for (var i = 0; i < 5; i++)
+            rows.push({ n: "f" + i, d: false, t: true, i: "image-x-generic", p: 33188, s: 10, m: 1 })
+        return Thumbs.plan(s, rows, 0, 0, 4, "media").ask.join(",")
+    }
+    var answered = { 0: "/c/0.png", 1: "/c/1.png", 2: "/c/2.png", 4: "/c/4.png" }
+    answered[3] = genMiss.file[3]
+    check("the planner asks a row a prefetch miss left unasked", planned(answered), "3")
+    answered[3] = Thumbs.CACHE_MISS
+    check("and never re-asks a row that stays missed", planned(answered), "")
+
+    // A live answer: finished thumbnails follow their row, by name, to the new index; asked, missed and dropped rows do not.
+    var live = Thumbs.empty()
+    live = Thumbs.applied(live, { ask: [10, 11, 12, 13], drop: [] })
+    live = Thumbs.remember(live, 10, "/cache/a.png", 240)
+    live = Thumbs.remember(live, 12, "/cache/c.png", 240)
+    live = Thumbs.remember(live, 13, "", 240)
+    var oldRows = [{ n: "a", t: true }, { n: "b", t: true }, { n: "c", t: true }, { n: "d", t: true }]
+    var moved = Thumbs.carried(live, oldRows, 10,
+        [{ n: "x", t: true }, { n: "c", t: true }, { n: "a", t: false }, { n: "b", t: true }, { n: "d", t: true }], 20)
+    check("a finished thumbnail follows its name to its new index", Thumbs.fileFor(moved, 21), "/cache/c.png")
+    check("a row no longer thumbnailable carries nothing", Thumbs.fileFor(moved, 22), "")
+    check("an asked row is not carried and is asked again", Thumbs.plan(moved, [{ n: "b", t: true }], 23, 23, 23).ask.join(","), "23")
+    check("an answer of nothing is not carried either", Thumbs.refused(moved, 24), false)
+    check("a row new to the answer is asked for", Thumbs.plan(moved, [{ n: "x", t: true }], 20, 20, 20).ask.join(","), "20")
+    check("a carried row is answered, so never asked for", Thumbs.plan(moved, [{ n: "c", t: true }], 21, 21, 21).ask.length, 0)
+    check("the carried order holds only the carried rows", moved.order.join(","), "21")
+    var marks = Thumbs.applied(Thumbs.empty(), { ask: [10], drop: [], cacheOnly: true })
+    marks = Thumbs.remember(marks, 11, Thumbs.CACHE_MISS, 240)
+    check("a cache-only ask and a cache miss are not carried",
+        Thumbs.carried(marks, oldRows, 10, oldRows, 10).order.length, 0)
+    check("a name like a prototype key carries nothing it was not given",
+        Thumbs.carried(live, [{ n: "a", t: true }], 10, [{ n: "constructor", t: true }], 0).order.length, 0)
 }

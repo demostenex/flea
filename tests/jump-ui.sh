@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # The path bar's folder jump through the real ChromeBar and PathJump, offscreen: what one open asks for
 # (a provisional ask at once, then the whole ask once the history read lands), a held Enter, a stale
 # answer, a Tab-completed path, a name with no match, a backend that never answers.
@@ -42,7 +43,7 @@ done
 
 # The real ui/ as the module under test, and the Omarchy modules its qs.* imports resolve to at the config root.
 cp -a ui "$fixture/flea"
-ln -s "$(readlink -f ui/Commons)" "$fixture/Commons"
+headless_commons "$fixture" "$fixture/Commons" || exit 1
 ln -s "$(readlink -f ui/Ui)" "$fixture/Ui"
 cp tests/jump-ui.qml "$fixture/shell.qml"
 
@@ -50,7 +51,7 @@ log="$fixture/qs.log"
 env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u YDOTOOL_SOCKET \
     HOME="$home" XDG_STATE_HOME="$home/.local/state" XDG_DATA_HOME="$home/.local/share" \
     XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$fixture/cache" FLEA_BIN="$bin" \
-    QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_FORCE_STDERR_LOGGING=1 \
+    QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_FORCE_STDERR_LOGGING=1 \
     setsid qs -p "$fixture/shell.qml" >"$log" 2>&1 </dev/null &
 qs_pid=$!
 

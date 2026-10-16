@@ -294,7 +294,7 @@ case_oversight() {
         fi
         entries=$(ipc contextMenuEntries) || fail "oversight: default menu entries unavailable"
         hints=$(ipc contextMenuHints) || fail "oversight: default menu hints unavailable"
-        grep -E '(^|\|)(Copy path|Open [Ww]ith|Open in terminal|Move to(\.\.\.)?|Copy to(\.\.\.)?|Properties|Permissions|Delete permanently)(\||$)' <<< "$entries" >/dev/null \
+        grep -E '(^|\|)(Copy as|Open [Ww]ith|Open in terminal|Move to(\.\.\.)?|Copy to(\.\.\.)?|Properties|Permissions|Delete permanently)(\||$)' <<< "$entries" >/dev/null \
             && fail "oversight: default menu exposes a hidden action: $entries"
         [[ "$oversight_arm" != candidate || -n "${hints%%|*}" ]] || fail "oversight: default Open menu row has no key hint"
         oversight_capture defaults-menu "$row"
@@ -380,7 +380,7 @@ empty_hero_capture() {
             continue
         fi
         jq -e '.captionColor == .foreground and .markColor == .muted' <<< "$before" >/dev/null \
-            || fail "empty hero: caption or GM's retained v0.1.6 spiral ink differs: $before"
+            || fail "empty hero: caption or the retained v0.1.6 spiral ink differs: $before"
         attempt=$((attempt + 1))
         shot "$label-phase-$attempt"
         after=$(ipc emptyHeroState) || fail "empty hero: post-capture paint state unavailable"

@@ -1,22 +1,11 @@
 .pragma library
 
 .import "Mounts.js" as Mounts
+.import "UserDirs.js" as UserDirs
 
 // Sample input: XDG_DOWNLOAD_DIR="$HOME/Downloads"
 function userDirs(body, home) {
-    var out = []
-    var lines = String(body || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-        var kv = lines[i].match(/^\s*XDG_([A-Z]+)_DIR\s*=\s*"([^"]*)"/)
-        if (!kv)
-            continue
-        var path = kv[2].replace("$HOME", home).replace(/\/+$/, "")
-        // corner: this box points TEMPLATES, PUBLICSHARE and DESKTOP at $HOME, which is not a favourite.
-        if (path.length === 0 || path === home)
-            continue
-        out.push({ path: path, label: leaf(path) })
-    }
-    return out
+    return UserDirs.userDirs(body, home)
 }
 
 // Sample input: file:///home/gm/Downloads Downloads
@@ -144,7 +133,7 @@ function recordError(record) {
     for (var i = 0; i < schemes.length; i++) {
         if (record.path.indexOf(schemes[i]) === 0 && record.path.length > schemes[i].length) return ""
     }
-    return "path must be absolute, ~/ relative, or a supported URI"
+    return "use a full path, a path that starts with ~/, or a network address"
 }
 
 function storedEntries(records, home) {
@@ -169,6 +158,20 @@ function homeEntries(home, dirsText, glyphFor) {
     })
 }
 
+// The rail and query use the same validation, URI decoding and mount-first open.
+function openEntry(entry, ports) {
+    if (!entry) return
+    if (entry.kind === "trash") { ports.trash(); return }
+    var error = entry.kind === "favourite" ? recordError(entry.original) : ""
+    if (error) { ports.message("Could not open %1 · %2".replace(/%([12])/g, function (m, n) { return n === "1" ? entry.label : error }), true); return }
+    if (entry.path.indexOf("://") >= 0 && entry.path.indexOf("file://") !== 0) {
+        var host = ports.networkHost()
+        if (host) host.openChildShare(entry.path, entry.label, ports.pane)
+    } else {
+        ports.opened(entry.path.indexOf("file://") === 0 ? Mounts.decodePath(entry.path.substring(7)) : entry.path)
+    }
+}
+
 function railIdentity(entry) {
     if (!entry) return ""
     if (entry.kind === "favourite") return JSON.stringify([entry.kind, entry.original])
@@ -189,4 +192,45 @@ function railCursorAfter(before, after, index) {
         if (railIdentity(after[j]) === key) matches.push(j)
     }
     return matches.length === oldCount ? matches[occurrence] : -1
+}
+
+// Under gvfs only the mounted row opened under view.shareKey lights, never a folder prefix or the disk.
+function heldBy(entries, dir, view) {
+    var list = entries || []
+    var at = view || ({ kind: "dir" })
+    var path = String(dir || "")
+    var gvfs = Mounts.underGvfs(path)
+    var best = -1, depth = -1
+    for (var i = 0; i < list.length; i++) {
+        var e = list[i]
+        if (at.kind !== "dir") {
+            if (e.kind === at.kind && (at.kind !== "tag" || e.tag === at.tag))
+                return i
+            continue
+        }
+        if (e.kind === "recent" || e.kind === "trash" || e.kind === "tag" || e.error || e.mounted === false)
+            continue
+        if (gvfs) {
+            var key = String(at.shareKey || "")
+            if (key.length > 0 && !e.path && (Mounts.normalize(e.uri) === key || Mounts.normalize(e.mountUri) === key))
+                return i
+            continue
+        }
+        if (typeof e.path !== "string" || e.path.length === 0)
+            continue
+        if ((e.path === "/" ? path.charAt(0) === "/" : Mounts.inside(path, e.path)) && e.path.length > depth) {
+            best = i
+            depth = e.path.length
+        }
+    }
+    return best
+}
+
+// pathAlias is the pane's remembered gvfs share (or null); its key is the share's normalized address.
+function litView(trashOpened, recentMode, searchMode, answeredQuery, pathAlias) {
+    if (trashOpened) return { kind: "trash" }
+    if (String(recentMode || "").length > 0) return { kind: "recent" }
+    var query = String(answeredQuery || "")
+    if (String(searchMode || "").length > 0 && query.indexOf("tag:") === 0) return { kind: "tag", tag: query.substring(4) }
+    return { kind: "dir", shareKey: pathAlias ? String(pathAlias.key || "") : "" }
 }

@@ -55,3 +55,9 @@ function newTabPath(state, here, home) {
 function orHome(path, home) {
     return path && String(path).length > 0 ? String(path) : home
 }
+
+// How long a restored folder waits for its first listing before it stops loading.
+var LISTING_WAIT_MS = 10000
+
+// How long the favourite inspector waits for its answer before its guard clears anyway.
+var INSPECT_WAIT_MS = 10000

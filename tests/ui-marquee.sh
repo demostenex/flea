@@ -94,18 +94,22 @@ marquee_to() {
     marquee_glide "$((wx + $1))" "$((wy + $2))"
 }
 
+# marquee_begin_below LAST [ctrl] [last_only] [tolerance]: a tail thinner than five pixels needs tolerance 0, an exact glide.
 marquee_begin_below() {
-    local last="$1" ctrl="${2:-false}" last_only="${3:-false}" ax ay aw ah rx ry rw rh cx cy
+    local last="$1" ctrl="${2:-false}" last_only="${3:-false}" tolerance="${4:-1}" ax ay aw ah rx ry rw rh cx cy pad
     local wx wy ww wh pointer_x pointer_y
     read -r ax ay aw ah <<< "$(ipc listAreaRect)"
     read -r rx ry rw rh <<< "$(ipc rowRect "$last")"
     [[ "$ax $ay $aw $ah $rx $ry $rw $rh" =~ ^[0-9]+(\ [0-9]+){7}$ ]] || fail "marquee: listing/row geometry unavailable"
     if [[ "$(ipc viewMode)" == columns ]]; then ax=$rx; aw=$rw; fi
     (( rh > 0 && ry + rh < ay + ah )) || fail "marquee: no empty space below the last row"
-    cx=$((ax + aw - 12)); cy=$(((ry + rh + ay + ah) / 2))
+    # Sample input: metrics prints "14 12 14 37", field 3 is rowPaddingX; ScrollLane040 reserves it at the view's right edge.
+    pad=$(ipc metrics | cut -d' ' -f3)
+    [[ "$pad" =~ ^[0-9]+$ ]] || fail "marquee: listing metrics unavailable"
+    cx=$((ax + aw - pad - 12)); cy=$(((ry + rh + ay + ah) / 2))
     [[ "$last_only" == true ]] && cx=$((rx + rw * 3 / 4))
     read -r wx wy ww wh < <(window_box) || fail "marquee: owned window is unavailable"
-    marquee_glide "$((wx + cx))" "$((wy + cy))" 1
+    marquee_glide "$((wx + cx))" "$((wy + cy))" "$tolerance"
     read -r pointer_x pointer_y <<< "$(hyprctl cursorpos | tr -d ',')"
     [[ "$pointer_x $pointer_y" =~ ^-?[0-9]+\ -?[0-9]+$ ]] || fail "marquee: final press position is unavailable"
     (( pointer_x > wx + ax && pointer_x < wx + ax + aw && pointer_y > wy + ry + rh && pointer_y < wy + ay + ah )) \
@@ -141,7 +145,7 @@ marquee_interactions() {
     click_row 2 left --mods ctrl
     marquee_expect selectedIndices 0 "$label Ctrl-click toggles its mark off"
     click_row 3 left --mods shift
-    marquee_expect selectedIndices '2,3' "$label Shift-click extends from cursor anchor"
+    marquee_expect selectedIndices '0,2,3' "$label Shift-click adds its range from the cursor anchor to the earlier mark"
     click_row 1 left
     marquee_four "$label"
     key -k Escape >/dev/null || fail "marquee: Escape delivery failed"
@@ -411,20 +415,58 @@ marquee_targets() {
         [[ "$(ipc path)" == "$dir" ]] || fail "marquee: refusing deletion outside the current owned listing"
         for i in 0 1 2 3; do marquee_guard "$dir/file-$i.txt"; done
         marquee_guard "$XDG_DATA_HOME/Trash"
-        trash_guard_store 0
+        # The window runs under the fixture HOME, so the provider saw that HOME's device.
+        trash_guard_store 0 "$marquee_home"
         key dd >/dev/null || fail "marquee: protected trash pair delivery failed"
         wait_listing 0
         for i in 0 1 2 3; do [[ ! -e "$dir/file-$i.txt" ]] || fail "marquee: dd did not trash every banded file"; done
-        trash_guard_store 4
+        trash_guard_store 4 "$marquee_home"
         key z >/dev/null || fail "marquee: undo key delivery failed"
         wait_listing 4
-        trash_guard_store 0
+        trash_guard_store 0 "$marquee_home"
         for i in 0 1 2 3; do
             [[ "$(cat "$dir/file-$i.txt")" == "keyboard $i" ]] || fail "marquee: undo did not restore exact banded contents"
         done
         printf 'MARQUEE_KEYBOARD %s copy=4 trash=4 undo=4\n' "$mode"
         kill_flea
     done
+}
+
+# A band that starts on the bare margin between two middle Grid tiles sweeps the four tiles it crosses; the pointer is the real uinput one.
+marquee_grid_margin() {
+    local dir="$marquee_box/margin" i columns rx ry rw rh y0 cx cy want
+    marquee_guard "$dir"
+    mkdir "$dir" || fail "marquee: margin fixture creation failed"
+    for i in $(seq -w 1 24); do printf 'margin %s\n' "$i" > "$dir/file-$i.txt" || fail "marquee: margin file creation failed"; done
+    seed_ui_state "$marquee_box/margin-state" '{"keys":"default","view":"list","preview":{"thumbnails":"off"}}'
+    HOME="$marquee_home" launch "$dir"
+    wait_listing 24
+    permissions_viewport 880 620
+    click_chrome grid
+    marquee_expect viewMode grid "margin fixture enters grid"
+    read -r rx y0 rw rh <<< "$(ipc rowRect 0)"
+    [[ "$rx $y0 $rw $rh" =~ ^[0-9]+(\ [0-9]+){3}$ ]] || fail "marquee: first Grid tile has no geometry: $rx $y0 $rw $rh"
+    # The first row ends where a tile's top moves down; the tiles on each side of the pressed margin must both be middle ones.
+    for ((columns = 1; columns < 12; columns++)); do
+        read -r rx ry rw rh <<< "$(ipc rowRect "$columns")"
+        [[ "$ry" =~ ^[0-9]+$ ]] || fail "marquee: Grid tile $columns has no geometry"
+        (( ry > y0 )) && break
+    done
+    (( columns >= 4 && columns < 12 )) || fail "marquee: Grid row holds $columns tiles, want a first row of four or more"
+    read -r rx ry rw rh <<< "$(ipc rowRect 1)"
+    [[ "$rx $ry $rw $rh" =~ ^[0-9]+(\ [0-9]+){3}$ ]] || fail "marquee: Grid tile 1 has no geometry: $rx $ry $rw $rh"
+    # Three pixels inside tile 1's right edge is cell margin, clear of its icon box and its caption.
+    marquee_press "$((rx + rw - 3))" "$((ry + rh / 2))"
+    marquee_state '.tracking and (.active | not)' "a press on the margin between two middle Grid tiles owns a pending band"
+    read -r cx cy <<< "$(ipc rowCentre "$((columns + 2))")"
+    marquee_to "$cx" "$cy"
+    marquee_state '.active and .tracking' "the margin press has a live rubber band"
+    want="1,2,$((columns + 1)),$((columns + 2))"
+    marquee_expect selectedIndices "$want" "the margin band marks the four tiles it crosses"
+    marquee_release
+    marquee_expect selectedIndices "$want" "release keeps the four tiles"
+    printf 'MARQUEE_MARGIN columns=%s selected=%s\n' "$columns" "$want"
+    kill_flea
 }
 
 case_marquee() (
@@ -444,7 +486,7 @@ case_marquee() (
     marquee_guard "$XDG_DATA_HOME"
     HOME="$marquee_home" trash_start_bus
     trap 'marquee_cleanup $?' EXIT
-    if [[ "$group" != extended ]]; then
+    if [[ "$group" != extended && "$group" != margin ]]; then
         for preset in default vim mac windows; do
             dir="$marquee_box/$preset"
             mkdir "$dir" || fail "marquee: listing creation failed"
@@ -472,7 +514,9 @@ case_marquee() (
             kill_flea
         done
     fi
-    if [[ "$group" != contexts ]]; then
+    if [[ "$group" == margin ]]; then
+        marquee_grid_margin
+    elif [[ "$group" != contexts ]]; then
         marquee_scroll
         marquee_columns_boundary
         marquee_filtered
@@ -483,3 +527,4 @@ case_marquee() (
 
 case_marqueecontexts() { case_marquee contexts; }
 case_marqueeextended() { case_marquee extended; }
+case_marqueemargin() { case_marquee margin; }

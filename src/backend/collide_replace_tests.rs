@@ -1,9 +1,12 @@
 // Replace, its undo and its redo, against a stand-in trash inside the sandbox.
 use super::tests::{asked, chosen, owned, refusing_trash, text, transfer, StandIn};
 use super::*;
+use crate::backend::mergeapply::{replacing_deferred, Deferred};
 use crate::backend::opsreq::run_transfer_checked;
 use crate::backend::testdir::TestDir;
+use crate::backend::trash;
 use crate::backend::undo::Journal;
+use crate::error::FleaError;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Output};
@@ -58,7 +61,7 @@ fn gio_trash(can: &Path, args: &[&str]) -> Output {
     }
 }
 
-fn working_trash(d: &TestDir) -> (StandIn, PathBuf) {
+pub(super) fn working_trash(d: &TestDir) -> (StandIn, PathBuf) {
     let can = d.dir("can");
     let at = can.clone();
     trash::STAND_IN.with(|slot| *slot.borrow_mut() = Some(Rc::new(move |args: &[&str]| Some(gio_trash(&at, args)))));
@@ -186,8 +189,9 @@ fn a_replace_whose_copy_fails_puts_the_old_item_straight_back() {
     assert_eq!(std::fs::read_dir(&can).unwrap().count(), 0);
     // A cancel reaches the same path and keeps its own word, which is what the transfer counts it by.
     let cancelled = |_: &mut Vec<Step>| Err(FleaError { where_: "copy".into(), path: String::new(), msg: CANCELLED.into() });
+    let mut deferred = Deferred::begin();
     let mut steps = Vec::new();
-    assert_eq!(replacing(&there, &mut steps, cancelled).unwrap_err().msg, CANCELLED);
+    assert_eq!(replacing_deferred(&there, &mut steps, &mut deferred, &std::sync::atomic::AtomicBool::new(false), cancelled).unwrap_err().msg, CANCELLED);
     assert_eq!(text(&there), "there");
     assert!(steps.is_empty());
 }
@@ -210,9 +214,10 @@ fn a_put_back_that_fails_keeps_the_step_for_undo_and_says_the_old_item_is_in_tra
     let there = d.file("to/shut.txt", "there");
     let _trash = unrestorable_trash(&d, Arc::new(AtomicBool::new(false)), true);
     let failing = |_: &mut Vec<Step>| Err(FleaError { where_: "copy".into(), path: String::new(), msg: "permission denied".into() });
+    let mut deferred = Deferred::begin();
     let mut steps = Vec::new();
-    let error = replacing(&there, &mut steps, failing).unwrap_err();
-    assert!(error.msg.starts_with("permission denied; the item it replaced is still in Trash"), "{}", error.msg);
+    let error = replacing_deferred(&there, &mut steps, &mut deferred, &std::sync::atomic::AtomicBool::new(false), failing).unwrap_err();
+    assert!(error.msg.starts_with("permission denied; the item it replaced is still in the Trash"), "{}", error.msg);
     assert!(matches!(&steps[..], [Step::Trashed(old)] if old.original == there), "undo can still restore it: {:?}", steps);
 }
 
@@ -241,7 +246,7 @@ fn a_cancelled_replace_whose_put_back_fails_is_a_failure_and_its_own_error_stops
     let (ok, failed, skipped, was_cancelled, steps) = done.expect("a terminal line");
     assert!(!cancel.load(Ordering::Relaxed), "the flag was down again before later.txt, so only photo.png's error could stop the batch");
     assert_eq!((ok, failed, skipped, was_cancelled), (0, 1, 1, true), "photo.png's name no longer holds what it held, so it fails; later.txt is skipped");
-    assert!(errors.len() == 1 && errors[0].starts_with("cancelled; the item it replaced is still in Trash"), "{:?}", errors);
+    assert!(errors.len() == 1 && errors[0].starts_with("cancelled; the item it replaced is still in the Trash"), "{:?}", errors);
     assert!(!to.join("later.txt").exists() && text(&later) == "never reached", "the batch stopped before later.txt");
     assert!(matches!(&steps[..], [Step::Trashed(old)] if old.original == there), "undo can still restore it: {:?}", steps);
     assert!(!there.exists(), "the old item really is in the stand-in trash");
@@ -271,7 +276,7 @@ fn a_cancelled_replace_whose_put_back_fails_under_a_standing_cancel_counts_once_
     }
     assert!(cancel.load(Ordering::Relaxed), "the Cancel stood through the put-back, as it does with the real gio");
     assert_eq!(done.expect("a terminal line"), (0, 1, 0, true), "failed once and never also skipped");
-    assert!(errors.len() == 1 && errors[0].starts_with("cancelled; the item it replaced is still in Trash"), "{:?}", errors);
+    assert!(errors.len() == 1 && errors[0].starts_with("cancelled; the item it replaced is still in the Trash"), "{:?}", errors);
     assert!(!there.exists(), "the old item is in the stand-in trash, where undo can restore it");
 }
 
@@ -391,4 +396,97 @@ fn a_link_at_the_name_is_replaced_as_itself_and_its_target_is_never_touched() {
     assert_eq!((ok, errors), (1, Vec::<String>::new()), "a link to the source does not hold the source");
     assert!(!link.symlink_metadata().unwrap().file_type().is_symlink(), "the link went to Trash and a copy took its name");
     assert_eq!((text(&link), text(&photo)), ("yours".to_string(), "yours".to_string()));
+}
+
+#[test]
+fn a_failed_link_cleanup_with_a_replaced_entry_still_undoes_the_good_link() {
+    use crate::backend::opsdispatch::{do_undo, test_fail_link_verify, test_reported_link, Ops};
+    let d = TestDir::new("collide-link-leftover-undo");
+    d.dir("src");
+    let a = d.file("src/a.txt", "a-new");
+    let b = d.file("src/b.txt", "b-new");
+    let dest = d.dir("dest");
+    d.file("dest/a.txt", "a-old");
+    d.file("dest/b.txt", "b-old");
+    // The second trash call arms the verify failure, so the first link lands and the second is left over.
+    let can = d.dir("can");
+    let at = can.clone();
+    let calls = Rc::new(std::cell::Cell::new(0usize));
+    let count = Rc::clone(&calls);
+    trash::STAND_IN.with(|slot| *slot.borrow_mut() = Some(Rc::new(move |args: &[&str]| {
+        if matches!(args, ["trash", "--", ..]) && count.get() == 1 {
+            test_fail_link_verify(true);
+        }
+        if matches!(args, ["trash", "--", ..]) {
+            count.set(count.get() + 1);
+        }
+        Some(gio_trash(&at, args))
+    })));
+    let _trash = StandIn;
+    let (tx, _rx) = channel();
+    let mut o = Ops::new(tx);
+    o.question = Some(asked(1, &[&a, &b], &dest));
+    let ask = Ask::parse(r#"{"c":"link","collide":"replace","collideId":1}"#);
+    let mut buf = Vec::new();
+    let paths = vec![a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
+    let policy = ask.policy(o.question.take(), &dest).for_batch(&paths);
+    test_reported_link(&mut o, &mut buf, "relative", paths, dest.clone(), policy);
+    test_fail_link_verify(false);
+    let line = String::from_utf8_lossy(&buf).to_string();
+    assert!(line.contains(r#""t":"linked","ok":1,"failed":1,"skipped":0"#), "one link lands and one is left over: {}", line);
+    // F24: the mixed answer carries the stranded sentence as a note.
+    assert!(line.contains(r#""note":"#), "a stranded replace is named on the mixed answer: {}", line);
+    assert!(line.contains(&format!("the link at {} could not be removed: ", crate::json::escape(&dest.join("b.txt").to_string_lossy()))), "the note names the leftover link: {}", line);
+    assert!(line.contains("the item it replaced is still in the Trash"), "the note says the replaced item was not restored: {}", line);
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a-new");
+    let mut buf = Vec::new();
+    do_undo(&mut buf, &mut o);
+    let line = String::from_utf8_lossy(&buf).to_string();
+    assert!(line.contains(r#""t":"undone","op":"link","ok":true"#), "the good link still reverses: {}", line);
+    assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "a-old");
+    assert!(dest.join("b.txt").symlink_metadata().is_ok(), "the leftover link stays and is reported, never dropped");
+    assert_eq!(std::fs::read_dir(&can).unwrap().count(), 2, "its original stays in the trash");
+    // The note travels on first_err, which only an all-failed answer carries.
+    let c = d.file("src/c.txt", "c-new");
+    d.file("dest/c.txt", "c-old");
+    o.question = Some(asked(2, &[&c], &dest));
+    let ask = Ask::parse(r#"{"c":"link","collide":"replace","collideId":2}"#);
+    test_fail_link_verify(true);
+    let mut buf = Vec::new();
+    let paths = vec![c.to_string_lossy().to_string()];
+    let policy = ask.policy(o.question.take(), &dest).for_batch(&paths);
+    test_reported_link(&mut o, &mut buf, "relative", paths, dest.clone(), policy);
+    test_fail_link_verify(false);
+    let line = String::from_utf8_lossy(&buf).to_string();
+    assert!(line.contains(r#""where":"link""#), "an all-failed link is an error line: {}", line);
+    assert!(line.contains("could not be removed: "), "the cleanup failure is named with its reason: {}", line);
+    assert!(line.contains("the item it replaced is still in the Trash"), "the replaced item is not reported as restored: {}", line);
+}
+
+#[test]
+fn a_missing_source_never_hides_a_stranded_replace_note() {
+    // F25: an earlier batch failure must not hide the stranded link sentence.
+    use crate::backend::opsdispatch::{test_fail_link_verify, test_reported_link, Ops};
+    let d = TestDir::new("collide-link-stranded-first");
+    d.dir("src");
+    let c = d.file("src/c.txt", "c-new");
+    let dest = d.dir("dest");
+    d.file("dest/c.txt", "c-old");
+    let (_trash, _can) = working_trash(&d);
+    let (tx, _rx) = channel();
+    let mut o = Ops::new(tx);
+    o.question = Some(asked(7, &[&c], &dest));
+    let ask = Ask::parse(r#"{"c":"link","collide":"replace","collideId":7}"#);
+    let gone = d.path().join("src/x.txt").to_string_lossy().to_string();
+    test_fail_link_verify(true);
+    let mut buf = Vec::new();
+    let paths = vec![gone, c.to_string_lossy().to_string()];
+    let policy = ask.policy(o.question.take(), &dest).for_batch(&paths);
+    test_reported_link(&mut o, &mut buf, "relative", paths, dest.clone(), policy);
+    test_fail_link_verify(false);
+    let line = String::from_utf8_lossy(&buf).to_string();
+    assert!(line.contains(r#""where":"link""#), "an all-failed link is an error line: {}", line);
+    assert!(line.contains("x.txt"), "the first failure is still named: {}", line);
+    assert!(line.contains("c.txt"), "the stranded link is named too: {}", line);
+    assert!(line.contains("the item it replaced is still in the Trash"), "the replaced item is not reported as restored: {}", line);
 }

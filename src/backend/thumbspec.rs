@@ -1,4 +1,5 @@
 use crate::backend::aliases::Aliases;
+use crate::backend::appicon;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -9,6 +10,8 @@ pub struct Spec {
 
 pub struct Thumbnailers {
     by_mime: HashMap<String, Spec>,
+    // Computed once when the table is built; a fail marker names the table that made it by this; see AGENTS.md "Thumbnail cache".
+    fingerprint: String,
 }
 
 // The freedesktop default when XDG_DATA_DIRS is unset, which it is over a non-interactive ssh here.
@@ -16,6 +19,12 @@ const DEFAULT_DATA_DIRS: &str = "/usr/local/share:/usr/share";
 const THUMBNAILERS_SUBDIR: &str = "thumbnailers";
 // The one group whose keys are honoured, because a key outside it names a program nothing may run.
 const ENTRY_GROUP: &str = "[Thumbnailer Entry]";
+const JPEG_MIME: &str = "image/jpeg";
+// The camera RAW types whose embedded JPEG is thumbnailed, by canonical name; the shared-mime-info alias image/x-panasonic-raw2 canonicalises to the RW2 entry.
+const RAW_MIMES: [&str; 11] = [
+    "image/x-canon-cr2", "image/x-canon-cr3", "image/x-nikon-nef", "image/x-nikon-nrw", "image/x-sony-arw", "image/x-sony-sr2",
+    "image/x-adobe-dng", "image/x-fuji-raf", "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-pentax-pef",
+];
 
 impl Thumbnailers {
     pub fn load(aliases: &Aliases) -> Thumbnailers {
@@ -38,38 +47,68 @@ impl Thumbnailers {
             // Sorting one directory at a time, rather than the whole list, keeps the search path's own precedence intact.
             entries.append(&mut sorted_by_path(in_dir));
         }
-        Thumbnailers::from_entries(&entries, aliases)
+        Thumbnailers::from_entries(&entries, aliases).with_appimage_route(aliases, appicon::available())
+    }
+
+    // An internal spec so rows.rs sets t for an AppImage; a thumbnailer file that declares the type keeps it, and without 7z there is no route.
+    pub(crate) fn with_appimage_route(mut self, aliases: &Aliases, tool: bool) -> Thumbnailers {
+        if tool {
+            for mime in appicon::MIMES {
+                self.by_mime.entry(aliases.canonical(mime).to_string()).or_insert_with(appicon::route_spec);
+            }
+        }
+        self
     }
 
     pub fn from_entries(entries: &[(String, String)], aliases: &Aliases) -> Thumbnailers {
         let mut by_mime: HashMap<String, Spec> = HashMap::new();
         for (_name, text) in entries {
             let (exec_line, try_exec, mimes) = fields(text);
-            let exec = match exec_line {
+            let mut exec = match exec_line {
                 Some(l) => tokenise(&l),
                 None => continue,
             };
-            let program = match exec.first() {
-                Some(p) if !p.is_empty() => p.as_str(),
-                _ => continue,
+            let found = match exec.first().filter(|p| !p.is_empty()).and_then(|p| resolve(p)) {
+                Some(f) => f,
+                None => continue,
             };
             // Both are validated: a TryExec that resolves must not vouch for an Exec program that does not.
-            if !is_runnable(program) || try_exec.as_deref().is_some_and(|t| !is_runnable(t)) {
+            if try_exec.as_deref().is_some_and(|t| resolve(t).is_none()) {
                 continue;
             }
+            // The jail has no PATH, so the program is stored as the path validation found; see AGENTS.md "Thumbnailer specs".
+            exec[0] = found;
             for mime in mimes {
                 let key = aliases.canonical(&mime).to_string();
                 // corner: the first file to declare a MIME type keeps it, and load sorts each directory by path so that winner is fixed; see AGENTS.md "Thumbnailer specs".
                 by_mime.entry(key).or_insert_with(|| Spec { exec: exec.clone() });
             }
         }
-        Thumbnailers { by_mime }
+        let fingerprint = fingerprint_of(&by_mime);
+        Thumbnailers { by_mime, fingerprint }
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     // Both sides are canonicalised, because a thumbnailer may declare either one; see AGENTS.md "MIME aliases".
     pub fn for_mime(&self, mime: &str, aliases: &Aliases) -> Option<&Spec> {
-        self.by_mime.get(aliases.canonical(mime))
+        self.by_mime.get(aliases.canonical(mime)).or_else(|| self.raw_route(mime, aliases))
     }
+
+    // A camera RAW no thumbnailer declares is thumbnailed by the image/jpeg spec on the JPEG it embeds; none when the type is not a RAW, a thumbnailer declares it, or no image/jpeg thumbnailer is installed.
+    pub fn raw_route(&self, mime: &str, aliases: &Aliases) -> Option<&Spec> {
+        let canonical = aliases.canonical(mime);
+        if RAW_MIMES.contains(&canonical) && !self.by_mime.contains_key(canonical) { self.by_mime.get(JPEG_MIME) } else { None }
+    }
+}
+
+// Sample output, 16 lowercase hex characters over every (MIME type, resolved program, arguments) entry; the entries are sorted so the map's order never reaches the hash.
+fn fingerprint_of(by_mime: &HashMap<String, Spec>) -> String {
+    let mut entries: Vec<String> = by_mime.iter().map(|(mime, spec)| format!("{}\0{}", mime, spec.exec.join("\0"))).collect();
+    entries.sort();
+    format!("{:016x}", crate::backend::xxh64::hash(entries.join("\n").as_bytes()))
 }
 
 // read_dir order is unspecified by POSIX, so a directory's files are ordered by path and the winner of a duplicate declaration is the same on every box.
@@ -165,27 +204,32 @@ fn tokenise(line: &str) -> Vec<String> {
     out
 }
 
-// A program that is not a regular executable file is refused, because the search path includes a user-writable directory.
-fn is_runnable(program: &str) -> bool {
+// A program that is not a regular executable file is refused, because the search path includes a user-writable directory; answers the path that passed.
+fn resolve(program: &str) -> Option<String> {
+    resolve_in(program, &std::env::var("PATH").unwrap_or_default())
+}
+
+// Split from resolve() so a test can name the PATH; sample input: "tool" with "/home/u/.local/bin:/usr/bin" answers "/home/u/.local/bin/tool" when that file is executable, and an empty or relative entry is skipped.
+fn resolve_in(program: &str, path: &str) -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
     const ANY_EXECUTE_BIT: u32 = 0o111;
     let candidates: Vec<PathBuf> = if program.contains('/') {
         vec![PathBuf::from(program)]
     } else {
-        let path = std::env::var("PATH").unwrap_or_default();
         path.split(':')
-            .filter(|d| !d.is_empty())
+            .filter(|d| d.starts_with('/'))
             .map(|d| PathBuf::from(d).join(program))
             .collect()
     };
-    for c in candidates {
-        if let Ok(meta) = std::fs::metadata(&c) {
-            if meta.is_file() && meta.permissions().mode() & ANY_EXECUTE_BIT != 0 {
-                return true;
-            }
-        }
-    }
-    false
+    candidates
+        .into_iter()
+        .find(|c| std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & ANY_EXECUTE_BIT != 0))
+        .map(|c| c.to_string_lossy().to_string())
+}
+
+// The AppImage route asks only whether a tool runs, under the same search-path rule as every thumbnailer.
+pub(crate) fn is_runnable(program: &str) -> bool {
+    resolve(program).is_some()
 }
 
 #[cfg(test)]
@@ -208,6 +252,47 @@ mod tests {
         assert!(t.for_mime("video/mp4", &a).is_some());
         assert!(t.for_mime("video/webm", &a).is_some());
         assert!(t.for_mime("image/jpeg", &a).is_none());
+    }
+
+    // The eleven camera RAW types as the mime database names them, spelled out so the table in the code is not its own witness.
+    const ELEVEN: [&str; 11] = [
+        "image/x-canon-cr2", "image/x-canon-cr3", "image/x-nikon-nef", "image/x-nikon-nrw", "image/x-sony-arw", "image/x-sony-sr2",
+        "image/x-adobe-dng", "image/x-fuji-raf", "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-pentax-pef",
+    ];
+
+    #[test]
+    fn each_camera_raw_type_takes_the_jpeg_spec_and_only_when_one_is_installed() {
+        let a = Aliases::from_str("image/x-panasonic-raw2 image/x-panasonic-rw2\n");
+        let jpeg = one("[Thumbnailer Entry]\nTryExec=/bin/sh\nExec=/bin/sh -j %i %o\nMimeType=image/jpeg;\n");
+        for m in ELEVEN.iter().chain(&["image/x-panasonic-raw2"]) {
+            assert_eq!(jpeg.raw_route(m, &a).map(|s| s.exec[1].as_str()), Some("-j"), "{m}");
+            assert!(jpeg.for_mime(m, &a).is_some(), "{m}");
+        }
+        // Not a RAW type: the PNG, the Sony SRF the walker reads but this route does not list, and an unknown name.
+        for m in ["image/png", "image/x-sony-srf", "nonsense/nothing"] {
+            assert!(jpeg.raw_route(m, &a).is_none() && jpeg.for_mime(m, &a).is_none(), "{m}");
+        }
+        // Without an image/jpeg thumbnailer a RAW has none, as before.
+        let video = one("[Thumbnailer Entry]\nTryExec=/bin/sh\nExec=/bin/sh %i %o\nMimeType=video/mp4;\n");
+        assert!(ELEVEN.iter().all(|m| video.for_mime(m, &a).is_none()));
+        // A thumbnailer that declares the RAW itself still serves it when no image/jpeg one exists, and the route stays off.
+        let own = one("[Thumbnailer Entry]\nTryExec=/bin/sh\nExec=/bin/sh -r %i %o\nMimeType=image/x-canon-cr2;\n");
+        assert_eq!(own.for_mime("image/x-canon-cr2", &a).map(|s| s.exec[1].as_str()), Some("-r"));
+        assert!(own.raw_route("image/x-canon-cr2", &a).is_none());
+    }
+
+    #[test]
+    fn a_thumbnailer_that_declares_a_raw_keeps_it_when_an_image_jpeg_one_is_installed_too() {
+        let a = Aliases::from_str("");
+        let jpeg = ("jpeg.thumbnailer".to_string(), "[Thumbnailer Entry]\nTryExec=/bin/sh\nExec=/bin/sh -j %i %o\nMimeType=image/jpeg;\n".to_string());
+        let cr2 = ("cr2.thumbnailer".to_string(), "[Thumbnailer Entry]\nTryExec=/bin/sh\nExec=/bin/sh -r %i %o\nMimeType=image/x-canon-cr2;\n".to_string());
+        let t = Thumbnailers::from_entries(&[jpeg, cr2], &a);
+        // The declared CR2 is served by its own thumbnailer on the file itself, and the route stays off for it.
+        assert_eq!(t.for_mime("image/x-canon-cr2", &a).map(|s| s.exec[1].as_str()), Some("-r"));
+        assert!(t.raw_route("image/x-canon-cr2", &a).is_none(), "the route must stay off for a declared RAW");
+        // A RAW nothing declares still takes the JPEG route.
+        assert_eq!(t.for_mime("image/x-nikon-nef", &a).map(|s| s.exec[1].as_str()), Some("-j"));
+        assert_eq!(t.raw_route("image/x-nikon-nef", &a).map(|s| s.exec[1].as_str()), Some("-j"));
     }
 
     #[test]
@@ -261,6 +346,44 @@ mod tests {
         let a = al();
         let t = one("[Thumbnailer Entry]\nTryExec=/tmp\nExec=/tmp %i %o\nMimeType=image/jpeg;\n");
         assert!(t.for_mime("image/jpeg", &a).is_none());
+    }
+
+    // Issue 171: the jail has no PATH, so load stores the path validation found and run never searches for a name.
+    #[test]
+    fn a_bare_exec_name_is_stored_as_the_path_that_validated() {
+        let a = al();
+        let t = one("[Thumbnailer Entry]\nExec=sh %i %o\nMimeType=image/jpeg;\n");
+        let program = &t.for_mime("image/jpeg", &a).unwrap().exec[0];
+        assert!(program.starts_with('/') && program.ends_with("/sh"), "the program is {}", program);
+        assert!(std::path::Path::new(program).is_file());
+    }
+
+    #[test]
+    fn a_bare_name_resolves_to_the_first_path_hit_that_is_a_runnable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::backend::testdir::TestDir::new("thumbspec-resolve");
+        let (first, second) = (d.join("first"), d.join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        // The first hit is not executable, so the search goes on to the second.
+        std::fs::write(first.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(second.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(second.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", first.display(), second.display());
+        assert_eq!(resolve_in("tool", &path), Some(second.join("tool").to_string_lossy().to_string()));
+        assert_eq!(resolve_in("tool", ""), None, "a name is not searched for without a PATH");
+        assert_eq!(resolve_in("/definitely/not/here", &path), None);
+    }
+
+    #[test]
+    fn a_relative_or_empty_path_entry_is_not_searched() {
+        // A repository executable that a relative entry would find from the test's cwd.
+        let here = std::env::current_dir().unwrap().join("tools");
+        let absolute = here.join("flea-file-budget").to_string_lossy().to_string();
+        assert_eq!(resolve_in("flea-file-budget", &here.to_string_lossy()), Some(absolute.clone()), "the control: an absolute entry finds it");
+        assert_eq!(resolve_in("flea-file-budget", "tools"), None);
+        assert_eq!(resolve_in("flea-file-budget", ":./tools"), None);
+        assert_eq!(resolve_in("flea-file-budget", &format!("tools:{}", here.display())), Some(absolute));
     }
 
     #[test]
@@ -328,5 +451,29 @@ mod tests {
             ("/usr/share/thumbnailers/evince.thumbnailer".to_string(), String::new()),
         ];
         assert_eq!(sorted_by_path(unsorted)[0].0, "/usr/share/thumbnailers/evince.thumbnailer");
+    }
+
+    // Sample output, a file name and a body that declares one type served by one program.
+    fn declared(mime: &str, program: &str) -> (String, String) {
+        (format!("{}.thumbnailer", mime.replace('/', "-")), format!("[Thumbnailer Entry]\nExec={} %i %o %s\nMimeType={};\n", program, mime))
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_same_for_the_same_entries_in_any_order() {
+        let a = al();
+        let forward = [declared("image/png", "/bin/sh"), declared("video/mp4", "/bin/true"), declared("image/jpeg", "/bin/false"), declared("audio/flac", "/bin/true")];
+        let reversed: Vec<(String, String)> = forward.iter().rev().cloned().collect();
+        // Each table owns a HashMap with its own iteration order, so rebuilding is what exercises the sort.
+        for _ in 0..20 {
+            assert_eq!(Thumbnailers::from_entries(&forward, &a).fingerprint(), Thumbnailers::from_entries(&reversed, &a).fingerprint());
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_changes_when_a_program_path_changes() {
+        let a = al();
+        let base = Thumbnailers::from_entries(&[declared("image/png", "/bin/true"), declared("video/mp4", "/bin/sh")], &a);
+        let moved = Thumbnailers::from_entries(&[declared("image/png", "/bin/false"), declared("video/mp4", "/bin/sh")], &a);
+        assert_ne!(base.fingerprint(), moved.fingerprint());
     }
 }

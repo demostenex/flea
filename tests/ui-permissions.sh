@@ -11,9 +11,9 @@ permissions_guard() {
 }
 
 permissions_wait() {
-    local expression="$1" label="${2:-$1}" state end=$((SECONDS + 20))
+    local expression="$1" label="${2:-$1}" reader="${3:-permissionsState}" state end=$((SECONDS + 20))
     while (( SECONDS < end )); do
-        state=$(ipc permissionsState) || fail "permissions: read-only state unavailable"
+        state=$(ipc "$reader") || fail "permissions: read-only state unavailable"
         if jq -e "$expression" <<< "$state" >/dev/null; then
             permissions_checks=$((permissions_checks + 1))
             printf 'PERMISSIONS_PASS %s expected=%q observed=%s\n' "$label" "$expression" "$state"
@@ -26,8 +26,9 @@ permissions_wait() {
 
 permissions_expect() {
     local reader="$1" expected="$2" observed end=$((SECONDS + 20))
+    shift 2
     while (( SECONDS < end )); do
-        observed=$(ipc "$reader") || fail "permissions: $reader unavailable"
+        observed=$(ipc "$reader" "$@") || fail "permissions: $reader unavailable"
         if [[ "$observed" == "$expected" ]]; then
             permissions_checks=$((permissions_checks + 1))
             printf 'PERMISSIONS_PASS %s expected=%q observed=%q\n' "$reader" "$expected" "$observed"
@@ -35,30 +36,59 @@ permissions_expect() {
         fi
         sleep 0.05
     done
-    fail "permissions: $reader expected $expected, observed $observed"
+    fail "permissions: $reader expected $expected, observed $observed (caller ${BASH_LINENO[0]})"
 }
 
 permissions_point() {
-    local centre="$1" button="${2:-left}" cx cy wx wy ww wh
+    local centre="$1" button="${2:-left}" cx cy wx wy ww wh scene
     read -r cx cy <<< "$centre"
     [[ "$cx" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || fail "permissions: native control has no centre"
     read -r wx wy ww wh < <(window_box) || fail "native window coordinates unavailable"
-    (( cx < ww && cy < wh )) || fail "permissions: control is outside the actual viewport"
+    # permissions_control names the control it clicks; a bare point reports as "control". Sizes are checked as numbers first, since a name in (( )) aborts under set -u.
+    if ! [[ "$ww" =~ ^[0-9]+$ && "$wh" =~ ^[0-9]+$ ]] || ! (( cx < ww && cy < wh )); then
+        scene=$(ipc windowSize 2>&1) || scene="unavailable"
+        fail "permissions: ${permissions_target:-control} centre $cx,$cy is outside the actual viewport ${ww}x${wh} (window at $wx,$wy; QML scene $scene)"
+    fi
     assert_focus
     omarchy-drive click "$((wx + cx))" "$((wy + cy))" "$button" >/dev/null \
         || fail "permissions: native pointer activation failed"
+}
+
+permissions_menu_point() {
+    local index="$1" model target cursor step steps centre cx cy fx fy fw fh permissions_target="menu row $1"
+    model=$(ipc contextMenuModel) || fail "permissions: menu inventory unavailable"
+    # A menu taller than the window scrolls its body, so the cursor moves onto the nearest row it can reach and brings the row into view first.
+    # Sample input: [{"action":"a"},{"separator":true},{"action":"permissions","disabled":true},{"action":"permissions"}] with index 3.
+    target=$(jq -er --argjson index "$index" '. as $rows | [range(0; length) | select($rows[.].separator != true and $rows[.].disabled != true)] | min_by((. - $index) | fabs)' <<< "$model") \
+        || fail "permissions: the menu has no row the cursor can reach"
+    steps=$(jq -er 'length' <<< "$model") || fail "permissions: menu inventory has no length"
+    for ((step = 0; step <= steps; step++)); do
+        cursor=$(ipc contextMenuCursor)
+        [[ "$cursor" == "$target" ]] && break
+        if (( cursor > target )); then key -k Up >/dev/null; else key -k Down >/dev/null; fi
+        settle
+    done
+    [[ "$cursor" == "$target" ]] || fail "permissions: menu cursor stalled at $cursor, short of row $target"
+    centre=$(ipc contextMenuRowCentre "$index")
+    # Sample input: 640 120 220 480 (contextMenuRect x y width height); a centre below the frame is a clipped row, and a click there closes the menu.
+    read -r cx cy <<< "$centre"
+    read -r fx fy fw fh <<< "$(ipc contextMenuRect)"
+    [[ "$fx $fy $fw $fh" =~ ^-?[0-9]+(\ -?[0-9]+){3}$ && "$cx" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || fail "permissions: menu row $index has no centre or the menu has no frame"
+    (( cx >= fx && cx < fx + fw && cy >= fy && cy < fy + fh )) || fail "permissions: menu row $index centre $cx,$cy is clipped outside the menu frame $fx,$fy,$fw,$fh"
+    permissions_point "$centre"
 }
 
 permissions_control() {
     local name="$1" centre
     centre=$(ipc permissionsState | jq -er --arg name "$name" '.controls[] | select(.name == $name and .visible) | .centre') \
         || fail "permissions: no visible $name control"
+    local permissions_target="$name"
     permissions_point "$centre"
 }
 
 permissions_viewport() {
     local target_width="${1:-1100}" target_height="${2:-800}"
-    local client address result wx wy width height end=$((SECONDS + 20))
+    local client address result wx wy width height scene end=$((SECONDS + 20))
     client=$(hyprctl clients -j | jq -ec --argjson pid "$(flea_pid)" '.[] | select(.pid == $pid)') \
         || fail "permissions: owned window unavailable"
     address=$(jq -er '.address' <<< "$client") || fail "permissions: owned window has no address"
@@ -66,16 +96,19 @@ permissions_viewport() {
     if ! jq -e '.floating' <<< "$client" >/dev/null; then
         omarchy-drive window float "$address" >/dev/null || fail "permissions: owned window could not float"
     fi
-    result=$(hyprctl dispatch "hl.dsp.window.resize({ x = $target_width, y = $target_height, exact = true, window = \"address:$address\" })") \
-        || fail "permissions: compositor resize failed"
-    [[ "$result" == ok* ]] || fail "permissions: compositor refused resize: $result"
+    result=$(hypr_window_resize "$address" "$target_width" "$target_height" 2>&1) \
+        || fail "permissions: compositor refused resize: $result"
     omarchy-drive window center "$address" || fail "permissions: owned window could not center"
     while (( SECONDS < end )); do
         read -r wx wy width height < <(window_box) || fail "native window coordinates unavailable"
-        [[ "$width" == "$target_width" && "$height" == "$target_height" ]] && return
+        if [[ "$width" == "$target_width" && "$height" == "$target_height" ]]; then
+            # Dialogs centre in the QML scene, so wait for the client to report the size hyprctl already shows.
+            scene=$(ipc windowSize 2>/dev/null) || scene=unavailable
+            [[ "$scene" == "$target_width $target_height" ]] && return
+        fi
         sleep 0.05
     done
-    fail "permissions: viewport did not reach ${target_width}x${target_height}"
+    fail "permissions: viewport did not reach ${target_width}x${target_height}: hyprctl ${width}x${height} at $wx,$wy, QML scene ${scene:-unread}"
 }
 
 permissions_setup() {
@@ -115,6 +148,7 @@ permissions_setup() {
 permissions_open() {
     local name="$1" entry="${2:-pointer}" row target
     wait_path "$permissions_listing"
+    permissions_wait '(.opened == false) and .inputReady' 'listing accepts the next menu gesture'
     row=$(row_index_of "$name")
     if [[ "$entry" == pointer ]]; then click_row "$row" right
     else click_row "$row" left; key m >/dev/null; fi
@@ -122,7 +156,7 @@ permissions_open() {
     ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled != true)' >/dev/null \
         || fail "permissions: single-item menu entry is missing or disabled"
     target=$(menu_row_index Permissions) || fail "permissions: no native Permissions row"
-    if [[ "$entry" == pointer ]]; then permissions_point "$(ipc contextMenuRowCentre "$target")"
+    if [[ "$entry" == pointer ]]; then permissions_menu_point "$target"
     else menu_seek Permissions; key -k Return >/dev/null; fi
     permissions_wait '.opened and (.busy == false)' "native $entry Permissions entry for $name"
     target=$(jq -cn --arg path "$permissions_listing/$name" '$path')
@@ -157,7 +191,7 @@ permissions_apply() {
         if [[ "$entry" == space ]]; then key -k space >/dev/null
         else key -k Return >/dev/null; fi
     fi
-    permissions_wait '(.opened == false)' 'successful Apply closes Permissions'
+    permissions_wait '(.opened == false) and .inputReady' 'successful Apply closes Permissions and returns listing input'
     [[ "$(stat -c '%a' "$path")" == "$mode" ]] || fail "permissions: applied filesystem mode differs from $mode"
     [[ "$(ipc focusView)" == list ]] || fail "permissions: Apply did not restore listing focus"
 }
@@ -202,7 +236,7 @@ permissions_file() {
     permissions_mode 0600
     shot "permissions-$permissions_group-file-applied"
     permissions_control Cancel
-    permissions_wait '(.opened == false)'
+    permissions_wait '(.opened == false) and .inputReady'
 }
 
 permissions_directory() {
@@ -214,7 +248,7 @@ permissions_directory() {
     permissions_open site
     shot "permissions-$permissions_group-directory-baseline"
     permissions_wait '.facts.directory and .editable and ([.controls[] | select(.bit == 64 or .bit == 8 or .bit == 1) | .name] == ["Owner enter","Group enter","Everyone enter"])' 'directory traversal bits are labelled enter'
-    permissions_wait '.displayedSummary | contains("Scope this directory only") and contains("enclosed items unchanged") and contains("ownership unchanged")' 'directory summary excludes descendants and ownership'
+    permissions_wait '.displayedSummary | contains("Scope this folder only") and contains("enclosed items unchanged") and contains("ownership unchanged")' 'directory summary excludes descendants and ownership'
     permissions_mode 0755
     permissions_octal 0700
     permissions_apply "$permissions_listing/site" 700
@@ -256,7 +290,7 @@ permissions_readonly_controls() {
     permissions_wait '.opened and (.busy == false)' 'disabled Apply leaves dialog open'
     [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$path")" == "$before" ]] \
         || fail "permissions: read-only controls changed the item"
-    permissions_wait ".displayedSummary | contains(\"Current mode $mode\") and contains(\"No changes available\")" 'read-only summary reports the retained current mode'
+    permissions_wait ".displayedSummary | contains(\"Current mode $mode\") and contains(\"No changes to apply\")" 'read-only summary reports the retained current mode'
     permissions_wait 'any(.controls[]; .name == "Cancel" and .focused)' 'disabled controls do not steal initial Cancel focus'
     key -k Tab >/dev/null
     permissions_wait 'any(.controls[]; .name == "Close" and .focused)' 'read-only Tab reaches Close'
@@ -267,7 +301,7 @@ permissions_readonly_controls() {
     key -M shift -k Tab -m shift >/dev/null
     permissions_wait 'any(.controls[]; .name == "Cancel" and .focused)' 'read-only reverse traversal wraps to Cancel'
     permissions_control Cancel
-    permissions_wait '(.opened == false)'
+    permissions_wait '(.opened == false) and .inputReady'
 }
 
 permissions_readonly() {
@@ -368,7 +402,7 @@ permissions_keys() {
             permissions_wait "any(.controls[]; .name == $quoted and .focused)" "$preset Shift+Tab focuses $name"
         done
         key -k Return >/dev/null
-        permissions_wait '(.opened == false)' "$preset Return on Cancel dismisses"
+        permissions_wait '(.opened == false) and .inputReady' "$preset Return on Cancel dismisses and returns listing input"
         permissions_expect focusView list
         [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")" == "$before" ]] || fail "permissions: $preset focus traversal changed the file"
         permissions_open notes.md keyboard
@@ -405,7 +439,7 @@ permissions_keys() {
                     key -k space >/dev/null
                     ;;
             esac
-            permissions_wait '(.opened == false)' "$preset $name discards the draft"
+            permissions_wait '(.opened == false) and .inputReady' "$preset $name discards the draft and returns listing input"
             permissions_expect focusView list
             [[ "$(stat -c '%a' "$permissions_listing/notes.md")" == "${wanted#0}" ]] || fail "permissions: $preset $name committed a draft"
             key -k Down >/dev/null
@@ -420,7 +454,9 @@ permissions_keys() {
 }
 
 permissions_eligibility() {
-    local first second index before
+    local first second index before dismissal note_before other_before quoted_paths
+    local notes_mode=0644 other_mode=0755 notes_applied=740 other_applied=751
+    local mixed_bit=64 uniform_bit=4 batch_count=2 untouched_group_bit=8 untouched_everyone_bit=1
     settings_open_key
     permissions_expect settingsOpen true
     settings_section menus
@@ -451,34 +487,151 @@ permissions_eligibility() {
     key -k Escape >/dev/null
     permissions_wait '(.opened == false)' 'restored menu preference reaches native dialog'
 
+    permissions_guard "$permissions_listing/notes.md"
+    permissions_guard "$permissions_listing/other.txt"
+    chmod "$notes_mode" "$permissions_listing/notes.md" || fail "permissions: first batch fixture mode failed"
+    chmod "$other_mode" "$permissions_listing/other.txt" || fail "permissions: second batch fixture mode failed"
+    note_before=$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")
+    other_before=$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/other.txt")
+    quoted_paths=$(jq -cn --arg first "$permissions_listing/notes.md" --arg second "$permissions_listing/other.txt" '[$first, $second] | sort')
+    permissions_wait '(.opened == false) and .inputReady' 'listing accepts batch selection'
     first=$(row_index_of notes.md)
     second=$(row_index_of other.txt)
     click_row "$first" left
     permissions_expect selectedIndices "$first"
     permissions_expect selectionCount 1
     click_row "$second" left --mods ctrl
-    permissions_expect selectionCount 2
+    permissions_expect selectionCount "$batch_count"
+    for dismissal in Cancel Escape Apply; do
+        permissions_wait '(.opened == false) and .inputReady' 'listing accepts the next batch menu gesture'
+        if [[ "$dismissal" == Escape ]]; then key m >/dev/null
+        else click_row "$first" right; fi
+        permissions_expect contextMenuVisible true
+        ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled != true and .errored != true)' >/dev/null \
+            || fail "permissions: regular-file selection has no enabled Permissions row"
+        index=$(menu_row_index Permissions) || fail "permissions: no batch Permissions row"
+        if [[ "$dismissal" == Escape ]]; then menu_seek Permissions; key -k Return >/dev/null
+        else permissions_menu_point "$index"; fi
+        permissions_wait ".opened and (.busy == false) and .editable and .title == \"Permissions for $batch_count items\" and (.paths | sort) == $quoted_paths" 'batch card reviews both files with the exact title'
+        permissions_wait 'any(.controls[]; .name == "Cancel" and .focused and .enabled)' 'batch opens with keyboard on Cancel'
+        permissions_wait '[.controls[] | select(.bit != null) | .value] == ["on","on","some","on","off","some","on","off","some"]' 'batch grid shows all uniform and mixed boxes for 0644 and 0755'
+        permissions_wait '.displayedSummary | endswith("Mixed boxes keep each item\u0027s setting unless you change them.")' 'batch displays the exact mixed-box note'
+        permissions_wait 'all(.controls[] | select(.name == "Octal"); .visible == false) and any(.controls[]; .name == "Apply" and .visible and .enabled)' 'batch shows the grid without Octal and offers Apply'
+        if [[ "$dismissal" == Cancel ]]; then shot "permissions-$permissions_group-multiselection"; fi
+        permissions_control "Owner execute"
+        permissions_wait "any(.controls[]; .bit == $mixed_bit and .value == \"on\" and .focused)" 'mixed owner-execute box becomes an explicit set'
+        permissions_control "Everyone read"
+        permissions_wait "any(.controls[]; .bit == $uniform_bit and .value == \"off\" and .focused)" 'uniform everyone-read box becomes an explicit clear'
+        permissions_wait "[.controls[] | select(.value == \"some\") | .bit] == [$untouched_group_bit,$untouched_everyone_bit]" 'untouched group and everyone execute boxes remain mixed'
+        case "$dismissal" in
+            Cancel) permissions_control Cancel ;;
+            Escape) key -k Escape >/dev/null ;;
+            Apply) permissions_control Apply ;;
+        esac
+        permissions_wait '(.opened == false) and .inputReady' "$dismissal returns listing input after the batch dialog"
+        permissions_expect focusView list
+        if [[ "$dismissal" == Apply ]]; then
+            [[ "$(stat -c '%a' "$permissions_listing/notes.md")" == "$notes_applied" \
+                && "$(stat -c '%a' "$permissions_listing/other.txt")" == "$other_applied" ]] \
+                || fail "permissions: batch Apply did not preserve each untouched mixed bit"
+            permissions_checks=$((permissions_checks + 1))
+            printf 'PERMISSIONS_PASS batch filesystem modes notes=%s other=%s\n' "$notes_applied" "$other_applied"
+        else
+            [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")" == "$note_before" \
+                && "$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/other.txt")" == "$other_before" ]] \
+                || fail "permissions: batch $dismissal changed a file"
+            permissions_checks=$((permissions_checks + 1))
+            printf 'PERMISSIONS_PASS batch %s preserves both files\n' "$dismissal"
+        fi
+        permissions_expect selectionCount "$batch_count"
+    done
+
+    # A click made while a re-read is out is refused as Loading, so it is repeated until one lands; a click made before the re-read keeps its mark.
+    for permissions_try in 1 2 3 4 5 6 7 8; do
+        click_row "$first" left
+        sleep 0.5
+        [[ "$(ipc selectionCount)" == 1 ]] && break
+    done
+    permissions_expect selectionCount 1
+    click_row "$(row_index_of link)" left --mods ctrl
+    permissions_expect selectionCount "$batch_count"
     click_row "$first" right
     permissions_expect contextMenuVisible true
-    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == null)' >/dev/null \
-        || fail "permissions: multi-selection does not read red with no sentence"
-    shot "permissions-$permissions_group-multiselection"
-    index=$(menu_row_index Permissions)
-    permissions_point "$(ipc contextMenuRowCentre "$index")"
-    permissions_wait '(.opened == false)' 'multi-selection pointer activation cannot open Permissions'
-    permissions_expect selectionCount 2
+    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' >/dev/null \
+        || fail "permissions: file-plus-symlink selection does not read red with the word symlink"
+    index=$(menu_row_index Permissions) || fail "permissions: no refused batch Permissions row"
+    permissions_menu_point "$index"
+    permissions_wait '(.opened == false)' 'file-plus-symlink pointer activation cannot open Permissions'
+    permissions_expect selectionCount "$batch_count"
     key -k Escape >/dev/null
+    permissions_wait '(.opened == false) and .inputReady' 'listing accepts the single-symlink gesture'
+    click_row "$first" left
+    permissions_expect selectionCount 1
     before=$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")
     click_row "$(row_index_of link)" right
     permissions_expect contextMenuVisible true
-    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == null)' >/dev/null \
-        || fail "permissions: symlink entry does not read red with no sentence"
+    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' >/dev/null \
+        || fail "permissions: symlink entry does not read red with the word symlink"
     shot "permissions-$permissions_group-symlink"
     index=$(menu_row_index Permissions)
-    permissions_point "$(ipc contextMenuRowCentre "$index")"
+    permissions_menu_point "$index"
     permissions_wait '(.opened == false)' 'symlink pointer activation cannot open Permissions'
     [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")" == "$before" ]] || fail "permissions: symlink eligibility changed target"
     key -k Escape >/dev/null
+}
+
+permissions_search() {
+    local first second marks cursor scroll quoted_paths index start=644 applied=744
+    local owner_execute_bit=64 batch_count=2 fixture_rows=6
+    # Sample input: 0100644, a regular file's st_mode; the held row carries the type bits with the permissions.
+    local regular_file=0100000
+    local settled='.searchMode == "results" and .searchQuery == "txt" and (.searchRunning | not)'
+    permissions_guard "$permissions_listing/other.txt"
+    permissions_guard "$permissions_listing/special.txt"
+    chmod "$start" "$permissions_listing/other.txt" "$permissions_listing/special.txt" || fail "permissions: search fixture modes failed"
+    quoted_paths=$(jq -cn --arg first "$permissions_listing/other.txt" --arg second "$permissions_listing/special.txt" '[$first, $second] | sort')
+    permissions_wait '(.opened == false) and .inputReady' 'listing accepts the Search gesture'
+    # Tab flips the scope to the pane's own directory, so the walk never leaves the fixture.
+    key -M ctrl -k f -m ctrl -k Tab txt -k Return >/dev/null || fail "permissions: native Search failed"
+    permissions_wait "$settled" 'Search settles over the fixture directory' keyDeliveryState
+    first=$(row_index_of other.txt)
+    second=$(row_index_of special.txt)
+    permissions_expect visibleRowMode "$((regular_file | 0$start))" "$first"
+    permissions_expect visibleRowMode "$((regular_file | 0$start))" "$second"
+    # A plain click on a result reveals it and leaves the search, so the marks take ctrl.
+    click_row "$first" left --mods ctrl
+    click_row "$second" left --mods ctrl
+    marks=$(printf '%s\n' "$first" "$second" | sort -n | paste -sd, -)
+    permissions_expect selectedIndices "$marks"
+    click_row "$first" right
+    permissions_expect contextMenuVisible true
+    index=$(menu_row_index Permissions) || fail "permissions: no Permissions row on the Search results"
+    permissions_menu_point "$index"
+    permissions_wait ".opened and (.busy == false) and .editable and .title == \"Permissions for $batch_count items\" and (.paths | sort) == $quoted_paths" 'Search results open the batch card with both marked files'
+    cursor=$(ipc cursor)
+    scroll=$(ipc listContentY)
+    permissions_expect selectedIndices "$marks"
+    permissions_control "Owner execute"
+    permissions_wait "any(.controls[]; .bit == $owner_execute_bit and .value == \"on\" and .focused)" 'owner-execute box becomes an explicit set on the Search results'
+    permissions_control Apply
+    permissions_wait '(.opened == false) and .inputReady' 'Apply closes Permissions over the Search results'
+    [[ "$(stat -c '%a' "$permissions_listing/other.txt")" == "$applied" \
+        && "$(stat -c '%a' "$permissions_listing/special.txt")" == "$applied" ]] \
+        || fail "permissions: Search Apply did not set both files to $applied"
+    permissions_checks=$((permissions_checks + 1))
+    printf 'PERMISSIONS_PASS Search filesystem modes other=%s special=%s\n' "$applied" "$applied"
+    # The refresh asks one window of the held rows: the search stays, its marks, cursor and scroll stay.
+    permissions_wait "$settled" 'Apply keeps the completed Search in place' keyDeliveryState
+    permissions_expect selectedIndices "$marks"
+    permissions_expect cursor "$cursor"
+    permissions_expect listContentY "$scroll"
+    # The held rows are read again from disk: a search that kept its old rows would still carry the start mode.
+    permissions_expect visibleRowMode "$((regular_file | 0$applied))" "$first"
+    permissions_expect visibleRowMode "$((regular_file | 0$applied))" "$second"
+    shot "permissions-$permissions_group-search-applied"
+    key -k Escape >/dev/null || fail "permissions: Search dismissal failed"
+    permissions_wait '.searchMode == ""' 'Escape closes the Search after Apply' keyDeliveryState
+    wait_listing "$fixture_rows"
 }
 
 permissions_overlay() {
@@ -609,7 +762,7 @@ PY
         permissions_octal "$wanted"
         permissions_wait '.editable and any(.controls[]; .name == "Apply" and .enabled)' 'owned read-only mount reaches normal Apply'
         permissions_control Apply
-        permissions_wait ".opened and (.busy == false) and .editable and .mode == \"$wanted\" and .displayedError == \"Could not change mode: filesystem is read-only. No change was applied.\"" 'real kernel refusal retains editable fields and reports one sentence'
+        permissions_wait ".opened and (.busy == false) and .editable and .mode == \"$wanted\" and .displayedError == \"Could not change mode: the drive is read-only. No change was applied.\"" 'real kernel refusal retains editable fields and reports one sentence'
         [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$PERMISSIONS_BIND_FILE")" == "$before" \
             && "$(sha256sum < "$PERMISSIONS_BIND_FILE")" == "$contents" ]] || fail "permissions: refused mode write changed the fixture"
         shot "permissions-$permissions_group-erofs-$wanted"
@@ -702,9 +855,9 @@ permissions_backenddeath() {
         permissions_stopped=""
         trap - EXIT
         if [[ "$phase" == applying ]]; then
-            expected='(.displayedError | contains("outcome is unknown") and contains("check the current mode"))'
+            expected='(.displayedError | contains("may not have finished") and contains("reopen Permissions to check"))'
         else
-            expected='(.displayedError | contains("Permissions is unavailable") and contains("restart Flea"))'
+            expected='(.displayedError | contains("Permissions is unavailable") and contains("Restart Flea"))'
         fi
         permissions_wait ".opened and (.busy == false) and (.editable == false) and .mode == \"$wanted\" and $expected" "$phase backend death retains the draft and reports the actual failure"
         permissions_wait 'all(.controls[] | select(.bit != null or .name == "Octal" or .name == "Apply"); .enabled == false)' 'lost descriptor disables every mutation control'
@@ -805,10 +958,11 @@ case_permissions() {
         stale) permissions_stale ;;
         keys) permissions_keys ;;
         eligibility) permissions_eligibility ;;
+        search) permissions_search ;;
         overlay) permissions_overlay ;;
         failure) permissions_failure ;;
         backenddeath) permissions_backenddeath ;;
-        full) permissions_directory; permissions_readonly; permissions_keys; permissions_eligibility; permissions_failure; permissions_backenddeath; permissions_stale; permissions_overlay ;;
+        full) permissions_directory; permissions_readonly; permissions_keys; permissions_eligibility; permissions_search; permissions_failure; permissions_backenddeath; permissions_stale; permissions_overlay ;;
         *) fail "permissions: unknown focused group $permissions_group" ;;
     esac
     printf 'PERMISSIONS_NATIVE group=%s checks=%s root=%s; screenshots require separate inspection.\n' "$permissions_group" "$permissions_checks" "$permissions_box"

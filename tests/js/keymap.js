@@ -1,6 +1,9 @@
 .import "../../ui/js/Keymap.js" as Keymap
+.import "../../ui/js/KeyName.js" as KeyName
 
 function run(check) {
+    // The hints the status strip draws follow the preset, so this suite hands it back as it found it.
+    var startPreset = Keymap.preset
     var none = Qt.NoModifier, ctrl = Qt.ControlModifier, shift = Qt.ShiftModifier
     var alt = Qt.AltModifier, meta = Qt.MetaModifier
     function key(preset, name, text, mods, expected, context, frontend) {
@@ -9,6 +12,16 @@ function run(check) {
     }
     for (var i = 0; i < Keymap.PRESETS.length; i++) {
         var preset = Keymap.PRESETS[i]
+        key(preset, "F", "F", shift, "previewPageForward")
+        key(preset, "B", "B", shift, "previewPageBack")
+        key(preset, "F", "f", none, "search")
+        key(preset, "F", "f", none, "copydirpath", "menu")
+        for (var pc = 0; pc < 3; pc++) {
+            key(preset, "F", "F", shift, "", ["preview", "pdf", "media"][pc])
+            key(preset, "B", "B", shift, "", ["preview", "pdf", "media"][pc])
+        }
+        var previewRows = Keymap.bindingRows(preset, "gui").filter(function (r) { return r.text === "F" || r.text === "B" })
+        check(preset + " claims each preview paging letter once", previewRows.length, 2)
         key(preset, "Down", "", none, "cursorDown")
         key(preset, "Up", "", none, "cursorUp")
         key(preset, "Space", " ", none, "preview")
@@ -16,12 +29,25 @@ function run(check) {
         key(preset, "Space", " ", ctrl, "loadPreview")
         key(preset, "PageDown", "", ctrl, "tabNext")
         key(preset, "PageUp", "", ctrl, "tabPrevious")
+        // Tabs040 callout 1 and Keys040: [ and ] step between tabs beside the drag, free in every preset; mac super chords on the same codes keep their history rows.
+        key(preset, "BraceLeft", "{", shift, "tabMoveLeft")
+        key(preset, "BraceRight", "}", shift, "tabMoveRight")
+        key(preset, "PageDown", "", ctrl | shift, "tabMoveRight")
+        key(preset, "PageUp", "", ctrl | shift, "tabMoveLeft")
+        key(preset, "BracketLeft", "[", none, "tabPrevious")
+        key(preset, "BracketRight", "]", none, "tabNext")
+        // ClickAndRefresh: F5 and Ctrl+R re-list the folder.
+        key(preset, "F5", "", none, "reload")
+        key(preset, "R", "", ctrl, "reload")
         key(preset, "Tab", "", ctrl, "focusPreview")
         key(preset, "Tab", "", none, "focusNext")
         // #182: Shift+Delete deletes permanently in every preset, not only Mac and Windows; plain Delete still trashes.
         key(preset, "Delete", "", shift, "deletePermanently")
         key(preset, "Delete", "", none, "trash")
         key(preset, "W", "", ctrl, "tabClose")
+        // nt1: Ctrl+Return opens the cursor folder in a new tab, free in every preset.
+        key(preset, "Return", "", ctrl, "openTab")
+        key(preset, "Enter", "", ctrl, "openTab")
         key(preset, "S", "s", none, "sortNext")
         key(preset, "S", "S", shift, "sortReverse")
         key(preset, "Slash", "/", none, "filter")
@@ -31,12 +57,22 @@ function run(check) {
         key(preset, "Insert", "", ctrl, "", "listing", "gui")
         key(preset, "1", "1", none, "tab1", "listing", "tui")
         key(preset, "9", "9", none, "tab9", "listing", "tui")
-        key(preset, "1", "1", none, "", "listing", "gui")
+        key(preset, "1", "1", none, "tab1", "listing", "gui")
+        key(preset, "9", "9", none, "tab9", "listing", "gui")
+        // Bare digits name tabs in the listing, tags in the open Tags list, and nothing typed into a field.
+        key(preset, "1", "1", none, "tag1", "menu", "gui")
+        key(preset, "7", "7", none, "tag7", "menu", "gui")
+        key(preset, "1", "1", none, "tab1", "rail", "gui")
+        for (var t = 0; t < 5; t++) key(preset, "1", "1", none, "", ["editor", "panel", "preview", "pdf", "media"][t], "gui")
         key(preset, "N", "", preset === "mac" ? meta : ctrl, "windowNew")
         key(preset, "N", "", preset === "mac" ? meta : ctrl, "", "listing", "tui")
         key(preset, "1", "", preset === "windows" ? ctrl | shift : ctrl, "viewList")
         key(preset, "2", "", preset === "windows" ? ctrl | shift : ctrl, "viewColumns")
         key(preset, "3", "", preset === "windows" ? ctrl | shift : ctrl, "viewGrid")
+        // KEYS-03: the Dual view has its own chord beside the three, and Shift+Tab walks the ring back from the listing.
+        key(preset, "4", "", preset === "windows" ? ctrl | shift : ctrl, "viewDual")
+        key(preset, "Tab", "", shift, "focusPrevious")
+        key(preset, "Backtab", "", shift, "focusPrevious")
         key(preset, "Comma", "", ctrl, "settings")
         for (var f = 0; f < 2; f++) {
             var frontend = ["gui", "tui"][f]
@@ -110,6 +146,7 @@ function run(check) {
     key("mac", "D", "", meta, "duplicate")
     key("mac", "Z", "", meta, "undo")
     key("mac", "Z", "", meta | shift, "redo")
+    key("default", "Z", "", ctrl | shift, "redo")
     key("mac", "A", "", meta, "selectAll")
     key("mac", "I", "", meta, "properties")
     key("mac", "BracketLeft", "", meta, "historyBack")
@@ -149,6 +186,24 @@ function run(check) {
         return row.action === "trash"
     })[0].keys.split(" / ").indexOf("d"), -1)
     check("menu-only actions invent no shortcut", Keymap.hintFor("emptyTrash"), "")
+    // MenuAdditions040: c opens Copy as, P opens Paste as, V flips the selection, Ctrl+Shift+C copies paths, free in all four presets; each leaf answers its own letter.
+    for (var k = 0; k < Keymap.PRESETS.length; k++) {
+        var preset = Keymap.PRESETS[k]
+        key(preset, "C", "c", none, "copyAs")
+        key(preset, "P", "P", shift, "pasteAs")
+        key(preset, "V", "V", shift, "invertSelection")
+        key(preset, "C", "", ctrl | shift, "copyPath")
+        key(preset, "P", "p", none, "copyPath", "menu")
+        key(preset, "N", "n", none, "copyName", "menu")
+        key(preset, "E", "e", none, "copyStem", "menu")
+        key(preset, "F", "f", none, "copydirpath", "menu")
+        key(preset, "U", "u", none, "copyUri", "menu")
+        key(preset, "S", "s", none, "copyQuoted", "menu")
+        key(preset, "L", "L", shift, "pasteLink", "menu")
+        key(preset, "A", "a", none, "pasteAbsoluteLink", "menu")
+        key(preset, "H", "H", shift, "pasteHardLink", "menu")
+    }
+    check("Copy as hints its opener", Keymap.hintFor("copyAs"), "c")
     check("a shift chord fills an action no plain key names", Keymap.hintFor("deletePermanently"), "shift-delete")
     // A preset shift row for an action the table binds plain: the plain key must speak for it, since a shift chord only fills what no text or plain row names.
     var keepRows = Keymap.bindingRows
@@ -189,6 +244,10 @@ function run(check) {
     check("one-action hints match the whole table on every preset", hintMismatches.join(" "), "")
     Keymap.setPreset("vim")
     check("sheet is populated from effective current bindings", Keymap.sheetFor(Keymap.preset, "gui").length > 30, true)
+    var tabRow = Keymap.sheetFor("default", "gui").filter(function (row) { return row.action === "focusNext" })[0]
+    check("the sheet reads Tab as scope / focus, with no pane-only wording", tabRow.keys + "|" + tabRow.label, "tab|scope / focus")
+    var backRow = Keymap.sheetFor("default", "gui").filter(function (row) { return row.action === "focusPrevious" })[0]
+    check("and Shift+Tab as focus back, in the Move group", backRow.label + "|" + (Keymap.SHEET_GROUPS.move.indexOf("focusPrevious") >= 0), "focus back|true")
     // One cap names one key. Joining every spelling an action answers to produced caps of 40
     // characters on Default and 78 on Mac, wider than the card, and they drew over the next column.
     var widestCap = 0, identifierLabel = ""
@@ -215,6 +274,19 @@ function run(check) {
     check("while m still opens the menu in the listing and mutes in a media preview", menuStillM, true)
     check("the sheet group that claims it is Look", Keymap.SHEET_GROUPS.look.indexOf("mute") >= 0, true)
 
+    // CommandPalette "At rest": the tab rows read the chord alone, whichever the preset, while [ and ] stay bound and hinted.
+    var tabCaps = []
+    for (var tp = 0; tp < Keymap.PRESETS.length; tp++) {
+        var tabSheet = Keymap.sheetFor(Keymap.PRESETS[tp], "gui")
+        var tabNext = tabSheet.filter(function (row) { return row.action === "tabNext" })[0]
+        var tabPrevious = tabSheet.filter(function (row) { return row.action === "tabPrevious" })[0]
+        tabCaps.push(Keymap.PRESETS[tp] + ":" + (tabNext ? tabNext.keys : "none") + ";" + (tabPrevious ? tabPrevious.keys : "none"))
+    }
+    check("next tab and prev tab read as the board draws them on every preset", tabCaps.join(" "),
+          Keymap.PRESETS.map(function (name) { return name + ":ctrl-pagedown;ctrl-pageup" }).join(" "))
+    check("] still steps to the next tab", Keymap.lookupFor("default", 0, "]", 0, "listing", "gui"), "tabNext")
+    check("[ still steps to the previous tab", Keymap.lookupFor("default", 0, "[", 0, "listing", "gui"), "tabPrevious")
+    check("and the menu hint for next tab stays ]", Keymap.hintFor("tabNext"), "]")
     check("no cap in any preset outgrows its half of the card", widestCap <= 18, true)
     check("no row prints an action id where its wording belongs", identifierLabel, "")
     check("pointer contract remains populated", Keymap.POINTER.length > 10, true)
@@ -223,4 +295,72 @@ function run(check) {
     check("every effective Mac binding resolves to advertised action", effective.every(function (r) {
         return Keymap.lookupFor("mac", r.keycode, r.text, r.mask, "listing", "gui") === r.action
     }), true)
+    // ListColumns040's F4: the key resolves in every preset, and its keys token is lowercase like every other.
+    var f4ok = true
+    for (var f = 0; f < Keymap.PRESETS.length; f++) {
+        if (Keymap.lookupFor(Keymap.PRESETS[f], Qt.Key_F4, "", none, "listing", "gui") !== "autofitColumns")
+            f4ok = false
+    }
+    check("F4 fits columns in every preset", f4ok, true)
+    var f4row = Keymap.PRESET_KEYS.filter(function (r) { return r.action === "autofitColumns" })[0] || {}
+    check("and its keys token is lowercase like every other", f4row.keys, "f4")
+    // nt1: the sheet lists the new tab key beside the other tab keys, with the same label style.
+    check("openTab is claimed by the move group", Keymap.SHEET_GROUPS.move.indexOf("openTab") >= 0, true)
+    var openTabSheet = Keymap.sheetFor("default", "gui").filter(function (row) { return row.action === "openTab" })[0] || {}
+    check("and the sheet draws it as open in new tab", openTabSheet.label, "open in new tab")
+    check("and the sheet caps it as the ctrl enter chord", openTabSheet.keys, "ctrl-enter")
+
+    // A mirrored pair draws the same number of spellings: width alone gave next tab "]" beside prev tab "[ / ctrl-pageup".
+    function spellings(sheet, action) {
+        var row = sheet.filter(function (r) { return r.action === action })[0]
+        return row ? row.keys.split(" / ").length : 0
+    }
+    var named = [["tabNext", "tabPrevious"], ["pageDown", "pageUp"]]
+    var pairs = named.concat((Keymap.SHEET_MIRRORS || []).filter(function (pair) {
+        return !named.some(function (known) { return known.join() === pair.join() })
+    }))
+    var lopsided = []
+    for (var mp = 0; mp < Keymap.PRESETS.length; mp++) {
+        for (var mf = 0; mf < 2; mf++) {
+            var pairSheet = Keymap.sheetFor(Keymap.PRESETS[mp], ["gui", "tui"][mf])
+            for (var pi = 0; pi < pairs.length; pi++)
+                if (spellings(pairSheet, pairs[pi][0]) !== spellings(pairSheet, pairs[pi][1]))
+                    lopsided.push(Keymap.PRESETS[mp] + ":" + ["gui", "tui"][mf] + ":" + pairs[pi].join("/"))
+        }
+    }
+    check("no mirrored pair of the generated sheet is lopsided in any preset or frontend", lopsided.join(" "), "")
+    var tabsDefault = Keymap.sheetFor("default", "gui")
+    check("next and prev tab draw one spelling each on Default",
+          tabsDefault.filter(function (r) { return r.action === "tabNext" })[0].keys + "|"
+          + tabsDefault.filter(function (r) { return r.action === "tabPrevious" })[0].keys, "ctrl-pagedown|ctrl-pageup")
+    check("the generator names the pairs it evens", (Keymap.SHEET_MIRRORS || []).length > 0, true)
+    // KeyName asks for one action's own rows with no modifier kind, as the UI does, yet names the row the whole table lists first.
+    function firstRow(rows, action) { return rows.filter(function (r) { return r.action === action })[0] }
+    var drawn = ["newFolder", "textSizeUp", "textSizeDown", "textSizeReset", "trash", "loadPreview", "keymapSheet", "filter"]
+    var drifted = []
+    try {
+        for (var kp = 0; kp < Keymap.PRESETS.length; kp++) {
+            Keymap.setPreset(Keymap.PRESETS[kp])
+            var whole = Keymap.bindingRows(Keymap.PRESETS[kp], "gui")
+            for (var ka = 0; ka < drawn.length; ka++) {
+                var first = firstRow(whole, drawn[ka])
+                var plain = Keymap.hintFor(drawn[ka])
+                var want = plain.length > 0 ? plain : first ? KeyName.spelled(first.keys) : ""
+                var row = KeyName.rowFor(drawn[ka])
+                if (KeyName.keyFor(drawn[ka]) !== want || (row ? row.keys : "") !== (first ? first.keys : ""))
+                    drifted.push(Keymap.PRESETS[kp] + ":" + drawn[ka])
+            }
+        }
+    } finally {
+        Keymap.setPreset(startPreset)
+    }
+    check("KeyName names the whole table's first row for each action it draws in every preset", drifted.join(" "), "")
+    check("and a chord-only action is named", KeyName.keyFor("newFolder").length > 0, true)
+    // A key keys.toml names as a mark is spelled as that mark, and underscore is not minus.
+    check("underscore, minus and plus are three marks", ["ctrl-shift-underscore", "ctrl-shift-minus", "ctrl-shift-plus"].map(KeyName.spelled).join("|"),
+          "Ctrl+Shift+_|Ctrl+Shift+-|Ctrl+Shift++")
+    Keymap.setPreset("default")
+    check("a sentence with several keys names them all", KeyName.hintedAll("%1 and %2 step", ["textSizeUp", "textSizeDown"]), "Ctrl+Shift++ and Ctrl+Shift+- step")
+    check("and is empty when the preset binds none of one of them", KeyName.hintedAll("%1 and %2 step", ["textSizeUp", "noSuchAction"]), "")
+    Keymap.setPreset(startPreset)
 }

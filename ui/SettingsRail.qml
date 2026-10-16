@@ -12,7 +12,7 @@ Flickable {
     property string section: ""
     // True while Tab has given the panel's cursor to the rail, which is what lights the row.
     property bool focused: false
-    readonly property real focusOpacity: 0.08
+    readonly property real focusOpacity: Theme.washHover
     implicitHeight: railColumn.implicitHeight
     contentHeight: railColumn.implicitHeight
     contentWidth: width
@@ -36,12 +36,7 @@ Flickable {
         parent: root
         flickable: root
     }
-
-    Flea.ViewportScrollBar {
-        parent: root
-        anchors { top: parent.top; right: parent.right }
-        flickable: root
-    }
+    // No bar and no lane: rows fill the rail and still scroll by wheel, touchpad and keys.
 
     signal chosen(string id)
 
@@ -102,7 +97,7 @@ Flickable {
                     height: Theme.railIconSize
                     maxSize: Theme.railIconSize
                     name: railRow.modelData.glyph
-                    color: railRow.current ? Theme.color.accent : Theme.color.muted
+                    color: railRow.current ? Theme.color.accent : Theme.color.mutedFrame
                 }
 
                 Text {

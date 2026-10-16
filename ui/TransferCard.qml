@@ -101,7 +101,7 @@ Item {
         anchors.fill: parent
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         // Mirrors hyprland decoration:rounding, the same as the menu and the convert popup; 0 on a
         // stock box, and the bar inside stays square either way.
         radius: Style.cornerRadius
@@ -126,7 +126,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Theme.chromeMarkSize
                 height: Theme.chromeMarkSize
-                color: Theme.color.muted
+                color: Theme.color.mutedFrame
             }
 
             Text {
@@ -164,18 +164,19 @@ Item {
 
             Rectangle {
                 anchors.fill: parent
-                color: Theme.color.muted
+                color: Theme.color.mutedFrame
                 opacity: root.trackOpacity
             }
 
             Rectangle {
                 width: parent.width * Transfer.fraction(root.shown)
                 height: parent.height
-                color: Theme.color.accent
+                color: Theme.color.accentFrame
 
                 // The card publishes four times a second; easing across the gap is what makes the
                 // fill read as movement rather than as four steps a second.
                 Behavior on width {
+                    enabled: !Theme.reducedMotion
                     NumberAnimation { duration: root.publishMs; easing.type: Easing.Linear }
                 }
             }
@@ -208,55 +209,17 @@ Item {
 
         Item {
             width: parent.width
-            height: cancelButton.height
+            height: cancelButton.implicitHeight
 
-            // The frame and paddings of ui/DialogButton.qml, which cannot carry the artifact's own
-            // x mark; a dingbat is not a mark in this language, so the mark is drawn as a glyph.
-            Rectangle {
+            // Variant A: the card's Cancel is the one control every dialog draws.
+            Flea.DialogButton {
                 id: cancelButton
-                visible: !root.cancelling
-                enabled: visible && Transfer.cancelEnabled(root.shown)
-                opacity: Transfer.cancelEnabled(root.shown) ? 1 : 0.55
-                Accessible.role: Accessible.Button
-                Accessible.name: "Cancel transfer"
-                Accessible.onPressAction: root.cancel()
                 anchors.right: parent.right
-                width: 2 * Theme.spacing.gap + mark.width + Theme.spacing.gap + label.implicitWidth
-                height: label.implicitHeight + Theme.spacing.gap + 2 * Theme.spacing.hairline
-                color: "transparent"
-                border.width: Theme.spacing.hairline
-                border.color: Theme.color.muted
-
-                Flea.Glyph {
-                    id: mark
-                    anchors.left: parent.left
-                    anchors.leftMargin: Theme.spacing.gap
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Theme.font.caption
-                    height: Theme.font.caption
-                    name: "x"
-                    color: Theme.color.muted
-                }
-
-                Text {
-                    id: label
-                    anchors.left: mark.right
-                    anchors.leftMargin: Theme.spacing.gap
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Cancel"
-                    color: Theme.color.muted
-                    font.family: Theme.font.family
-                    font.pixelSize: Theme.font.body
-                    textFormat: Text.PlainText
-                }
-
-                HoverHandler { cursorShape: Qt.PointingHandCursor }
-
-                TapHandler {
-                    acceptedButtons: Qt.LeftButton
-                    gesturePolicy: TapHandler.ReleaseWithinBounds
-                    onTapped: root.cancel()
-                }
+                visible: !root.cancelling
+                label: "Cancel"
+                available: Transfer.cancelEnabled(root.shown)
+                enabled: available
+                onActivated: root.cancel()
             }
 
             // The cancel is in and the item in flight is being finished rather than torn in half,

@@ -12,6 +12,8 @@ Flickable {
     property var values: ({})
     property int cursor: 0
     property string side: "pane"
+    // The idle walk that builds the sections nobody has shown yet.
+    readonly property alias walk: idleBuild
     readonly property real compactHeight: sections.count > 0 && sections.itemAt(0) ? sections.itemAt(0).implicitHeight : 0
 
     signal activated(int index)
@@ -52,12 +54,14 @@ Flickable {
         parent: root
         flickable: root
     }
+    // No bar and no lane: rows fill the pane and still scroll by wheel, touchpad and keys.
 
     // SettingsMenus rule 4: a section taller than the viewport fades at its lower edge instead of
     // slicing a row, so the cut says that more follows. parent: root keeps it off the content item,
     // which is what scrolls; a fully transparent stop is written in the ground's own channels,
     // because "transparent" is black at zero alpha and ramps through grey on the way there.
     Rectangle {
+        id: tailFade
         parent: root
         anchors.left: parent.left
         anchors.right: parent.right
@@ -70,14 +74,25 @@ Flickable {
         }
     }
 
-    Flea.ViewportScrollBar {
-        parent: root
-        anchors { top: parent.top; right: parent.right }
-        flickable: root
-    }
+    // How much of the fade's height the next row's first ink is drawn under, in the revealed state.
+    readonly property real cutShare: 0.5
 
     // The row item at an index of the chosen section, or null before the columns exist.
     function rowItem(index) { return root.current ? root.current.rows.itemAt(index) : null }
+
+    // The viewport bottom that clears the fade under the cursor row and still shows a cut of the row after it, so the fade reads as more following and not as padding.
+    function revealedBottom(index, item) {
+        var bottom = item.y + item.height + tailFade.height
+        var next = root.rowItem(index + 1)
+        return next ? Math.max(bottom, next.y + root.inkTop(next) + Math.round(tailFade.height * root.cutShare)) : bottom
+    }
+
+    // Where a row's first ink starts: a heading's label sits under its rule and padding, any other row's content under the row's own padding.
+    function inkTop(row) {
+        for (var i = 0; row.isGroup && i < row.children.length; i++)
+            if (row.children[i].inkTop !== undefined) return row.children[i].inkTop
+        return Theme.spacing.rowPaddingY
+    }
 
     // The Column inside the Flickable holds rows of two different heights, so the visible window is
     // moved onto the row itself rather than derived from an index times a row height.
@@ -94,10 +109,32 @@ Flickable {
             root.contentY = Math.max(0, Math.min(root.contentHeight - root.height, item.y))
             return
         }
-        if (item.y < root.contentY)
+        // The lower-edge fade must lie over a cut: scroll while the cursor row, or the cut after it, is not clear of it, and stop at the content's end where none is drawn.
+        if (item.y < root.contentY) {
             root.contentY = item.y
-        else if (item.y + item.height > root.contentY + root.height)
-            root.contentY = item.y + item.height - root.height
+            return
+        }
+        var bottom = root.revealedBottom(index, item)
+        if (bottom > root.contentY + root.height)
+            root.contentY = Math.max(0, Math.min(root.contentHeight - root.height, bottom - root.height))
+    }
+
+    // The first open builds View and the open section only; from the pane's creation this walk builds one more section per 150 ms tick, and a section shown sooner builds when shown.
+    Timer {
+        id: idleBuild
+        interval: 150
+        repeat: true
+        running: true
+        property int next: 1
+        onTriggered: {
+            while (idleBuild.next < sections.count && sections.itemAt(idleBuild.next).built)
+                idleBuild.next++
+            if (idleBuild.next >= sections.count) {
+                idleBuild.stop()
+                return
+            }
+            sections.itemAt(idleBuild.next).built = true
+        }
     }
 
     Repeater {
@@ -108,13 +145,18 @@ Flickable {
         delegate: Column {
             id: column
             required property var modelData
+            required property int index
             readonly property alias rows: rowItems
+            // View always, because compactHeight reads it; a built section is never torn down.
+            property bool built: false
             width: root.width
             visible: modelData.id === root.section
+            onVisibleChanged: if (visible) built = true
+            Component.onCompleted: if (visible || index === 0) built = true
 
             Repeater {
                 id: rowItems
-                model: Settings.rows(column.modelData.id, root.values)
+                model: column.built ? Settings.rows(column.modelData.id, root.values) : []
 
                 delegate: Flea.SettingsRow {
                     required property var modelData

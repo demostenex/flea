@@ -2,6 +2,7 @@
 
 .import "Eject.js" as Eject
 .import "Mounts.js" as Mounts
+.import "Nav.js" as Nav
 
 // What the rail does with a key, split out of Focus.js at its 300-line hard cap the same way
 // ui/js/PreviewKeys.js was: Focus.js decides which surface owns a key, and this is the surface.
@@ -16,7 +17,7 @@ function landed(root, sidebar) {
 // A Sidebar open (opened or networkOpened): the pane that asked opens it, and a waiting claim lands; no pane spends the claim.
 function openFrom(pane, path, sidebar) {
     if (!pane) { if (sidebar) sidebar.focusOnOpen = false; return }
-    pane.open(path)
+    Nav.openPlace(pane, path)
     if (sidebar) landed(pane, sidebar)
 }
 
@@ -25,10 +26,36 @@ function messaged(sidebar, isError) {
     if (isError && sidebar) sidebar.focusOnOpen = false
 }
 
-// The rail answers ten of the key table's action names and ignores the rest while it has focus.
-function act(action, root, sidebar) {
-    // Any other rail key ends a mount-first open's claim on the focus.
+// The keyboard cursor takes the rail's highlight only while the keyboard holds it, never under an open rail menu or after a pointer press until a rail key.
+function cursorDrawn(focused, menuOpen, pointerFocus) {
+    return Boolean(focused && !menuOpen && !pointerFocus)
+}
+
+// Right Arrow from a row whose mark releases moves the keyboard onto that mark, read raw because the table resolves Right to opening the row in every preset.
+function markKey(event, root, sidebar) {
+    if (event && (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) !== 0) return false
+    var key = event ? event.key : 0
+    if (!sidebar.markFocused) {
+        if (key !== Qt.Key_Right || !Eject.releasable(sidebar.entries[sidebar.cursorIndex])) return false
+        sidebar.markFocused = true
+        return true
+    }
+    if (key === Qt.Key_Left || key === Qt.Key_Escape) sidebar.markFocused = false
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter || key === Qt.Key_Space) {
+        sidebar.markFocused = false
+        Eject.release(root, sidebar, true)
+    } else if (key !== Qt.Key_Right) return false
+    return true
+}
+
+// The rail answers ten of the key table's action names and ignores the rest while it has focus; event is the key itself, for the ones the table does not name.
+function act(action, root, sidebar, event) {
+    // Any other rail key ends a mount-first open's claim on focus and restores the keyboard highlight a pointer press hid.
     sidebar.focusOnOpen = false
+    sidebar.pointerFocus = false
+    if (markKey(event, root, sidebar)) return
+    // A cursor key leaves the mark for the rows, even on the first or last row where the cursor stays.
+    if (action.indexOf("cursor") === 0) sidebar.markFocused = false
     switch (action) {
     case "cursorDown": sidebar.cursorIndex = Math.min(sidebar.entries.length - 1, sidebar.cursorIndex + 1); return
     case "cursorUp": sidebar.cursorIndex = Math.max(0, sidebar.cursorIndex - 1); return

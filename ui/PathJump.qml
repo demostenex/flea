@@ -67,7 +67,8 @@ Item {
     }
 
     // ui/WindowBody.qml carries these to the pane's backend and back, the way it carries the bar's Tab.
-    signal requested(int id, var favourites, var recent)
+    // ranking is the provisional ask this whole ask follows, or 0: the backend answers it from that ask's zoxide run.
+    signal requested(int id, int ranking, var favourites, var recent)
     signal chosen(string path)
     // Enter that the dropdown did not take after all: nothing matched, so the bar resolves the line as a path.
     signal declined()
@@ -119,10 +120,10 @@ Item {
         }
         if (root.historyKept && root.historyReadAt === root.historyChanges) {
             root.wholeAsked = true
-            root.ask()
+            root.ask(0)
         } else {
             root.provisionalId = root.asked
-            root.ask()
+            root.ask(0)
             root.readHistory()
         }
     }
@@ -138,8 +139,8 @@ Item {
     // How many times the history has been parsed; tests/jump-ui.sh reads it.
     property int historyReads: 0
 
-    function ask() {
-        root.requested(root.asked, root.favouritePaths(), root.recentPaths)
+    function ask(ranking) {
+        root.requested(root.asked, ranking, root.favouritePaths(), root.recentPaths)
     }
 
     function askWhole() {
@@ -154,7 +155,7 @@ Item {
         }
         root.wholeAsked = true
         root.asked += 1
-        root.ask()
+        root.ask(root.provisionalId)
     }
 
     // The watch starts before the read, so a change landing while it runs is counted and read next time.
@@ -303,12 +304,14 @@ Item {
             height: Math.max(0, Math.min(rows.implicitHeight + 2 * Theme.spacing.rowPaddingY, root.room))
             color: Theme.color.surface
             border.width: Theme.spacing.hairline
-            border.color: Theme.color.muted
+            border.color: Theme.color.mutedFrame
             radius: Style.cornerRadius
 
             function reveal(index) { scroll.reveal(rowItems.itemAt(index)) }
             // For tests/jump-ui.sh: how many delegates stand, and the one at an index.
             readonly property int liveCount: rowItems.count
+            // For the picker's path shots: how far the rows have scrolled.
+            readonly property real scrollY: scroll.contentY
             function liveAt(index) { return rowItems.itemAt(index) }
             Component.onCompleted: reveal(root.cursor)
 
@@ -329,6 +332,10 @@ Item {
 
             Flea.CardScroll {
                 id: scroll
+                // The dropdown steps the highlight like a menu: one row a notch, one row per
+                // row height of gained touchpad travel. The cursor's reveal() follows.
+                highlightSteps: true
+                stepBy: function (delta) { root.cursor = Jump.step(root.entries, root.cursor, delta) }
                 anchors.fill: parent
                 anchors.topMargin: Theme.spacing.rowPaddingY
                 anchors.bottomMargin: Theme.spacing.rowPaddingY

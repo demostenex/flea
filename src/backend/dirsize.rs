@@ -1,4 +1,6 @@
+use crate::backend::extclass::refuses_folder_sizes;
 use crate::backend::listing::Listing;
+use crate::backend::meta::Stat;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,6 +44,14 @@ pub fn walk_all(base: &Path, l: &Listing, deadline: Instant) -> Vec<Option<DirSi
     out
 }
 
+// On a share or a phone a size sort walks nothing: each folder keeps its entry size, partial, as an expired walk answers.
+pub fn sort_walk(base: &Path, class: &str, l: &Listing, stats: &[Stat], deadline: Instant) -> Vec<Option<DirSize>> {
+    if !refuses_folder_sizes(class) {
+        return walk_all(base, l, deadline);
+    }
+    (0..l.len()).map(|i| l.is_dir(i).then(|| DirSize { bytes: stats[i].size, partial: true })).collect()
+}
+
 // walk_until is the testable core: a test passes an already-past deadline to force partial without waiting 2000 ms.
 pub fn walk(path: &Path) -> DirSize {
     walk_until(path, Instant::now() + Duration::from_millis(DEADLINE_MS))
@@ -60,49 +70,117 @@ pub fn walk_cancellable(path: &Path, deadline: Instant, cancelled: &impl Fn() ->
 // two seconds; the transfer needs the whole total, however long the tree takes, or it draws no
 // estimate at all, so the stop it is given is its own cancel rather than a deadline.
 pub fn walk_while(path: &Path, stop: &dyn Fn() -> bool) -> DirSize {
-    let mut bytes = 0u64;
-    let mut partial = false;
-    // The target's own directory entry counts too, matching what `du -s` reports for the directory itself.
-    match path.symlink_metadata() {
-        Ok(meta) => bytes += meta.size(),
-        Err(_) => partial = true,
+    walk_while_with(path, stop, None)
+}
+
+// What a walk has counted so far: bytes include the start's own entry, items are the entries below it.
+#[derive(Clone, Copy, Debug)]
+pub struct Tally {
+    pub bytes: u64,
+    pub items: u64,
+    pub partial: bool,
+}
+
+// The running tally goes to `report` at most once per `every`, never per entry; `entering` hears each folder before its listing.
+pub struct Progress<'a> {
+    pub every: Duration,
+    pub report: &'a mut dyn FnMut(&Tally),
+    pub entering: Option<&'a dyn Fn(&Path)>,
+}
+
+// The properties card counts a folder's contents with the same walk, answering to its own stop and progress.
+pub fn walk_counted<'a>(path: &Path, stop: &'a dyn Fn() -> bool, progress: Option<Progress<'a>>) -> Tally {
+    walk_core(path, stop, None, progress)
+}
+
+// One lookup override for tests; None takes the entry's own device, so production pays no indirection.
+pub(super) type DevLookup<'a> = Option<&'a dyn Fn(&Path) -> Option<u64>>;
+
+struct Walk<'a> {
+    tally: Tally,
+    stop: &'a dyn Fn() -> bool,
+    start_dev: Option<u64>,
+    dev_of: DevLookup<'a>,
+    progress: Option<Progress<'a>>,
+    reported: Instant,
+}
+
+impl Walk<'_> {
+    // Bytes and items move together, so Size and Contains always describe the same entries.
+    fn count(&mut self, size: u64) {
+        self.tally.bytes += size;
+        self.tally.items += 1;
+        if let Some(p) = self.progress.as_mut() {
+            if self.reported.elapsed() >= p.every {
+                (p.report)(&self.tally);
+                self.reported = Instant::now();
+            }
+        }
     }
-    walk_into(path, stop, &mut bytes, &mut partial);
-    DirSize { bytes, partial }
+}
+
+// Sample input: dev_of answering another device for "other" keeps its bytes out of the total.
+fn walk_while_with(path: &Path, stop: &dyn Fn() -> bool, dev_of: DevLookup<'_>) -> DirSize {
+    let t = walk_core(path, stop, dev_of, None);
+    DirSize { bytes: t.bytes, partial: t.partial }
+}
+
+pub(super) fn walk_core<'a>(path: &Path, stop: &'a dyn Fn() -> bool, dev_of: DevLookup<'a>, progress: Option<Progress<'a>>) -> Tally {
+    // The walk never crosses into a nested mount, matching du -x; the mountpoint entry itself counts.
+    // The target's own directory entry counts too, matching what `du -s` reports for the directory itself.
+    let start = path.symlink_metadata();
+    let start_dev = start.as_ref().map(|m| m.dev()).ok();
+    let mut tally = Tally { bytes: 0, items: 0, partial: false };
+    match start {
+        Ok(meta) => tally.bytes += meta.size(),
+        Err(_) => tally.partial = true,
+    }
+    let mut walk = Walk { tally, stop, start_dev, dev_of, progress, reported: Instant::now() };
+    walk_into(path, &mut walk);
+    walk.tally
+}
+
+// Stays on the starting device, so Home Size never walks a nested mount; None disables the guard.
+fn same_device(start: Option<u64>, child: u64) -> bool {
+    match start {
+        None => true,
+        Some(d) => d == child,
+    }
 }
 
 // Recursion, not a stack, and each listing is closed before its folders are walked, so depth costs no descriptors.
-fn walk_into(path: &Path, stop: &dyn Fn() -> bool, bytes: &mut u64, partial: &mut bool) {
+fn walk_into(path: &Path, walk: &mut Walk<'_>) {
     let mut folders = Vec::new();
-    list_into(path, stop, bytes, partial, &mut folders);
+    list_into(path, walk, &mut folders);
     for folder in folders {
-        walk_into(&folder, stop, bytes, partial);
+        walk_into(&folder, walk);
     }
 }
 
 // Counts one directory's entries and hands back the folders among them, still unwalked.
-fn list_into(path: &Path, stop: &dyn Fn() -> bool, bytes: &mut u64, partial: &mut bool, folders: &mut Vec<PathBuf>) {
-    if stop() {
-        *partial = true;
+fn list_into(path: &Path, walk: &mut Walk<'_>, folders: &mut Vec<PathBuf>) {
+    if let Some(entering) = walk.progress.as_ref().and_then(|p| p.entering) { entering(path); }
+    if (walk.stop)() {
+        walk.tally.partial = true;
         return;
     }
     let entries = match std::fs::read_dir(path) {
         Ok(rd) => rd,
         // Permission denied or vanished mid-walk: what was already counted stays, marked partial.
         Err(_) => {
-            *partial = true;
+            walk.tally.partial = true;
             return;
         }
     };
     for entry in entries {
-        if stop() {
-            *partial = true;
+        if (walk.stop)() {
+            walk.tally.partial = true;
             return;
         }
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
-                *partial = true;
+                walk.tally.partial = true;
                 continue;
             }
         };
@@ -110,28 +188,42 @@ fn list_into(path: &Path, stop: &dyn Fn() -> bool, bytes: &mut u64, partial: &mu
         let file_type = match entry.file_type() {
             Ok(t) => t,
             Err(_) => {
-                *partial = true;
+                walk.tally.partial = true;
                 continue;
             }
         };
         if file_type.is_symlink() {
             // Not followed, matching du's default; DirEntry::metadata is lstat, so only the link's own small size counts.
             if let Ok(meta) = entry.metadata() {
-                *bytes += meta.size();
+                walk.count(meta.size());
             } else {
-                *partial = true;
+                walk.tally.partial = true;
             }
             continue;
         }
-        let meta = match entry.metadata() {
+        // A known mount point on another device is entered first, so a hang in the stat that crosses into it is charged to that mount.
+        let known_dev = if file_type.is_dir() { walk.dev_of.and_then(|f| f(&entry.path())) } else { None };
+        let crossing = known_dev.is_some_and(|dev| !same_device(walk.start_dev, dev));
+        let entering = walk.progress.as_ref().and_then(|p| p.entering).filter(|_| crossing);
+        if let Some(entering) = entering {
+            entering(&entry.path());
+        }
+        let stat = entry.metadata();
+        // The crossing stat has returned, so the folder being listed owns the next entry again.
+        if let Some(entering) = entering {
+            entering(path);
+        }
+        let meta = match stat {
             Ok(m) => m,
             Err(_) => {
-                *partial = true;
+                walk.tally.partial = true;
                 continue;
             }
         };
-        *bytes += meta.size();
-        if file_type.is_dir() {
+        walk.count(meta.size());
+        // Sample mount: start_dev 2049 with child 62 never descends, so du -x holds across mounts.
+        let child_dev = known_dev.unwrap_or_else(|| meta.dev());
+        if file_type.is_dir() && same_device(walk.start_dev, child_dev) {
             folders.push(entry.path());
         }
     }
@@ -284,6 +376,41 @@ mod tests {
         let expected_min = fs::symlink_metadata(&d).unwrap().size()
             + fs::symlink_metadata(d.join("visible.txt")).unwrap().size();
         assert!(result.bytes >= expected_min, "what the walk could see must still be counted");
+    }
+
+    #[test]
+    fn a_walk_never_descends_off_its_starting_device() {
+        assert!(same_device(Some(2049), 2049), "the starting device itself descends");
+        assert!(!same_device(Some(2049), 62), "a nested tmpfs mount never descends");
+        assert!(same_device(None, 62), "an unknown start walks as before");
+    }
+
+    #[test]
+    fn a_walk_applies_its_device_gate_to_every_folder_it_lists() {
+        // Sample input: dev_of answers another device for "other", so its payload stays uncounted.
+        let (_sandbox, d) = fixture("dirsize-device-gate");
+        fs::create_dir(d.join("keep")).unwrap();
+        fs::write(d.join("keep/in.txt"), "12345678").unwrap();
+        fs::create_dir(d.join("other")).unwrap();
+        fs::write(d.join("other/out.txt"), "12345678").unwrap();
+        let start_dev = fs::symlink_metadata(&d).unwrap().dev();
+        let other = d.join("other");
+        let dev_of = |p: &Path| {
+            if p.starts_with(&other) || *p == other {
+                Some(start_dev.wrapping_add(1))
+            } else {
+                None
+            }
+        };
+        let result = walk_while_with(&d, &|| false, Some(&dev_of));
+        assert!(!result.partial, "the gate skips rather than failing");
+        let want = fs::symlink_metadata(&d).unwrap().size()
+            + fs::symlink_metadata(d.join("keep")).unwrap().size()
+            + fs::symlink_metadata(d.join("keep/in.txt")).unwrap().size()
+            + fs::symlink_metadata(d.join("other")).unwrap().size();
+        let out = fs::symlink_metadata(d.join("other/out.txt")).unwrap().size();
+        assert_eq!(result.bytes, want, "the other-device subtree never descends, dropping the gate goes red");
+        assert!(out > 0, "the skipped payload is real bytes, so the equality above is not vacuous");
     }
 
     #[test]

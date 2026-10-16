@@ -27,7 +27,7 @@ Item {
     // The Menus board's work-area clamp: a floating surface never renders taller than its bounds
     // less this margin, and the pane scrolls inside that while the rail stays put.
     readonly property int clampMargin: 8
-    // GM's compact-card ruling keeps View's measured size across sections, clamped to the window.
+    // The compact card keeps View's measured size across sections, clamped to the window.
     readonly property int chromeAndBorder: Theme.chromeHeight + 2 * Theme.spacing.hairline
     readonly property int paneBottomPadding: Math.round(8 * Theme.font.bodySmall / 13)
     readonly property real groundOpacity: 0.5
@@ -261,9 +261,13 @@ Item {
     }
 
     anchors.fill: parent
-    visible: root.opened
+    visible: root.opened || root.opacity > 0
+    // Closed means no input, even while the fade-out is still drawn.
+    enabled: root.opened
+    opacity: 0
     // Above the context menu and the keymap sheet: the panel is the surface that opened last.
     z: 3
+    Flea.Reveal { target: root; shown: root.opened; lift: card }
 
     Rectangle {
         anchors.fill: parent
@@ -281,15 +285,16 @@ Item {
 
     Rectangle {
         id: card
-        anchors.centerIn: parent
-        width: Math.min(root.panelWidth, Math.max(0, root.width - 2 * root.clampMargin))
+        x: Theme.cardOrigin(root.width, width)
+        y: Theme.cardOrigin(root.height, height)
+        width: Theme.cardSpan(root.panelWidth, root.width - 2 * root.clampMargin)
         // Settings.html gives the rail and pane separate vertical insets.
-        height: Math.min(root.chromeAndBorder + Math.max(rail.implicitHeight + 2 * Theme.settings.railPaddingY,
-                                                          pane.compactHeight + root.paneBottomPadding),
-                         Math.max(0, root.height - 2 * root.clampMargin))
+        height: Theme.cardSpan(root.chromeAndBorder + Math.max(rail.implicitHeight + 2 * Theme.settings.railPaddingY,
+                                                                pane.compactHeight + root.paneBottomPadding),
+                               root.height - 2 * root.clampMargin)
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         // Mirrors hyprland decoration:rounding, same as ui/KeymapSheet.qml; 0 on a stock box stays square.
         radius: Style.cornerRadius
         clip: true
@@ -388,7 +393,7 @@ Item {
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
                     height: Theme.spacing.hairline
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                     opacity: 0.4
                 }
             }
@@ -416,7 +421,7 @@ Item {
                 anchors.top: chrome.bottom
                 anchors.bottom: parent.bottom
                 width: Theme.spacing.hairline
-                color: Theme.color.muted
+                color: Theme.color.mutedFrame
                 opacity: 0.4
             }
 

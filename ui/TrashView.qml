@@ -6,6 +6,7 @@ import "js/Format.js" as Format
 import "js/Icons.js" as Icons
 import "js/Keymap.js" as Keymap
 import "js/Ops.js" as Ops
+import "js/Sort.js" as Sort
 import "js/Tap.js" as Tap
 import "js/TrashDates.js" as Trash
 import "js/Trash.js" as TrashKeys
@@ -38,6 +39,8 @@ FocusScope {
     property bool confirming: false
     property string initialAction: ""
     property int pendingSelection: -1
+    // The first list after open() puts the cursor, and its mark, on the newest row.
+    property bool landing: false
     property var pendingExtend: false
     property string errorText: ""
     property bool confirmingAll: false
@@ -47,12 +50,16 @@ FocusScope {
     property int confirmingSelectionToken: 0
     property var confirmingIdentities: []
     property int confirmingToken: 0
+    // The sentence a recovered journal answers with, one whole sentence per count, each filled by Format.fill.
+    readonly property var recoveredWords: ({ one: "Recovered 1 interrupted file operation", many: "Recovered %1 interrupted file operations" })
     readonly property bool confirmationOpen: confirmation.opened
     readonly property var confirmationItem: confirmation
     readonly property var backItem: backButton
     readonly property var upItem: upButton
+    readonly property var emptyItem: emptyAction
+    readonly property var stripItem: strip
     readonly property string countText: countLabel.text
-    readonly property var headerLabels: [nameTitle.text, locationTitle.text, deletedTitle.text]
+    readonly property var headerLabels: [nameTitle.text, locationTitle.text, "Deleted"]
     function rowItemFor(index) { return listing.itemAtIndex(index) }
     readonly property int windowRows: Math.max(1, Math.min(350, Math.ceil(listing.height / Theme.fileRowHeight) + 2))
     readonly property int selectedCount: allSelected ? Math.max(0, selectionCount - excludedUris().length) + selectedUris().length : selectedUris().length
@@ -63,6 +70,8 @@ FocusScope {
     signal actionRequested(string action)
     signal contextRequested(real x, real y, bool hasSelection)
     signal statusReported(string message, bool error)
+    // The dd prompt, said apart from a status line so the bar starts its arm from the signal and never by reading the sentence.
+    signal armReported(string text)
     signal operationResult(string headline, string detail, bool error)
     signal countChanged(int count)
     anchors.fill: parent
@@ -79,13 +88,13 @@ FocusScope {
     }
     function open(action) {
         trashArmedAt = 0
-        if (operationActive) { opened = true; forceActiveFocus(); return }
+        if (operationActive) { opened = true; emptyAction.focus = false; forceActiveFocus(); return }
         opened = true; selected = ({}); selectionIdentities = ({}); allSelected = false; selectionToken = 0; selectionCount = 0; cursor = 0
-        first = 0; rows = []; total = 0; errorText = ""; bytesReady = false
+        first = 0; rows = []; total = 0; errorText = ""; bytesReady = false; landing = true
         confirming = false; confirmation.close(); refreshPending = false
         initialAction = action || ""
         send("list", {start: 0, count: windowRows, recover: true})
-        forceActiveFocus()
+        emptyAction.focus = false; forceActiveFocus() // Fresh open never keeps the strip button.
     }
     function close() {
         trashArmedAt = 0
@@ -187,14 +196,14 @@ FocusScope {
         var paired = trashArmedAt > 0 && now - trashArmedAt < TrashKeys.ARM_MS
         trashArmedAt = paired ? 0 : now
         if (paired) prepare(false)
-        else statusReported("Press d again to review permanent deletion, or Delete on its own.", false)
+        else armReported(TrashKeys.reviewPrompt())
     }
     function receive(message) {
         if ((!opened && !operationActive) || message.id !== requestId || message.op !== pendingOp) return
         pendingOp = ""
         if (!message.ok) {
             if (message.stale && opened) { operationActive = false; confirming = true; sourceChanged(); return }
-            errorText = message.error || "Trash operation failed."
+            errorText = message.error || "That Trash action could not be completed."
             confirming = false; confirmation.close()
             statusReported(errorText, true)
             operationActive = false
@@ -216,9 +225,9 @@ FocusScope {
             cursor = Math.max(0, Math.min(cursor, total - 1))
             if (message.op === "list") {
                 if ((message.recoveryErrors || []).length > 0)
-                    operationResult("Interrupted file operation needs attention", message.recoveryErrors.join("\n"), true)
+                    operationResult("Flea could not finish an interrupted file action", message.recoveryErrors.join("\n"), true)
                 else if (message.recoveredCount > 0)
-                    operationResult("Recovered " + message.recoveredCount + " interrupted file " + Ops.pluralWord(message.recoveredCount, "operation", "operations"), "", false)
+                    operationResult(message.recoveredCount === 1 ? root.recoveredWords.one : Format.fill(root.recoveredWords.many, message.recoveredCount), "", false)
                 errorText = ""
                 var kept = ({})
                 var keptIdentities = ({})
@@ -233,7 +242,8 @@ FocusScope {
                 var action = initialAction; initialAction = ""
                 if (action === "emptyTrash") prepare(true)
                 else if (action === "restoreAll") restore(true)
-                else send("summary")
+                else { if (landing && total > 0) choose(0, false); send("summary") }
+                landing = false
             }
             if (pendingSelection >= 0 && rowAt(pendingSelection)) choose(pendingSelection, pendingExtend)
         } else if (message.op === "select") {
@@ -293,9 +303,9 @@ FocusScope {
         else if (action === "trashArm") root.armDelete()
         else if (action === "deletePermanently" || action === "trash") root.prepare(false)
         else if (action === "focusNext") root.focusRailRequested()
-        else if (action === "settings" || action === "keymapSheet" || action === "quit") root.actionRequested(action)
-        else if (event.key === Qt.Key_F5 && unmodified) root.refresh()
-        else if (action === "menu") root.contextRequested(root.width / 2, Theme.chromeHeight, root.selectedCount > 0)
+        else if (action === "quit" || TrashKeys.route(action) !== "trash") root.actionRequested(action)
+        else if (action === "reload" || event.key === Qt.Key_F5 && unmodified) root.refresh()
+        else if (action === "menu") root.openMenu()
         // Trash owns this focus context; ordinary filesystem actions must never reach the covered pane.
         event.accepted = true
     }
@@ -304,6 +314,7 @@ FocusScope {
         anchors.fill: parent
         spacing: 0
         Rectangle {
+            id: strip
             width: parent.width
             height: Theme.chromeHeight
             color: Theme.color.surface
@@ -312,23 +323,20 @@ FocusScope {
                 anchors.leftMargin: Theme.spacing.rowPaddingX
                 anchors.rightMargin: Theme.spacing.rowPaddingX
                 spacing: Theme.spacing.gap
-                Flea.Glyph {
+                Flea.ChromeButton {
                     id: backButton
-                    width: Theme.hitMin; height: parent.height; maxSize: Theme.chromeMarkSize
-                    name: "arrow-left"; color: Theme.color.foreground
-                    Accessible.role: Accessible.Button
-                    Accessible.name: "Back"
-                    Accessible.onPressAction: root.close()
-                    TapHandler { onTapped: root.close() }
+                    ruleRows: Theme.spacing.hairline
+                    glyph: "arrow-left"
+                    onActivated: root.close()
                 }
-                Flea.Glyph {
+                Flea.ChromeButton {
                     id: upButton
-                    width: Theme.hitMin; height: parent.height; maxSize: Theme.chromeMarkSize
-                    name: "arrow-up"; color: Theme.color.muted
-                    Accessible.role: Accessible.Button
-                    Accessible.name: "Up unavailable in Trash"
-                    Accessible.ignored: false
+                    ruleRows: Theme.spacing.hairline
+                    glyph: "arrow-up"
+                    accessName: "Up unavailable in Trash"
+                    // Dead by design: a history has no parent, so ChromeButton dims it like any disabled control.
                     enabled: false
+                    Accessible.ignored: false
                 }
                 Text {
                     id: trashTitle
@@ -351,11 +359,12 @@ FocusScope {
                     font { family: Theme.font.family; pixelSize: Theme.font.caption }
                 }
                 // Emptying the Trash was reachable only by right-clicking the rail row. It addresses the whole Trash, which is what the count beside it describes, so it belongs here. It opens the confirmation the menu row opens: the boundary is unchanged and no key is bound to it. Disabled exactly where ui/js/Menu.js disables the row.
-                Flea.ChromeAction {
+                Flea.DialogButton {
                     id: emptyAction
                     anchors.verticalCenter: parent.verticalCenter
                     label: "Empty Trash"
-                    role: "error"
+                    destructive: true
+                    inStrip: true
                     available: root.total > 0 && !root.busy
                     onActivated: root.prepare(true)
                 }
@@ -396,7 +405,7 @@ FocusScope {
                 width: Math.min(Theme.column.trashDate, root.width * 0.2)
                 anchors.verticalCenter: parent.verticalCenter
                 horizontalAlignment: Text.AlignRight
-                text: "Deleted"
+                text: Sort.title("Deleted", true)
                 textFormat: Text.PlainText
                 elide: Text.ElideRight
                 color: Theme.color.foreground
@@ -457,6 +466,22 @@ FocusScope {
     Text { anchors.centerIn: parent; visible: root.total === 0; text: root.errorText || (root.busy ? "Reading Trash…" : "Trash is empty"); textFormat: Text.PlainText; color: root.errorText ? Theme.color.error : Theme.color.muted; font { family: Theme.font.family; pixelSize: Theme.font.body } }
     // GIO's monitor reports top-level changes; the active confirmation also checks nested identities.
     Timer { interval: 2500; repeat: true; running: root.opened && confirmation.opened && !root.busy; onTriggered: root.send("check", {token: confirmation.snapshot.token}) }
+    // m: the cursor row's own menu under that row, the marked rows' menu where it was, the whole-Trash menu when nothing lists.
+    function openMenu() {
+        var item = rowAt(cursor)
+        var target = item ? TrashKeys.menuTarget(total, selectedCount, isSelected(item.uri)) : "strip"
+        if (target === "cursor") {
+            if (selectedCount === 0) choose(cursor, false)
+            listing.positionViewAtIndex(cursor, ListView.Contain)
+            var row = listing.itemAtIndex(cursor)
+            if (row) {
+                var at = row.mapToItem(root, Theme.spacing.rowPaddingX, row.height)
+                contextRequested(at.x, at.y, true)
+                return
+            }
+        }
+        contextRequested(width / 2, Theme.chromeHeight, selectedCount > 0)
+    }
     Flea.TrashConfirm {
         id: confirmation
         parent: root.overlayParent || root

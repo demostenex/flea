@@ -3,12 +3,12 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import "." as Flea
-import "js/Icons.js" as Icons
 import "js/Eject.js" as Eject
 import "js/Mounts.js" as Mounts
 import "js/Places.js" as Places
 import "js/PlaceMenu.js" as PlaceMenu
 import "js/RailMenu.js" as RailMenu
+import "js/RailKeys.js" as RailKeys
 
 // Places, Favorites, Network and Devices share one flat cursor in visual order.
 Item {
@@ -20,18 +20,60 @@ Item {
     property bool trashActive: false
     // Set by Enter on a row that mounts first, so the open that lands afterwards takes focus into the folder.
     property bool focusOnOpen: false
+    // Right Arrow from a row that releases puts the keyboard on its eject mark; a move, a lost focus or a vanished mark ends its frame.
+    property bool markFocused: false
+    // A pointer press on a focused rail returns the highlight to the current place until the next rail key.
+    property bool pointerFocus: false
+    onFocusedChanged: if (!root.focused) { root.markFocused = false; root.pointerFocus = false }
     // ui/Pane.qml's one ui/ContextMenu.qml, handed in rather than built here: a second instance in
     // this tree took the keyboard away from the list, see ui/SidebarRow.qml's own note.
     property var menu: null
     property int cursorIndex: 0
     property var cursorEntries: []
+    // The row that holds what the rail pane shows. It is settled only once no listing is out, so it moves in the frame the listing swaps.
+    property int litIndex: -1
+    // The menu sets cursorIndex on open; the keyboard highlight stays off while that menu is open.
+    readonly property bool cursorDrawn: RailKeys.cursorDrawn(root.focused, root.menu && root.menu.opened && root.menu.forRail, root.pointerFocus)
+    readonly property int highlightedIndex: root.cursorDrawn ? root.cursorIndex : root.litIndex
+    function settleLit() {
+        var pane = root.navigationPane
+        if (pane === null || pane.listInFlight)
+            return
+        root.litIndex = Places.heldBy(root.entries, pane.path, Places.litView(pane.trash.opened, pane.recentMode, pane.searchMode, pane.swap.answeredQuery, pane.pathAlias))
+    }
+    onNavigationPaneChanged: root.settleLit()
+    Connections {
+        target: root.navigationPane
+        function onPathChanged() { root.settleLit() }
+        function onRecentModeChanged() { root.settleLit() }
+        function onSearchModeChanged() { root.settleLit() }
+        function onListInFlightChanged() { root.settleLit() }
+    }
+    Connections {
+        target: root.navigationPane ? root.navigationPane.trash : null
+        function onOpenedChanged() { root.settleLit() }
+    }
+    Connections {
+        target: root.navigationPane ? root.navigationPane.swap : null
+        function onAnsweredQueryChanged() { root.settleLit() }
+    }
     readonly property var placesState: ViewState.state.places || ({})
-    readonly property var userFavouriteEntries: Places.storedEntries(Favourites.records, Quickshell.env("HOME")).map(function (entry) {
-        entry.error = entry.error || Favourites.statuses[entry.favouriteIndex] || ""
-        return entry
-    })
-    property var homeEntries: []
-    readonly property var placesEntries: root.homeEntries.concat(root.trashEntries, root.userFavouriteEntries)
+    readonly property var userFavouriteEntries: RailPlaces.favouriteEntries
+    readonly property var homeEntries: RailPlaces.homeEntries
+    // Recent sits under Home and carries a location token.
+    readonly property var homeLead: root.homeEntries.slice(0, 1)
+    readonly property var homeRest: root.homeEntries.slice(1)
+    readonly property var recentEntries: RailPlaces.recentEntries
+    readonly property var placesEntries: root.homeLead.concat(root.recentEntries, root.homeRest, root.trashEntries, root.userFavouriteEntries, root.tagRows)
+    // The TAGS section (ui/TagRailSection.qml) is built once the setting is on and a tag is in use, since it ships off; its rows end the places group.
+    property var tagSection: null
+    readonly property var tagRows: root.tagSection !== null && root.placesState.showTags === true ? root.tagSection.entries : []
+    readonly property bool tagsListed: root.placesState.showTags === true && root.navigationPane !== null && root.navigationPane.tagState !== null
+        && Object.keys(root.navigationPane.tagState.inUse).length > 0
+    onTagsListedChanged: {
+        if (!root.tagsListed || root.tagSection !== null) return
+        root.tagSection = Qt.createComponent("TagRailSection.qml").createObject(netGap, { sidebar: root })
+    }
     readonly property int trashCount: trashMonitor.count
     signal trashChanged()
     function refreshTrash() { trashMonitor.refresh() }
@@ -43,54 +85,77 @@ Item {
         // read for the rail Trash menu even with the badge off, so only a shown count reports it.
         onFailed: function(text) { if (root.trashActive || root.placesState.trashCount === true) root.message(text, true) }
     }
-    readonly property var trashEntries: root.placesState.showTrash === false ? []
-        : [{ label: "Trash", path: "trash:///", group: "trash", kind: "trash", glyph: "trash", count: root.trashCount }]
+    readonly property var trashEntries: RailPlaces.trashEntries.map(function (entry) {
+        return Object.assign({}, entry, { count: root.trashCount })
+    })
     signal trashRequested()
+    // Folder drops share one receiver below the rows; Trash's own area answers above it.
+    RailDrop { id: fileDrop; sidebar: root; viewport: scroller }
 
     // The saved place an Edit is rewriting, "" when none is; ui/js/RailMenu.js editPlace sets it.
     property string editingPlace: ""
     // And the request that Edit's own attempt went out with, so no other mount answers for it.
     property string editingRequest: ""
-    // The window-long network host this rail renders and routes through, injected by
-    // ui/PaneRail.qml: the service outlives the rail Loader below, so hiding the rail mid-mount
-    // kills no mount, no bridge wait and no dialog answer. Null until the first open builds it.
+    // PaneRail injects the window-long host, so hiding the rail preserves mounts, waits and dialog answers.
     property var service: null
     readonly property var networkEntries: root.placesState.showNetwork === false || !root.railGate.showNetwork || !root.service ? [] : root.service.entries
     // The poll rebinds its delegates in place, so a rename left standing would edit a different share.
     onNetworkEntriesChanged: root.cancelRename()
     // Phones ride the DEVICES group behind the block devices: a plugged phone is a device to the person holding it, whatever transport gvfs reaches it over.
     readonly property var deviceEntries: root.placesState.showDevices === false || !root.railGate.showDevices ? [] : devices.entries.concat(phones.entries)
+    // The eject chain's guard state, read fresh at ipc time, so a failed eject names its guard.
+    function ejectChainState() { return devices.ejectState() }
+    // A release in flight, which PaneRail holds the rail open for.
+    readonly property bool releasing: devices.releasing
+    // False parks the DEVICES poll; PaneRail drops it while an auto-hide rail is withdrawn, and a reveal polls at once.
+    property bool polling: true
+    function pollDevices() { devices.poll() }
     readonly property var entries: root.placesEntries.concat(root.networkEntries, root.deviceEntries)
 
     // The rail lands in one step by gating the entries themselves, so cursor, IPC and menus match only drawn rows.
     readonly property int railSettleMs: 800
     property bool railDeadlineElapsed: false
     property bool bookmarksReady: false
+    // Favourite-relative insertion boundary, count past the last row, -1 when idle; a rebuild clears it.
+    property int reorderLine: -1
     readonly property var railGate: Mounts.railGroupsReady(root.bookmarksReady && root.service !== null && root.service.listingAnswered && root.service.dropboxAnswered, devices.firstAnswered && phones.firstDone, root.railDeadlineElapsed ? root.railSettleMs : 0, root.railSettleMs)
     Timer { interval: root.railSettleMs; running: true; repeat: false; onTriggered: root.railDeadlineElapsed = true }
 
     // Reconcile only the aggregate; evaluating entries from a group's change handler re-enters its binding.
     onEntriesChanged: {
+        root.reorderLine = -1
         var next = Places.railCursorAfter(root.cursorEntries, root.entries, root.cursorIndex)
+        var lit = Places.railCursorAfter(root.cursorEntries, root.entries, root.litIndex)
         if (root.renamingIndex >= 0
             && Places.railCursorAfter(root.cursorEntries, root.entries, root.renamingIndex) !== root.renamingIndex)
             root.cancelRename()
         root.cursorEntries = root.entries
         root.cursorIndex = next
+        // A listing still out keeps its row through the rebuild; an idle pane re-reads it.
+        root.litIndex = lit
+        root.settleLit()
+        root.markFocused = root.markFocused && Eject.releasable(root.entries[next])
         availability.restart()
     }
 
     signal opened(string path)
+    // A locked LUKS row opens the unlock dialog instead of running gio mount.
+    signal unlockRequested(string device, string label, double size, string fstype)
+    // Recent answers bounded newest-first history paths, which the pane opens through listpaths.
+    signal recentRequested(var paths, var requester, var visits)
     signal addRequested()
     // The rail's Edit row asks the window to open the dialog over the saved place.
     signal editRequested(string uri, string label, string password, string reason, bool failedConnect, var origin)
     signal message(string text, bool isError)
+    signal operationResult(string headline, string detail, bool isError)
     signal forgetMessage(string text)
 
     // The entry index mid-rename, or -1; ui/SidebarRow.qml swaps its Text for a field on it, and ui/Pane.qml holds its keys off while it stands.
     property int renamingIndex: -1
     // Fires once, on both commit and cancel, so ui/Pane.qml has one place to hand focus back.
     signal renameFinished()
+    // Any press inside the rail, so an overlay rail can take the keyboard though a row or the Flickable below holds the grab: the handler's item is above every child.
+    signal pressed()
 
     // Sized in characters, because a monospace makes that exact where a pixel constant would be an accident.
     readonly property int widthChars: 18
@@ -105,23 +170,13 @@ Item {
     }
 
     FileView {
-        id: userDirsFile
-        path: Quickshell.env("HOME") + "/.config/user-dirs.dirs"
-        watchChanges: true
-        printErrors: false
-        onFileChanged: reload()
-        onLoaded: root.rebuild()
-        onLoadFailed: root.rebuild()
-    }
-
-    FileView {
         id: bookmarksFile
         path: Quickshell.env("HOME") + "/.config/gtk-3.0/bookmarks"
         watchChanges: true
         printErrors: false
         onFileChanged: reload()
-        onLoaded: { root.bookmarksReady = true; root.rebuild(); root.pushBookmarks() }
-        onLoadFailed: { root.bookmarksReady = true; root.rebuild(); root.pushBookmarks() }
+        onLoaded: { root.bookmarksReady = true; root.pushBookmarks() }
+        onLoadFailed: { root.bookmarksReady = true; root.pushBookmarks() }
     }
 
     // The host keeps its own copy of this text: it outlives this rail, so a rail unload
@@ -142,16 +197,79 @@ Item {
     // Departure hands the timer back to a flight, if any, and the last listing stands while it is off.
     Component.onDestruction: { if (root.service && root.arrived) root.service.railLeft() }
 
+    // The desktop's own history, read and never written, kept across opens.
+    property var recentPaths: []
+    property var recentVisits: ({})
+    property bool recentKept: false
+    property bool recentReading: false
+    property int recentChanges: 0
+    property int recentReadAt: -1
+    // Every asker waiting on the read in flight, null meaning the rail pane itself.
+    property var recentRequesters: []
+    // How many times the history has been parsed; the seam reads it the way it reads the jump's.
+    property int recentReads: 0
+    function readRecent(requester) {
+        // One read at a time: every asker waits on it, so each pane opens once it lands.
+        if (root.recentReading) {
+            root.recentRequesters = recentReader.item.joinRequesters(root.recentRequesters, requester)
+            return
+        }
+        if (root.recentKept && root.recentReadAt === root.recentChanges) {
+            root.recentRequested(root.recentPaths, requester || null, root.recentVisits)
+            return
+        }
+        // Build the helper with the reader, only after an uncached Recent action.
+        recentReader.active = true
+        root.recentRequesters = recentReader.item.joinRequesters([], requester)
+        root.recentReading = true
+        root.recentReadAt = root.recentChanges
+        recentWatcher.path = recentReader.item.file
+        recentReader.item.refresh()
+    }
+    // Watching only: it never loads the file, and it reports a rename over it, a delete and a re-create alike.
+    FileView {
+        id: recentWatcher
+        preload: false
+        watchChanges: true
+        onFileChanged: root.recentChanges += 1
+    }
+    // The history reader and its helpers load on a Recent action, then drop after the read.
+    Loader {
+        id: recentReader
+        active: false
+        source: "PickerRecent.qml"
+    }
+    Connections {
+        target: recentReader.item
+        function onRefreshed() {
+            root.recentPaths = recentReader.item.paths
+            root.recentVisits = recentReader.item.visits
+            root.recentKept = true
+            root.recentReading = false
+            root.recentReads += 1
+            // Drop the bounded parsed model later, after the reader finishes emitting this signal.
+            Qt.callLater(function () { if (!root.recentReading) recentReader.active = false })
+            var askers = root.recentRequesters
+            root.recentRequesters = []
+            for (var i = 0; i < askers.length; i++) root.recentRequested(root.recentPaths, askers[i], root.recentVisits)
+        }
+    }
+
     // The context menu's gate for the two Dropbox rows, so the pane never reaches into the rail.
     readonly property bool dropboxReady: root.service !== null && root.service.dropboxReady
     readonly property var providerService: root.service
 
     DeviceMounts {
         id: devices
+        polling: root.polling
         showUnmounted: root.placesState.showUnmounted !== false
         onOpened: function (path) { root.opened(path) }
         onMessage: function (text, isError) { root.message(text, isError) }
+        onOperationResult: function (headline, detail, isError) { root.operationResult(headline, detail, isError) }
         onForgetMessage: function (text) { root.forgetMessage(text) }
+        // An eject releases the volume, so readers on it stop first and panes on it go Home.
+        onQuiesce: function (path) { if (root.navigationPane) root.navigationPane.quiesceVolume(path) }
+        onUnlockRequested: function (device, label, size, fstype) { root.unlockRequested(device, label, size, fstype) }
     }
 
     // Lists and unmounts only: activate() below routes a phone's mount-and-open through the same openShare leg a share rides.
@@ -169,15 +287,9 @@ Item {
     // connections rather than through this rail.
 
     // Home is in neither file, so it is prepended; the merge and its first-position-wins rule are Places.favorites'.
-    onPlacesStateChanged: root.rebuild()
     Connections {
         target: Favourites
         function onFailed(message) { root.message(message, true) }
-    }
-
-    function rebuild() {
-        var home = Quickshell.env("HOME")
-        root.homeEntries = root.placesState.showHome === false ? [] : Places.homeEntries(home, userDirsFile.text(), Icons.sidebarGlyphFor)
     }
 
     // NetworkDialog's saved() drives this reload because a watch set up before its parent directory existed never fires, and it blocks because "forget" derives its body from this text: measured here, an asynchronous reload put a removed line back.
@@ -190,9 +302,7 @@ Item {
         return root.service !== null ? root.service.result : ""
     }
 
-    // The eject mark's one click: Eject for a drive, Unmount for a share. The release
-    // row itself is named rather than rows[0], which an unmounted-switch volume's Open
-    // would win; Eject.releaseAction and Mounts.railKey are what Ctrl+E reads too.
+    // The eject mark's one click names its release row, never rows[0], which a volume's Open would win; Ctrl+E keys its release by Mounts.railKey too.
     function ejectRow(index) {
         var entry = root.entries[index]
         if (!entry)
@@ -245,18 +355,18 @@ Item {
         return null
     }
 
+    // The favourites store persists reorders; a refused move keeps its row and reports the failure.
+    function moveFavourite(from, to) {
+        root.reorderLine = -1
+        if (to !== from)
+            Favourites.move(from, to)
+    }
     // A favourite's path is already real and opens directly; a share or a volume may need its Service.
     function openFavourite(index) {
-        var entry = root.userFavouriteEntries[index]
-        if (!entry) return
-        var error = Places.recordError(entry.original)
-        if (error) { root.message("Could not open " + entry.label + " · " + error, true); return }
-        if (entry.path.indexOf("://") >= 0 && entry.path.indexOf("file://") !== 0) {
-            var host = root.networkHost()
-            if (host) host.openChildShare(entry.path, entry.label, root.navigationPane)
-        } else {
-            root.opened(entry.path.indexOf("file://") === 0 ? Mounts.decodePath(entry.path.substring(7)) : entry.path)
-        }
+        Places.openEntry(root.userFavouriteEntries[index], {
+            pane: root.navigationPane, opened: root.opened, message: root.message,
+            networkHost: root.networkHost, trash: root.trashRequested
+        })
     }
 
     function activate(index) {
@@ -266,7 +376,9 @@ Item {
         if (!entry) return
         if (entry.kind === "favourite") { root.openFavourite(entry.favouriteIndex); return }
         if (entry.kind === "home") { root.opened(entry.path); return }
+        if (entry.kind === "recent") { root.readRecent(); return }
         if (entry.kind === "trash") { root.trashRequested(); return }
+        if (entry.kind === "tag") { root.navigationPane.tags().openTag(entry.tag); return }
         var rest = index - root.placesEntries.length
         if (rest < root.networkEntries.length) root.service.activate(rest, root.navigationPane)
         // A phone mounts, resolves and opens the way a share does.
@@ -289,6 +401,10 @@ Item {
         if (index < root.placesEntries.length)
             return
         if (index >= root.placesEntries.length + root.networkEntries.length)
+            return
+        // A kernel share row has no saved place to rename, and relabelling it would append a file:// bookmark the network rail never draws.
+        var entry = root.networkEntries[index - root.placesEntries.length]
+        if (entry && entry.editable === false)
             return
         root.renamingIndex = index
     }
@@ -322,12 +438,13 @@ Item {
         root.service.rename(entry.uri, trimmed)
     }
 
+    // Auto-hide reveals the rail over the listing, so on glass it hides the rows under it the way a menu does.
     Rectangle {
         anchors.fill: parent
-        color: Theme.color.surface
+        color: ViewState.railAutoHide ? Theme.color.surface : Glass.surface
     }
 
-    onCursorIndexChanged: root.revealCursor()
+    onCursorIndexChanged: { root.markFocused = false; root.revealCursor() }
 
     // Anchored inside the Flickable's contentItem, so a row's y is already the scroll coordinate.
     function revealCursor() {
@@ -358,7 +475,7 @@ Item {
     }
     Flickable {
         id: scroller
-        onContentYChanged: availability.restart()
+        onContentYChanged: { availability.restart(); fileDrop.reaim() }
         anchors.fill: parent
         clip: true
         contentWidth: width
@@ -369,7 +486,7 @@ Item {
             parent: scroller
             flickable: scroller
         }
-        Flea.ViewportScrollBar { parent: scroller; anchors.top: parent.top; anchors.right: parent.right; flickable: scroller }
+        // No bar and no lane: rows fill the rail and still scroll by wheel, touchpad and keys.
         Column {
             id: rail
             anchors.top: parent.top
@@ -377,70 +494,87 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
 
-            Text {
+            RailHeading {
                 id: placesHeading
-                x: Style.spacing.rowPaddingX
-                topPadding: Math.ceil(font.pixelSize * 0.15)
-                bottomPadding: Style.spacing.rowGap
                 visible: root.homeEntries.length + root.trashEntries.length > 0
                 text: "PLACES"
-                color: Theme.color.muted
-                font.family: Theme.font.family
-                font.pixelSize: Theme.font.caption
-                font.letterSpacing: 1
-                textFormat: Text.PlainText
             }
             Repeater {
-                id: homeRepeater
-                model: root.homeEntries
+                id: homeLeadRepeater
+                model: root.homeLead
                 delegate: SidebarRow {
-                    cursor: index === root.cursorIndex
+                    lit: index === root.litIndex
+                    highlighted: index === root.highlightedIndex
+                    cursor: root.cursorDrawn && index === root.cursorIndex
                     focused: root.focused
                     onActivated: function (idx) { root.activate(idx) }
                     onMenuRequested: function(idx, pos) { root.openRailMenu(idx, pos) }
+                    onTabRequested: function (idx) { PlaceMenu.openTabAt(root, idx) }
+                }
+            }
+            Repeater {
+                id: recentRepeater
+                model: root.recentEntries
+                delegate: SidebarRow {
+                    lit: index + root.homeLead.length === root.litIndex
+                    highlighted: index + root.homeLead.length === root.highlightedIndex
+                    cursor: root.cursorDrawn && index + root.homeLead.length === root.cursorIndex
+                    focused: root.focused
+                    onActivated: function (idx) { root.activate(idx + root.homeLead.length) }
+                    onMenuRequested: function(idx, pos) { root.openRailMenu(idx + root.homeLead.length, pos) }
+                }
+            }
+            Repeater {
+                id: homeRestRepeater
+                model: root.homeRest
+                delegate: SidebarRow {
+                    lit: index + root.homeLead.length + root.recentEntries.length === root.litIndex
+                    highlighted: index + root.homeLead.length + root.recentEntries.length === root.highlightedIndex
+                    cursor: root.cursorDrawn && index + root.homeLead.length + root.recentEntries.length === root.cursorIndex
+                    focused: root.focused
+                    onActivated: function (idx) { root.activate(idx + root.homeLead.length + root.recentEntries.length) }
+                    onMenuRequested: function(idx, pos) { root.openRailMenu(idx + root.homeLead.length + root.recentEntries.length, pos) }
+                    onTabRequested: function (idx) { PlaceMenu.openTabAt(root, idx + root.homeLead.length + root.recentEntries.length) }
                 }
             }
             Repeater {
                 id: trashRepeater
                 model: root.trashEntries
-                delegate: SidebarRow {
-                    // The menu sets cursorIndex on open, so the Trash row takes the cursor rung; trashActive keeps it lit.
-                    cursor: root.trashActive || (index + root.homeEntries.length === root.cursorIndex)
-                    focused: root.focused || root.trashActive
-                    onActivated: function (idx) { root.activate(idx + root.homeEntries.length) }
-                    onMenuRequested: function(idx, pos) { root.openRailMenu(idx + root.homeEntries.length, pos) }
-                }
+                delegate: RailTrashRow { rail: root }
             }
 
-            Text {
+            RailHeading {
                 id: favouritesHeading
                 visible: root.userFavouriteEntries.length > 0
-                x: Style.spacing.rowPaddingX
-                topPadding: (placesHeading.visible ? Style.spacing.panelGap : 0) + Math.ceil(font.pixelSize * 0.15)
-                bottomPadding: Style.spacing.rowGap
                 text: "FAVORITES"
-                color: Theme.color.muted
-                font.family: Theme.font.family
-                font.pixelSize: Theme.font.caption
-                font.letterSpacing: 1
-                textFormat: Text.PlainText
+                topExtra: placesHeading.visible ? Style.spacing.panelGap : 0
             }
             Repeater {
                 id: favRepeater
                 model: root.userFavouriteEntries
                 delegate: SidebarRow {
-                    cursor: index + root.homeEntries.length + root.trashEntries.length === root.cursorIndex
+                    lit: index + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length === root.litIndex
+                    highlighted: index + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length === root.highlightedIndex
+                    cursor: root.cursorDrawn && index + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length === root.cursorIndex
                     focused: root.focused
-                    onActivated: function (idx) { root.activate(idx + root.homeEntries.length + root.trashEntries.length) }
-                    onMenuRequested: function (idx, pos) { root.openRailMenu(idx + root.homeEntries.length + root.trashEntries.length, pos) }
+                    // The rail's own reorder drag, persisted through the favourites store.
+                    dragFrom: modelData.favouriteIndex
+                    lineCount: root.userFavouriteEntries.length
+                    onMoved: function (to) { root.moveFavourite(dragFrom, to) }
+                    onReorderAt: function (line) { root.reorderLine = line }
+                    onActivated: function (idx) { root.activate(idx + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length) }
+                    onMenuRequested: function (idx, pos) { root.openRailMenu(idx + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length, pos) }
+                    onTabRequested: function (idx) { PlaceMenu.openTabAt(root, idx + root.homeLead.length + root.recentEntries.length + root.homeRest.length + root.trashEntries.length) }
                 }
             }
 
             // The OEM panel idiom's own group gap, not the tighter row-to-row rhythm rows keep inside a group.
             Item {
-                visible: root.networkEntries.length > 0
+                id: netGap
+                // The TAGS section lives inside this gap, so its rows end the places group by construction.
+                visible: root.networkEntries.length > 0 || (root.tagSection !== null && root.placesState.showTags === true)
                 width: rail.width
-                height: Style.spacing.panelGap
+                height: ((root.tagSection !== null && root.placesState.showTags === true) ? root.tagSection.height : 0) + (root.networkEntries.length > 0 ? Style.spacing.panelGap : 0)
             }
 
             // Self-hides with its list below when gio, the bookmarks file and Dropbox all have nothing to say.
@@ -449,16 +583,10 @@ Item {
                 width: rail.width
                 height: netHeading.implicitHeight + Style.spacing.rowGap
 
-                Text {
+                RailHeading {
                     id: netHeading
-                    x: Style.spacing.rowPaddingX
-                    topPadding: Math.ceil(font.pixelSize * 0.15)
+                    noBottom: true
                     text: "NETWORK"
-                    color: Theme.color.muted
-                    font.family: Theme.font.family
-                    font.pixelSize: Theme.font.caption
-                    font.letterSpacing: 1
-                    textFormat: Text.PlainText
                 }
 
                 // A hand-drawn plus, not a Text "+": at caption size the font glyph read as a Christian cross, not a plus. Sized off the heading's own font token.
@@ -469,7 +597,7 @@ Item {
                     anchors.rightMargin: Style.spacing.rowPaddingX
                     anchors.verticalCenter: netHeading.verticalCenter
                     name: "plus"
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                     width: Theme.font.caption
                     height: width
                 }
@@ -492,7 +620,10 @@ Item {
                 id: netRepeater
                 model: root.networkEntries
                 delegate: SidebarRow {
-                    cursor: (index + root.placesEntries.length) === root.cursorIndex
+                    lit: index + root.placesEntries.length === root.litIndex
+                    highlighted: index + root.placesEntries.length === root.highlightedIndex
+                    cursor: root.cursorDrawn && index + root.placesEntries.length === root.cursorIndex
+                    markFocused: root.markFocused && cursor
                     focused: root.focused
                     renaming: (index + root.placesEntries.length) === root.renamingIndex
                     onActivated: function (idx) { root.activate(idx + root.placesEntries.length) }
@@ -510,31 +641,37 @@ Item {
             }
 
             // Self-hides with its list where lsblk reports no disk, and carries no add mark: nothing here is bookmarked.
-            Text {
+            RailHeading {
                 id: devHeading
                 visible: root.deviceEntries.length > 0
-                x: Style.spacing.rowPaddingX
-                topPadding: Math.ceil(font.pixelSize * 0.15)
-                bottomPadding: Style.spacing.rowGap
                 text: "DEVICES"
-                color: Theme.color.muted
-                font.family: Theme.font.family
-                font.pixelSize: Theme.font.caption
-                font.letterSpacing: 1
-                textFormat: Text.PlainText
             }
 
             Repeater {
                 id: devRepeater
                 model: root.deviceEntries
                 delegate: SidebarRow {
-                    cursor: (index + root.placesEntries.length + root.networkEntries.length) === root.cursorIndex
+                    lit: index + root.placesEntries.length + root.networkEntries.length === root.litIndex
+                    highlighted: index + root.placesEntries.length + root.networkEntries.length === root.highlightedIndex
+                    cursor: root.cursorDrawn && index + root.placesEntries.length + root.networkEntries.length === root.cursorIndex
+                    markFocused: root.markFocused && cursor
                     focused: root.focused
                     onActivated: function (idx) { root.activate(idx + root.placesEntries.length + root.networkEntries.length) }
                     onEjectRequested: function (idx) { root.ejectRow(idx + root.placesEntries.length + root.networkEntries.length) }
                     onMenuRequested: function (idx, pos) { root.openRailMenu(idx + root.placesEntries.length + root.networkEntries.length, pos) }
                 }
             }
+        }
+        // Sidebar040 specimen 1: the bar lies over the boundary, one hairline in the row above and the rest under it.
+        Rectangle {
+            readonly property var row: favRepeater.itemAt(Math.min(root.reorderLine, favRepeater.count - 1))
+            readonly property real boundary: row ? row.y + (root.reorderLine === favRepeater.count ? row.height : 0) : 0
+            visible: root.reorderLine >= 0 && root.reorderLine <= favRepeater.count && row !== null
+            width: rail.width
+            height: Theme.accentEdge * Theme.spacing.hairline
+            y: boundary - Theme.spacing.hairline + rail.y
+            color: Theme.color.accent
+            z: 1
         }
     }
 
@@ -543,24 +680,37 @@ Item {
     function headingItems() { return [placesHeading, favouritesHeading, netHeading, devHeading] }
     // The rail has no ListView virtualization, so every row already exists; the same itemFor idiom ui/Pane.qml uses for the list, so a test can find a rail row's on-screen box.
     function railItemFor(index) {
-        if (index < root.homeEntries.length) return homeRepeater.itemAt(index)
-        var rest = index - root.homeEntries.length
+        if (index < root.homeLead.length) return homeLeadRepeater.itemAt(index)
+        var rest = index - root.homeLead.length
+        if (rest < root.recentEntries.length) return recentRepeater.itemAt(rest)
+        rest -= root.recentEntries.length
+        if (rest < root.homeRest.length) return homeRestRepeater.itemAt(rest)
+        rest -= root.homeRest.length
         if (rest < root.trashEntries.length) return trashRepeater.itemAt(rest)
         rest -= root.trashEntries.length
         if (rest < root.userFavouriteEntries.length) return favRepeater.itemAt(rest)
         rest -= root.userFavouriteEntries.length
+        if (rest < root.tagRows.length) return root.tagSection.itemAt(rest)
+        rest -= root.tagRows.length
         if (rest < root.networkEntries.length)
             return netRepeater.itemAt(rest)
         rest -= root.networkEntries.length
         return devRepeater.itemAt(rest)
     }
-    // The one divider in the whole design.
-    Rectangle {
+    // Above the Flickable and every row, because a PointHandler under their exclusive press grab is never given the press; a passive handler leaves the press to the row.
+    Item {
+        anchors.fill: parent
+        z: 1
+        PointHandler {
+            acceptedButtons: Qt.AllButtons
+            // After pressed(), which can hand an overlay rail the keyboard, so the press that claimed it still hides the frame.
+            onActiveChanged: if (active) { root.pressed(); if (root.focused) root.pointerFocus = true }
+        }
+    }
+    // The rail edge, one Divider shared with the column edges.
+    Flea.Divider {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.bottom: parent.bottom
-        width: Style.spacing.hairline
-        color: Theme.color.foreground
-        opacity: 0.12
     }
 }

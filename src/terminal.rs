@@ -1,6 +1,3 @@
-use crate::gui;
-use crate::thp;
-use crate::vulkan;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -22,12 +19,12 @@ pub fn open_terminal(path: &str) -> i32 {
         Some(p) => p,
         // The reason is elided, never shown raw, and the path is the user's own input.
         None => {
-            eprintln!("flea: that directory could not be opened in a terminal, check that it still exists");
+            eprintln!("flea: that folder could not be opened in a terminal; check that it still exists");
             return FAILED;
         }
     };
     if !target.is_dir() {
-        eprintln!("flea: that directory could not be opened in a terminal, check that it still exists");
+        eprintln!("flea: that folder could not be opened in a terminal; check that it still exists");
         return FAILED;
     }
     // An OsString and not a format!, because Path::display would substitute U+FFFD for a byte that is not UTF-8.
@@ -66,14 +63,29 @@ pub fn open_terminal(path: &str) -> i32 {
 /// Apply the process guards to a child that Flea starts without waiting for it.
 /// The updater in `src/update.rs` uses these guards too.
 pub fn detach(child: &mut Command) {
-    // The setting is inherited across exec, so this is the last point that can hand it back.
-    thp::enable();
-    // The display-GPU pin is Qt's alone, and only this launcher's own pin is dropped.
-    vulkan::drop_display_pin(child);
-    // The platform theme Flea traded for its own startup is Qt's alone too, and is handed back here.
-    gui::restore_platform_theme(child);
+    // One helper owns the environment, so a new guard reaches every launcher at once; see src/open.rs.
+    crate::open::prepare(child);
     // The child outlives us, so an inherited pipe would kill it on its first write; see AGENTS.md "Opening a file".
     child.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // Its own process group, so nothing that later kills Flea's group reaches the child.
     child.process_group(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_detached_child_loses_every_tear_off_variable() {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        for name in crate::tearoff::ENV {
+            child.env(name, "stale");
+        }
+        detach(&mut child);
+        for name in crate::tearoff::ENV {
+            let entry = child.get_envs().find(|(key, _)| *key == OsStr::new(name));
+            assert_eq!(entry, Some((OsStr::new(name), None)), "{name} survived detach");
+        }
+    }
 }

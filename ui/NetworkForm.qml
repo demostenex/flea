@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import "." as Flea
+import "js/Buttons.js" as Buttons
 import "js/Protocols.js" as Protocols
 
 // The Add-network-place form: a protocol picks the scheme, prefills the port and swaps the field set,
@@ -29,6 +30,7 @@ Column {
         protocol: root.protocol, host: root.host, port: root.port, path: root.path,
         domain: root.domain, user: root.user, tls: root.tls
     })
+    readonly property string passwordHintText: passwordHint.visible ? passwordHint.text : ""
     readonly property bool complete: Protocols.complete({ host: root.host, port: root.port })
 
     spacing: Style.space(12)
@@ -81,6 +83,9 @@ Column {
         hostField.input.forceActiveFocus()
     }
 
+    // The dialog's buttons below the form, which the walk takes after the TLS box, in reading order.
+    property var trailing: []
+
     // Visual order: the protocol chips, then the fields down the form, then the TLS box. Three of
     // these are visibility-bound and come and go with the protocol, so the walk skips what is not on
     // screen rather than parking the caret where nobody can see it.
@@ -95,7 +100,7 @@ Column {
             }
         }
         ring.push(labelField, hostField, portField, pathField, domainField, userField, passwordField, tlsRow)
-        return ring
+        return ring.concat(root.trailing)
     }
 
     function step(from, delta) {
@@ -107,14 +112,15 @@ Column {
         }
         for (var n = 1; n <= len; n++) {
             var next = ring[((at + delta * n) % len + len) % len]
-            if (next.visible) {
-                next.takeFocus()
+            // A button that cannot act is passed over, the way a hidden field is; a button takes plain focus.
+            if (next.visible && next.available !== false) {
+                if (typeof next.takeFocus === "function") next.takeFocus(); else next.forceActiveFocus()
                 return
             }
         }
     }
 
-    // A chip carries a label and no accessibility tree, so a test reaches one by name and clicks it.
+    // A test reaches a chip by its label.
     function chipFor(name) {
         var kids = chips.children
         for (var i = 0; i < kids.length; i++) {
@@ -170,6 +176,9 @@ Column {
         for (var i = 0; i < fields.length; i++) {
             if (fields[i].focused) return fields[i].label
         }
+        for (var j = 0; j < root.trailing.length; j++) {
+            if (root.trailing[j].activeFocus) return root.trailing[j].label
+        }
         return tlsRow.focused ? "TLS" : ""
     }
 
@@ -187,7 +196,7 @@ Column {
 
     Row {
         id: chips
-        spacing: Theme.spacing.hairline * 6
+        spacing: Theme.spacing.hairline * Buttons.SET_GAP
 
         Repeater {
             model: Protocols.PROTOCOLS
@@ -272,11 +281,23 @@ Column {
     }
 
     Text {
+        id: passwordHint
+        visible: root.spec.credentials
+        width: parent.width
+        height: visible ? implicitHeight : 0
+        text: "The password is not saved."
+        color: Theme.color.muted
+        font.family: Theme.font.family
+        font.pixelSize: Theme.font.caption
+        textFormat: Text.PlainText
+    }
+
+    Text {
         id: nfsNote
         visible: root.protocol === "NFS"
         width: parent.width
         height: visible ? implicitHeight : 0
-        text: "No credentials: NFS trusts the client host"
+        text: "No password needed: the NFS server trusts this computer"
         color: Theme.color.muted
         font.family: Theme.font.family
         font.pixelSize: Theme.font.caption
@@ -309,7 +330,7 @@ Column {
             color: "transparent"
             border.width: Theme.spacing.hairline * 2
             border.color: root.tls ? Theme.color.accent
-                                   : (tlsRow.focused ? Theme.color.foreground : Theme.color.muted)
+                                   : (tlsRow.focused ? Theme.color.foreground : Theme.color.mutedFrame)
 
             Flea.Glyph {
                 anchors.fill: parent
@@ -351,11 +372,16 @@ Column {
             clip: true
 
             Flickable {
+                id: sentenceFlick
                 anchors.fill: parent
                 contentWidth: sentence.implicitWidth
                 contentHeight: sentence.implicitHeight
                 flickableDirection: Flickable.HorizontalFlick
                 boundsBehavior: Flickable.StopAtBounds
+                Flea.FastScrollHandler {
+                    parent: sentenceFlick
+                    flickable: sentenceFlick
+                }
 
                 // Dialogs rule 3: one sentence rather than an eyebrow over a value, and it says the
                 // whole answer, because Protocols.uri() has one as soon as the host and port validate:

@@ -11,53 +11,87 @@ pub fn magic_is_network(magic: i64) -> bool {
 }
 
 // Sample input: "fuse.sshfs" trues, "ext4" falses, "NFS4" trues.
+// Kept for fsinforeq.rs; extclass itself calls netfs directly.
 pub fn fstype_is_network(fstype: &str) -> bool {
-    let lower = fstype.to_ascii_lowercase();
-    lower == "cifs"
-        || lower == "smb3"
-        || lower.starts_with("nfs")
-        || lower.contains("sshfs")
-        || lower.contains("rclone")
-        || lower == "9p"
-        || lower.contains("ceph")
+    super::netfs::is_network_fstype(fstype)
 }
 
-// Sample input: "/run/user/1000/gvfs/mtp:host=X/" answers Some("phone").
-pub fn gvfs_class(path: &Path) -> Option<&'static str> {
-    if !path.to_string_lossy().starts_with("/run/user/") {
-        return None;
-    }
-    let text = path.to_string_lossy().into_owned();
-    let mark = text.find("/gvfs/")?;
-    let rest = text[mark + "/gvfs/".len()..].to_ascii_lowercase();
-    if rest.starts_with("mtp:") || rest.starts_with("gphoto2:") || rest.starts_with("afc:") {
-        Some("phone")
-    } else {
-        Some("network")
-    }
+pub use super::gvfsroot::{gvfs_class, gvfs_root};
+
+// The classes ui/js/DirSizes.js isRemoteClass refuses a folder size on; unknown never reaches the backend, classify always answers.
+// Sample input: "network" and "phone" true, "usb" and "" false.
+pub fn refuses_folder_sizes(class: &str) -> bool {
+    matches!(class, "network" | "phone")
 }
 
-// Sample input: a symlink "~/NAS" into "/run/user/1000/gvfs/..." answers the share.
-pub fn resolved(path: &Path) -> PathBuf {
-    if gvfs_class(path).is_some() {
+// Paths the link walk issued readlink on, so a test pins that none lands inside a mount that can wedge.
+#[cfg(test)]
+thread_local! {
+    static LINK_READS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// The kernel's own bound on links followed in one path, past which the walk answers the raw path as realpath fails.
+const MAX_LINK_HOPS: usize = 40;
+
+// The one syscall the walk makes, on a path whose mount is already known not to wedge.
+fn read_link(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    LINK_READS.with(|v| v.borrow_mut().push(path.to_path_buf()));
+    std::fs::read_link(path)
+}
+
+// The one link walk, stopping at the first prefix inside a mount that can wedge; sample input: a link into a cifs mount answers its edge plus the tail.
+pub fn resolved_in(path: &Path, body: &str) -> PathBuf {
+    use std::path::Component;
+    if !path.is_absolute() || gvfs_class(path).is_some() {
         return path.to_path_buf();
     }
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let parts = |path: &Path| -> Vec<std::ffi::OsString> {
+        path.components().filter(|c| matches!(c, Component::Normal(_) | Component::ParentDir)).rev().map(|c| c.as_os_str().to_owned()).collect()
+    };
+    let mut todo = parts(path);
+    let mut at = PathBuf::from("/");
+    let mut hops = 0;
+    while let Some(name) = todo.pop() {
+        if name == ".." {
+            at.pop();
+            continue;
+        }
+        let next = at.join(&name);
+        let wedges = gvfs_class(&next).is_some()
+            || super::mountinfo::mount_entry_in(&next, body).is_some_and(|e| super::netfs::can_wedge(&e.fstype));
+        if wedges {
+            let mut out = next;
+            out.extend(todo.iter().rev());
+            return out;
+        }
+        match read_link(&next) {
+            Ok(target) => {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return path.to_path_buf();
+                }
+                if target.is_absolute() {
+                    at = PathBuf::from("/");
+                }
+                todo.extend(parts(&target));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => at = next,
+            Err(_) => return path.to_path_buf(),
+        }
+    }
+    at
 }
 
-// Sample input: "/run/user/1000/gvfs/smb-share:server=n,share=x/dir" answers "/run/user/1000/gvfs/smb-share:server=n,share=x".
-pub fn gvfs_root(path: &Path) -> Option<PathBuf> {
-    gvfs_class(path)?;
-    let mut root = PathBuf::new();
-    let mut after_gvfs = false;
-    for part in path.components() {
-        root.push(part);
-        if after_gvfs {
-            return Some(root);
-        }
-        after_gvfs = part.as_os_str() == "gvfs";
-    }
-    None
+// The paths the link walk read since the last reset.
+#[cfg(test)]
+pub(crate) fn test_link_reads() -> Vec<PathBuf> {
+    LINK_READS.with(|v| v.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_link_reads() {
+    LINK_READS.with(|v| v.borrow_mut().clear());
 }
 
 // Sample sysfs target: "../../devices/pci0000:00/0000:00:14.0/usb2/2-1/host0/block/sdb/sdb1" trues.
@@ -93,7 +127,7 @@ pub fn classify_parts(path: &Path, fstype: Option<&str>, magic: Option<i64>, usb
     if let Some(class) = gvfs_class(path) {
         return class;
     }
-    if fstype.is_some_and(fstype_is_network) {
+    if fstype.is_some_and(super::netfs::is_network_fstype) {
         return "network";
     }
     if magic.is_some_and(magic_is_network) {
@@ -105,7 +139,7 @@ pub fn classify_parts(path: &Path, fstype: Option<&str>, magic: Option<i64>, usb
     ""
 }
 
-// One canonicalize, one mountinfo read, one statfs and two sysfs reads at most, once per directory change.
+// One link walk, one mountinfo read, one statfs and two sysfs reads at most, once per directory change.
 pub fn classify(path: &Path) -> &'static str {
     if let Some(class) = gvfs_class(path) {
         return class;
@@ -120,10 +154,10 @@ pub fn classify_in(path: &Path, body: &str) -> &'static str {
         return class;
     }
     // The raw path's own mount first, so a kernel share whose server died costs no canonicalize.
-    if super::mountinfo::mount_entry_in(path, body).is_some_and(|e| fstype_is_network(&e.fstype)) {
+    if super::mountinfo::mount_entry_in(path, body).is_some_and(|e| super::netfs::is_network_fstype(&e.fstype)) {
         return "network";
     }
-    let owned = resolved(path);
+    let owned = resolved_in(path, body);
     if let Some(class) = gvfs_class(&owned) {
         return class;
     }
@@ -135,7 +169,7 @@ pub fn classify_entry(path: &Path, entry: Option<&MountEntry>) -> &'static str {
     if let Some(class) = gvfs_class(path) {
         return class;
     }
-    if entry.is_some_and(|e| fstype_is_network(&e.fstype)) {
+    if entry.is_some_and(|e| super::netfs::is_network_fstype(&e.fstype)) {
         return "network";
     }
     classify_entry_with_magic(path, entry, super::fsinfo::magic_of(path))
@@ -169,6 +203,10 @@ fn usb_for(majmin: Option<&str>) -> bool {
 }
 
 #[cfg(test)]
+#[path = "extclass_tests.rs"]
+mod link_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -184,13 +222,9 @@ mod tests {
     }
 
     #[test]
-    fn fuse_subtypes_name_their_network() {
-        for fstype in ["cifs", "nfs", "nfs4", "NFS", "fuse.sshfs", "sshfs", "fuse.rclone", "9p", "ceph"] {
-            assert!(fstype_is_network(fstype), "{} reaches the network class", fstype);
-        }
-        for fstype in ["ext4", "btrfs", "xfs", "vfat", "exfat", "ntfs", "tmpfs", "overlay", "fuse.gvfsd-fuse", ""] {
-            assert!(!fstype_is_network(fstype), "{} stays out of the network class", fstype);
-        }
+    fn only_network_and_phone_refuse_a_folder_size() {
+        assert!(refuses_folder_sizes("network") && refuses_folder_sizes("phone"));
+        assert!(!refuses_folder_sizes("usb") && !refuses_folder_sizes(""), "a local or removable disk still sizes");
     }
 
     #[test]
@@ -264,8 +298,9 @@ mod tests {
         let target = d.dir("real");
         let link = d.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(resolved(&link), target, "a symlink answers its target");
-        assert_eq!(resolved(&d.join("never-existed")), d.join("never-existed"), "a failure keeps today's path");
+        let local = "1 0 0:30 / / rw - ext4 /dev/a rw\n";
+        assert_eq!(resolved_in(&link, local), target, "a symlink answers its target");
+        assert_eq!(resolved_in(&d.join("never-existed"), local), d.join("never-existed"), "a failure keeps today's path");
     }
 
     #[test]
@@ -280,12 +315,48 @@ mod tests {
         assert_eq!(classify_in(&link, &plain), "", "the same link stays local when its target is local");
     }
 
+    // A link into a share is followed no further than the share's edge: no readlink lands inside it, even when the target is gone.
+    #[test]
+    fn a_link_into_a_share_classifies_network_with_no_syscall_inside_the_share() {
+        test_reset_link_reads();
+        let d = crate::backend::testdir::TestDir::new("extclass-link-wedge");
+        let share = d.dir("share").canonicalize().unwrap();
+        let (link, gone) = (d.path().join("link"), d.path().join("gone"));
+        std::os::unix::fs::symlink(&share, &link).unwrap();
+        std::os::unix::fs::symlink(share.join("missing").join("deep"), &gone).unwrap();
+        let body = format!("1 0 0:30 / / rw - ext4 /dev/a rw\n30 1 0:9 / {} rw - cifs //nas/media rw\n", share.display());
+        assert_eq!(classify_in(&link.join("sub"), &body), "network", "a link into a share is network");
+        assert_eq!(classify_in(&gone, &body), "network", "a link to a path the share cannot show is network too");
+        let reads = test_link_reads();
+        assert!(reads.contains(&link) && reads.contains(&gone), "the links themselves are read, so the hook sees the walk: {:?}", reads);
+        assert!(reads.iter().all(|p| !p.starts_with(&share)), "no syscall reaches the share: {:?}", reads);
+        test_reset_link_reads();
+    }
+
     #[test]
     fn a_network_entry_classifies_without_a_statfs() {
         crate::backend::fsinfo::test_reset_statfs();
-        let entry = MountEntry { mount: PathBuf::from("/media/nas"), fstype: "smb3".to_string(), majmin: "0:27".to_string() };
+        let entry = MountEntry { mount: PathBuf::from("/media/nas"), fstype: "smb3".to_string(), majmin: "0:27".to_string(), source: "//nas/media".to_string() };
         assert_eq!(classify_entry(Path::new("/media/nas/photos"), Some(&entry)), "network");
         assert_eq!(crate::backend::fsinfo::statfs_calls(), 0, "classify_entry itself decides on the fstype");
+    }
+
+    // Quick Look reads a Markdown file ahead and inline only on class "": every kernel and FUSE share below must not get it.
+    #[test]
+    fn kernel_cifs_nfs_and_fuse_shares_take_the_network_class_that_keeps_quick_look_from_reading_them() {
+        let body = "1 0 0:30 / / rw - ext4 /dev/a rw\n\
+            31 1 0:27 / /mnt/cifs rw - cifs //nas/media rw\n\
+            32 1 0:28 / /mnt/nfs rw - nfs4 nas:/export rw\n\
+            33 1 0:29 / /mnt/smb rw - smb3 //nas/media rw\n\
+            34 1 0:40 / /mnt/sshfs rw - fuse.sshfs me@nas:/ rw\n\
+            35 1 0:41 / /mnt/rclone rw - fuse.rclone remote: rw\n\
+            36 1 0:42 / /mnt/s3 rw - fuse.s3fs bucket rw\n\
+            37 1 0:43 / /mnt/local-fuse rw - fuse.mergerfs a:b rw\n";
+        for mount in ["cifs", "nfs", "smb", "sshfs", "rclone", "s3"] {
+            let path = format!("/mnt/{}/notes/README.md", mount);
+            assert_eq!(classify_in(Path::new(&path), body), "network", "{} reaches the class Quick Look refuses", mount);
+        }
+        assert_eq!(classify_in(Path::new("/mnt/local-fuse/README.md"), body), "", "an unlisted FUSE type is local, as netfs.rs pins");
     }
 
     #[test]

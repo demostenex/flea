@@ -1,9 +1,19 @@
 .pragma library
 .import "TextSize.js" as TextSize
 .import "Places.js" as Places
+.import "Format.js" as Format
 .import "Keymap.js" as Keymap
+.import "KeyName.js" as KeyName
 .import "SettingsShelf.js" as Shelf
 .import "SettingsAbout.js" as About
+
+// Whole sentences with "%1" for a value, filled by fill so each translates as one.
+var WORDS = {
+    sheetTip: "Press %1 for the keyboard sheet.",
+    loadTip: "%1 loads the current selection.",
+    textKeys: "%1 and %2 step through them; %3 follows Omarchy again.",
+    nearestStop: "Omarchy's own size. The ruler marks %1, the nearest stop."
+}
 
 // Sections follow the current Desktop boards; their state uses the shared ui.json updater.
 var SECTIONS = [
@@ -34,9 +44,9 @@ var MENU_GROUPS = [
     { id: "basic", label: "Basic file actions", ids: BASIC },
     { id: "destructive", label: "Destructive", ids: ["delete"] },
     { id: "openInspect", label: "Open and inspect",
-      ids: ["openwith", "openTerminal", "moveto", "copyto", "properties", "permissions", "copypath"] },
+      ids: ["openwith", "run", "openAsText", "openTerminal", "moveto", "copyto", "properties", "permissions", "makeExecutable", "copyAs", "showOriginal", "tags"] },
     { id: "extras", label: "Extras", features: ["placeMenu"],  // features gate a surface, not a row
-      ids: ["shelf", "compress", "extract", "convert", "taildrop", "localsend", "dropbox", "sharelink", "runScript", "placeMenu", "updateFlea", "extThumbs"] }
+      ids: ["shelf", "compress", "extract", "convert", "flashDrive", "taildrop", "localsend", "dropbox", "sharelink", "runScript", "placeMenu", "updateFlea", "toggleLangMarks", "extThumbs", "pasteAs", "invertSelection"] }
 ]
 
 // Open and Show hidden files draw the lock mark instead of a box, and the board says why: a menu that cannot open the row under the cursor is not a menu, and the hidden toggle is the one background row with no keyboard-independent alternative.
@@ -44,12 +54,13 @@ var LOCKED = ["open", "toggleHidden"]
 
 var LABELS = {
     cut: "Cut", copy: "Copy", paste: "Paste", duplicate: "Duplicate", rename: "Rename",
-    trash: "Move to Trash", openTerminal: "Open in terminal", copypath: "Copy path", permissions: "Permissions",
+    trash: "Move to Trash", openTerminal: "Open in terminal", copyAs: "Copy as", showOriginal: "Show original",
+    pasteAs: "Paste as", invertSelection: "Invert selection", permissions: "Permissions", makeExecutable: "Make executable",
     delete: "Delete permanently", openwith: "Open with", moveto: "Move to", copyto: "Copy to", properties: "Properties",
     compress: "Compress", extract: "Extract", localsend: "Send with LocalSend",
-    convert: "Convert", taildrop: "Send with Taildrop", dropbox: "Move to Dropbox",
-    sharelink: "Copy Share Link", open: "Open", toggleHidden: "Show hidden files", shelf: "Enable shelf", placeMenu: "Places row menu", runScript: "Run script",
-    updateFlea: "Update Flea", extThumbs: "Show thumbnails"
+    convert: "Convert", flashDrive: "Flash to drive", taildrop: "Send with Taildrop", dropbox: "Move to Dropbox", tags: "Tags",
+    sharelink: "Copy share link", open: "Open", toggleHidden: "Show hidden files", shelf: "Enable shelf", placeMenu: "Places row menu", runScript: "Run script",
+    updateFlea: "Update Flea", toggleLangMarks: "Show code icons", extThumbs: "Show thumbnails", run: "Run", openAsText: "Open as text"
 }
 
 // The four values of the Keys row, in SettingsKeys.html's own chooser order. The first is what a missing or unrecognised stored name resolves to, which that board says is Default.
@@ -59,11 +70,12 @@ var PRESET_LABELS = { "default": "Default", vim: "Vim", mac: "Mac", windows: "Wi
 // Every board row carries a left mark, and a switch wears the mark of the row it governs: these are ui/js/Menu.js's own glyphs by action id, which tests/js/settings.js asserts the two agree on.
 var GLYPHS = {
     cut: "scissors", copy: "copy", paste: "clipboard", duplicate: "file-plus", rename: "rename",
-    trash: "trash", openTerminal: "terminal", copypath: "file-text", permissions: "lock", compress: "archive",
+    trash: "trash", openTerminal: "terminal", copyAs: "file-text", showOriginal: "symlink",
+    pasteAs: "symlink", invertSelection: "contrast", permissions: "lock", makeExecutable: "play", compress: "archive",
     delete: "trash", openwith: "app-window", moveto: "folder-plus", copyto: "copy", properties: "info",
     extract: "archive-out",
-    convert: "sliders", sharelink: "network", open: "folder-open", toggleHidden: "eye", placeMenu: "folder-open", runScript: "terminal",
-    updateFlea: "download", extThumbs: "image", shelf: "shelf"
+    convert: "sliders", flashDrive: "drive", sharelink: "network", open: "folder-open", toggleHidden: "eye", placeMenu: "folder-open", runScript: "terminal",
+    updateFlea: "download", toggleLangMarks: "code", extThumbs: "image", shelf: "shelf", run: "play", openAsText: "file-text", tags: "tag"
 }
 
 // The shelf switch wears the cut glyph the menu row draws, never the animated brand mark.
@@ -89,7 +101,7 @@ function isHidden(hidden, id) {
     return contains(hidden, id)
 }
 
-// GM's ruling: the count is of ENABLED actions, so "5 of 6" means one of the six is switched off.
+// The rule: the count is of ENABLED actions, so "5 of 6" means one of the six is switched off.
 function basicEnabled(hidden, list) {
     var on = 0
     for (var i = 0; i < list.length; i++) {
@@ -177,7 +189,7 @@ function rows(section, state) {
 function effectiveNote(follows, baseSize) {
     var nearest = TextSize.nearest(baseSize)
     return !follows ? "Your override." : nearest === baseSize ? "Omarchy's own size."
-        : "Omarchy's own size. The ruler marks " + nearest + ", the nearest stop."
+        : Format.fill(WORDS.nearestStop, nearest)
 }
 
 // The SettingsScale board's own division: Flea owns its text override and Omarchy owns the rest. The size follows the desktop until one of TextSize's seven stops is pinned, and the monitor scale and the corner rounding are the compositor's, drawn as the read-only facts they are.
@@ -192,8 +204,9 @@ function displayRows(state) {
         { kind: "ruler", id: "textStop", stops: TextSize.STOPS, on: !follows,
           index: TextSize.STOPS.indexOf(TextSize.nearest(state.baseSize)) }
     ]
-    // SettingsRest rule 2 keeps only the chords, and HANDOFF rule 8 keeps them to the one line the panel can draw: the board's own sentence wrapped onto two at this width.
-    out.push({ kind: "hint", label: "Ctrl+Shift +/- walks them, Ctrl+Shift+0 follows." })
+    // SettingsRest rule 2 keeps only the chords; the hint wraps onto two lines at this width.
+    var textKeys = KeyName.hintedAll(WORDS.textKeys, ["textSizeUp", "textSizeDown", "textSizeReset"])
+    if (textKeys.length > 0) out.push({ kind: "hint", label: textKeys })
     // And Effective stays: it is state.baseSize, the size actually running, where the ruler marks TextSize.nearest() and a tie takes the smaller stop, so a base of 13 marks 12.
     out.push({ kind: "fact", id: "textEffective", label: "Effective", role: "live",
                value: state.baseSize + " px", caption: effectiveNote(follows, state.baseSize) })
@@ -201,7 +214,7 @@ function displayRows(state) {
     out.push({ kind: "fact", label: "Scale", glyph: "maximize",
                value: scaleLabel(state.monitorScale) })
     out.push({ kind: "hint",
-               label: "Flea follows the compositor value and does not step or cycle it." })
+               label: "Flea follows Hyprland's scale and does not change it." })
     out.push({ kind: "group", label: "Appearance" })
     out.push({ kind: "check", id: "display.hyprlandIcons", label: "Hyprland-aware icons",
                mark: MARKS["display.hyprlandIcons"],
@@ -281,7 +294,8 @@ function keyRows(state) {
         { kind: "group", label: "This preset" },
         { kind: "keyPreview", id: "keyPreview", items: keyPreview(state.preset) }
     ]
-    out.push({ kind: "hint", label: "Press ? for the keyboard sheet." })
+    var sheetTip = KeyName.hinted(WORDS.sheetTip, "keymapSheet")
+    if (sheetTip.length > 0) out.push({ kind: "hint", label: sheetTip })
     return out
 }
 
@@ -310,24 +324,44 @@ function viewRows(state) {
     var data = state.data || {}
     var sort = data.sort || {}
     var columns = data.columns || ["name", "size", "date"]
-    return [
+    var out = [
         { kind: "group", label: "View" },
         choice("view", "Last-used view", undefined, ["list", "columns", "grid", "dual"],
                ["List", "Columns", "Grid", "Dual pane"], data.view || "list"),
-        choice("density", "Row density", "list", ["compact", "normal", "comfortable"],
-               ["Compact", "Normal", "Comfortable"], data.density || "compact"),
+        { kind: "check", id: "rememberViewPerFolder", label: "Remember each folder's view", glyph: "folder",
+          on: data.rememberViewPerFolder === true },
+        choice("density", "Row density", "list", ["tight", "compact", "normal", "comfortable"],
+               ["Tight", "Compact", "Normal", "Comfortable"], data.density || "compact"),
+        { kind: "hint", label: "Compact stays the default." },
         { kind: "action", id: "columns", label: "Columns", glyph: "columns",
           value: columns.map(function (key) { return key.charAt(0).toUpperCase() + key.slice(1) }).join(", ") },
         choice("addressBar", "Address bar", undefined, ["path", "breadcrumb"],
                ["Path", "Breadcrumb"], data.addressBar || "breadcrumb"),
+        // ColumnsWidth board, #167 and #69: the count follows the window width, capped here.
+        choice("columnsLimit", "Columns view limit", "columns", [2, 3, 4, 5],
+               ["2", "3", "4", "5"], data.columnsLimit || 3),
+        { kind: "check", id: "highlightToday", label: "Highlight today's dates", glyph: "history",
+          on: data.highlightToday === true },
+        // Drops callout 2: off until switched on, and the board draws it with no mark, like escapeUp.
+        { kind: "check", id: "openFoldersWhileDragging", label: "Open folders while dragging",
+          on: data.openFoldersWhileDragging === true },
         { kind: "group", label: "Sorting" },
         choice("sort.key", "Sort by", "sort", ["name", "size", "date", "kind"],
                ["Name", "Size", "Date", "Kind"], sort.key || "name"),
         { kind: "check", id: "foldersFirst", label: "Folders first", glyph: "folders-first", on: data.foldersFirst !== false },
         { kind: "check", id: "groupByKind", label: "Group by kind", caption: "folders, photos, files", glyph: "grid", on: data.groupByKind === true },
         { kind: "check", id: "hidden", label: "Show hidden files", glyph: "eye", on: data.hidden === true },
+        // Issue 70: a dependent greys in place at the same column while hidden files are off, with no hint.
+        { kind: "check", id: "hiddenLast", label: "Hidden files last", glyph: "eye-off",
+          on: data.hiddenLast === true, available: data.hidden === true },
+        { kind: "check", id: "langMarks", label: "Show code icons", glyph: "code", on: data.langMarks !== false },
+        // Issue 179: the group's last row; off, every folder takes the default sort and nothing is written.
+        { kind: "check", id: "rememberSort", label: "Remember each folder's sort", glyph: "sort",
+          on: data.rememberSort !== false },
         { kind: "group", label: "Cursor" },
         { kind: "check", id: "wrapAtEnds", label: "Wrap at list ends", caption: "arrow-up at the top", glyph: "arrow-up", on: data.wrapAtEnds === true },
+        // Issue 29: Escape climbs to the parent while on, and stays put while off, which is 0.3.4.
+        { kind: "check", id: "escapeUp", label: "Escape goes up a folder", caption: "with nothing to close", on: data.escapeUp === true },
         { kind: "group", label: "Opening" },
         choice("startIn", "Flea opens in", "house", ["home", "last", "folder"],
                ["Home", "Last folder", "Chosen folder"], data.startIn || "home"),
@@ -336,9 +370,25 @@ function viewRows(state) {
           value: data.startFolder || "Use this folder" },
         choice("newTab", "New tabs open in", "columns", ["current", "home", "start"],
                ["Current folder", "Home", "Start folder"], data.newTab || "current"),
-        { kind: "hint", footer: true, label: state.saveStatus || "Saved · applied in this process",
+        // ClickAndRefresh: one tap opens in single mode and selects with a modifier, so the
+        // slow-click rename below has nothing to answer and greys in place, the way hiddenLast does.
+        choice("openMode", "Open items with", "pointer", ["double", "single"],
+               ["Double click", "Single click"], data.openMode || "double"),
+        { kind: "check", id: "clickRename", label: "Click a selected name to rename",
+          on: data.clickRename !== false, available: data.openMode !== "single" },
+        { kind: "hint", footer: true, label: state.saveStatus || "Saved",
           role: (state.saveStatus || "").indexOf("Could not") === 0 ? "error" : "accent" }
     ]
+    // Tabs040 callout 2, the board's own sentence, under the control it explains and only there.
+    if ((data.startIn || "home") === "last") {
+        for (var i = 0; i < out.length; i++) {
+            if (out[i].id === "startIn") {
+                out.splice(i + 1, 0, { kind: "hint", label: "Last folder reopens every tab you had." })
+                break
+            }
+        }
+    }
+    return out
 }
 
 function previewRows(state) {
@@ -348,15 +398,17 @@ function previewRows(state) {
     // Rule 7: with the column off, SelectionPreview.canRead is false and both load paths return, so Load is the one real dependent here and it greys rather than lying.
     load.available = data.column !== false
     // One value per row, rule 4: the board drops the figure outright, because "64 px  Medium" is one fact twice.
-    var size = choice("preview.thumbSize", "Thumbnail size", "maximize", ["small", "medium", "large", "xlarge"],
-                      ["Small", "Medium", "Large", "Extra large"], data.thumbSize || "medium")
-    return [
+    var size = choice("preview.thumbSize", "Thumbnail size", "maximize", ["small", "medium", "large", "xlarge", "huge", "largest"],
+                      ["Small", "Medium", "Large", "Extra large", "Huge", "Largest"], data.thumbSize || "medium")
+    var head = [
         { kind: "group", label: "Preview column" },
         // Preview board rule 4: the heading names the group, so the row under it names the switch.
         { kind: "check", id: "preview.column", label: "Show the preview column", glyph: "columns", on: data.column !== false },
-        load,
-        // Rule 3: a hint sits under the control it explains, not two hairlines below it in a footer.
-        { kind: "hint", label: data.loadOn === "manual" ? "Ctrl+Space loads the current selection." : "Automatic follows the cursor." },
+        load
+    ]
+    // Rule 3: a hint sits under the control it explains, not two hairlines below it in a footer; none when the preset binds no key to name.
+    var loadTip = data.loadOn === "manual" ? KeyName.hinted(WORDS.loadTip, "loadPreview") : "Automatic follows the cursor."
+    var tail = [
         { kind: "group", label: "Thumbnails" },
         choice("preview.thumbnails", "Thumbnails", "image", ["off", "images", "media"],
                ["Off", "Images", "Everything"], data.thumbnails || "media"),
@@ -376,6 +428,7 @@ function previewRows(state) {
         // Rule 7: GridArea gates ctrl-scroll on ViewState.ctrlZoom alone and sizes the tiles from it with thumbnails off, so it is grid zoom, it is named that, and it never greys with them.
         { kind: "check", id: "preview.ctrlZoom", label: "Zoom the grid with ctrl and scroll", glyph: "move-horizontal", on: data.ctrlZoom !== false }
     ]
+    return head.concat(loadTip.length > 0 ? [{ kind: "hint", label: loadTip }] : [], tail)
 }
 
 function columnRows(state) {
@@ -396,15 +449,18 @@ function placesRows(state) {
     var rows = [{ kind: "group", label: "Favorites", id: "addFavourite", action: "addFavourite", value: "Add this folder" }]
     for (var i = 0; i < entries.length; i++) {
         rows.push({ kind: "favourite", id: "favourite:" + i, label: entries[i].label,
-            value: entries[i].storedPath, glyph: entries[i].glyph, error: entries[i].error || (state.favouriteStatuses || {})[i] || "", favouriteIndex: i })
+            value: entries[i].storedPath, display: Format.tilde(entries[i].storedPath, state.home || ""), glyph: entries[i].glyph, error: entries[i].error || (state.favouriteStatuses || {})[i] || "", favouriteIndex: i })
     }
     rows.push({ kind: "group", label: "Built in" })
-    var builtins = [["showHome", "Home", "house"], ["showNetwork", "Network", "network"],
-                    ["showDevices", "Devices", "drive"], ["showTrash", "Trash", "trash"]]
-    for (var b = 0; b < builtins.length; b++) rows.push({ kind: "check", id: "places." + builtins[b][0], label: builtins[b][1], glyph: builtins[b][2], on: data[builtins[b][0]] !== false })
-    rows.push({ kind: "group", label: "Rail" })
+    // Sidebar040: Recent sits beside Home, Network, Devices and Trash, and ships off.
+    // The fourth field is what a key the file never stored reads as, the way the Rail group below reads its own.
+    var builtins = [["showHome", "Home", "house", true], ["showRecent", "Recent", "history", false],
+                    ["showNetwork", "Network", "network", true],
+                    ["showDevices", "Devices", "drive", true], ["showTrash", "Trash", "trash", true]]
+    for (var b = 0; b < builtins.length; b++) rows.push({ kind: "check", id: "places." + builtins[b][0], label: builtins[b][1], glyph: builtins[b][2], on: builtins[b][3] ? data[builtins[b][0]] !== false : data[builtins[b][0]] === true })
+    rows.push({ kind: "group", label: "Sidebar" })
     // The fourth field is src/uischema.rs's shipped value, which is what a key the file never stored reads as.
-    var rail = [["driveSize", "Show drive size", "drive", false], ["trashCount", "Show Trash count", "trash", false], ["showUnmounted", "Show unmounted drives", "drive", true], ["autoHide", "Auto-hide sidebar", "maximize", false]]
+    var rail = [["driveSize", "Show drive size", "drive", false], ["trashCount", "Show Trash count", "trash", false], ["showUnmounted", "Show unmounted drives", "drive", true], ["showTags", "Show tags", "tag", false], ["autoHide", "Auto-hide sidebar", "maximize", false]]
     for (var r = 0; r < rail.length; r++) rows.push({ kind: "check", id: "places." + rail[r][0], label: rail[r][1], glyph: rail[r][2], on: rail[r][3] ? data[rail[r][0]] !== false : data[rail[r][0]] === true })
     // Directive 74: the rail is remembered as a word, so this row reads it as one; ctrl-b writes the same leaf. Directive 77: auto-hide answers the pointer instead, so the remembered choice is greyed while that is on rather than quietly ignored.
     rows.push({ kind: "check", id: "places.rail", label: "Show sidebar", glyph: "columns", on: data.rail !== "hidden", available: data.autoHide !== true })

@@ -1,18 +1,24 @@
 // Menu snapshots own selected identities; registry work runs only after an explicit menu action.
 use crate::backend::opsreq::OpMsg;
 use super::menu_registry::{self, Registry};
+use super::menu_slot::{CloseOnExit, MenuSlot, Sent};
 use super::trashmanifest::Cancellation;
 use crate::json::{escape, field_bool, field_str, field_usize};
 use std::fs::{Metadata, OpenOptions};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// The sentence every backend refusal of a menu selection that no longer matches uses, the one the UI shows for a stale route; selected_path alone names one missing item.
+pub(crate) const SELECTION_CHANGED: &str = "Selected items changed; reopen the menu.";
+const MENU_STOPPED: &str = "The menu stopped answering; reopen this window.";
+const DELETE_EXPIRED: &str = "The delete confirmation expired; confirm again.";
+
 pub struct MenuActions {
-    requests: SyncSender<(String, Vec<String>, Option<String>, Cancellation)>,
+    slot: Arc<MenuSlot>,
     replies: Sender<OpMsg>,
     snapshot: Arc<Mutex<Snapshot>>,
     cancellation: Mutex<Cancellation>,
@@ -23,8 +29,9 @@ pub struct MenuActions {
 impl MenuActions {
     pub fn new(replies: Sender<OpMsg>) -> Self {
         // One pending request bounds repeated activation while an application registry query runs.
-        let (requests, receiver) = sync_channel::<(String, Vec<String>, Option<String>, Cancellation)>(1);
+        let slot = Arc::new(MenuSlot::default());
         let output = replies.clone();
+        let queued = Arc::clone(&slot);
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let published = Arc::clone(&snapshot);
         let registry = Registry::default();
@@ -32,8 +39,15 @@ impl MenuActions {
         let restoration = Arc::new(Mutex::new((0, Vec::new())));
         let completed = Arc::clone(&restoration);
         std::thread::spawn(move || {
-            while let Ok((line, paths, cursor, cancel)) = receiver.recv() {
+            let _close = CloseOnExit(Arc::clone(&queued));
+            while let Some((line, paths, cursor, cancel)) = queued.take() {
                 let mut state = published.lock().unwrap().clone();
+                if field_str(&line, "op").as_deref() == Some("contents") {
+                    if super::menucontents::serve(&line, state.id, &state.items, &output, &cancel) { continue; } else { break; }
+                }
+                if field_str(&line, "op").as_deref() == Some("facts") {
+                    if super::menufacts::serve(&line, state.id, &state.items, &output, &cancel) { continue; } else { break; }
+                }
                 let mut reply = if cancel.check().is_ok() {
                     state.handle_request(&line, paths, cursor.as_deref(), &queries, &cancel)
                 } else { response(&line, Err("Menu request cancelled.".into())) };
@@ -53,25 +67,25 @@ impl MenuActions {
                 if output.send(message).is_err() { break; }
             }
         });
-        Self { requests, replies, snapshot, cancellation: Mutex::new(Cancellation::default()), registry, requested_id: AtomicUsize::new(0), restoration }
+        Self { slot, replies, snapshot, cancellation: Mutex::new(Cancellation::default()), registry, requested_id: AtomicUsize::new(0), restoration }
     }
     pub(crate) fn retain_survivors(&self, id: usize, matches: &mut Vec<(&str, usize)>) -> Result<(), String> {
-        let restoration = self.restoration.lock().map_err(|_| "The menu service stopped; refresh this window.")?;
-        if id == 0 || restoration.0 != id { return Err("Deletion survivor identities expired; select the items again.".into()); }
+        let restoration = self.restoration.lock().map_err(|_| MENU_STOPPED)?;
+        if id == 0 || restoration.0 != id { return Err("The items changed; select them again.".into()); }
         let originals: HashMap<_, _> = restoration.1.iter().map(|item| (item.path.as_path(), item)).collect();
         matches.retain(|(path, _)| originals.get(Path::new(path)).is_some_and(|item| item.current().is_ok()));
         Ok(())
     }
     pub(crate) fn selection(&self, id: usize) -> Result<Vec<Selected>, String> {
-        let snapshot = self.snapshot.lock().map_err(|_| "The menu service stopped; reopen this window.")?;
+        let snapshot = self.snapshot.lock().map_err(|_| MENU_STOPPED)?;
         if id == 0 || snapshot.id != id || snapshot.items.is_empty() {
-            return Err("Menu selection expired; reopen the menu.".into());
+            return Err(SELECTION_CHANGED.into());
         }
         Ok(snapshot.items.clone())
     }
     pub(crate) fn provider_destination(&self, id: usize, dest: &Path) -> Result<Option<Selected>, String> {
-        let snapshot = self.snapshot.lock().map_err(|_| "The menu service stopped; reopen this window.")?;
-        if snapshot.id != id { return Err("Menu selection expired; reopen the menu.".into()); }
+        let snapshot = self.snapshot.lock().map_err(|_| MENU_STOPPED)?;
+        if snapshot.id != id { return Err(SELECTION_CHANGED.into()); }
         if snapshot.provider_transfer {
             snapshot.check_provider_destination(dest)?;
             return Ok(snapshot.provider_destination.clone());
@@ -79,10 +93,10 @@ impl MenuActions {
         Ok(None)
     }
     pub(crate) fn selected_path(&self, id: usize, path: &Path) -> Result<Selected, String> {
-        let snapshot = self.snapshot.lock().map_err(|_| "The menu service stopped; reopen this window.")?;
-        if id == 0 || snapshot.id != id { return Err("Menu selection expired; reopen the menu.".into()); }
+        let snapshot = self.snapshot.lock().map_err(|_| MENU_STOPPED)?;
+        if id == 0 || snapshot.id != id { return Err(SELECTION_CHANGED.into()); }
         snapshot.items.iter().find(|item| item.path == path).cloned()
-            .ok_or_else(|| "This path was not in the menu selection; reopen the menu.".into())
+            .ok_or_else(|| "That item is no longer selected; reopen the menu.".into())
     }
     pub fn request(&self, line: String, paths: Vec<String>, cursor: Option<String>) -> bool {
         let op = field_str(&line, "op").unwrap_or_default();
@@ -105,22 +119,27 @@ impl MenuActions {
                 return false;
             }
         }
-        if let Err(error) = self.requests.try_send((line, paths, cursor, cancellation.clone())) {
-            let (request, reason) = match error {
-                TrySendError::Full(request) => (request, "A menu request is still running; try again when it finishes."),
-                TrySendError::Disconnected(request) => (request, "The menu service stopped; reopen this window."),
-            };
-            let reply = response(&request.0, Err(reason.into()));
-            let _ = self.replies.send(OpMsg::Meta { line: reply });
-            return false;
-        }
-        true
+        let refusal = match self.slot.send((line, paths, cursor, cancellation.clone())) {
+            Sent::Queued => return true,
+            Sent::Displaced(older) => {
+                let mut reply = response(&older.0, Err("Menu request cancelled.".into()));
+                reply.insert_str(reply.len() - 1, r#", "cancelled":true"#);
+                let _ = self.replies.send(OpMsg::Meta { line: reply });
+                return true;
+            }
+            Sent::Busy(refused) => (refused.0, "A menu request is still running; try again when it finishes."),
+            Sent::Closed(refused) => (refused.0, MENU_STOPPED),
+        };
+        let reply = response(&refusal.0, Err(refusal.1.into()));
+        let _ = self.replies.send(OpMsg::Meta { line: reply });
+        false
     }
 }
 
 impl Drop for MenuActions {
     fn drop(&mut self) {
         self.cancellation.lock().unwrap().next();
+        self.slot.close();
         if let Err(error) = self.registry.cancel() { eprintln!("flea: {}", error); }
     }
 }
@@ -139,7 +158,7 @@ struct Snapshot {
 fn publish_snapshot(mut published: MutexGuard<'_, Snapshot>, state: Snapshot, cancel: &Cancellation) {
     if cancel.check().is_ok() { *published = state; }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Selected {
     pub path: PathBuf,
     dev: u64,
@@ -168,7 +187,7 @@ pub(crate) fn validate_sources(items: Option<&[Selected]>, paths: &[PathBuf]) ->
     let Some(items) = items else { return Ok(()); };
     let captured: HashSet<_> = items.iter().map(|item| item.path.as_path()).collect();
     let requested: HashSet<_> = paths.iter().map(|path| path.as_path()).collect();
-    if captured != requested { return Err("The operation does not match the captured menu selection.".into()); }
+    if captured != requested { return Err(SELECTION_CHANGED.into()); }
     for item in items { item.current().map_err(|error| format!("{}: {}", item.path.display(), error))?; }
     Ok(())
 }
@@ -191,7 +210,8 @@ impl Snapshot {
                     self.cursor = cursor.map(Selected::inspect).transpose()?;
                     self.items = items;
                     self.id = id;
-                    Ok(format!(r#""count":{}"#, self.items.len()))
+                    let kinds = self.items.iter().map(|item| item.kind.to_string()).collect::<Vec<_>>().join(",");
+                    Ok(format!(r#""count":{},"kinds":[{}]"#, self.items.len(), kinds))
                 })
             }
         } else if op == "close" {
@@ -204,7 +224,7 @@ impl Snapshot {
     }
     fn perform(&mut self, id: usize, op: &str, line: &str, registry: &Registry, cancel: &Cancellation) -> Result<String, String> {
         if id == 0 || id != self.id || self.items.is_empty() {
-            return Err("Menu selection expired; reopen the menu.".into());
+            return Err(SELECTION_CHANGED.into());
         }
         if op == "delete" {
             let review = self.take_deletion(field_usize(line, "token").unwrap_or(0))?;
@@ -217,7 +237,7 @@ impl Snapshot {
         if op == "checkDelete" {
             let token = field_usize(line, "token").unwrap_or(0);
             let review = self.deletion.as_ref().filter(|review| token > 0 && review.token == token)
-                .ok_or("Deletion confirmation expired; review a fresh confirmation.")?;
+                .ok_or(DELETE_EXPIRED)?;
             return Ok(format!(r#""valid":{}"#, review.validate(cancel).is_ok()));
         }
         if op == "refreshDelete" {
@@ -238,7 +258,7 @@ impl Snapshot {
         if op == "providerDestination" {
             let dest = field_str(line, "dest").unwrap_or_default();
             let selected = Selected::inspect(&dest)?;
-            if !selected.current()?.is_dir() { return Err("Dropbox account folder is not a directory.".into()); }
+            if !selected.current()?.is_dir() { return Err("The Dropbox account path is not a folder.".into()); }
             self.provider_destination = Some(selected);
             return Ok(String::new());
         }
@@ -255,11 +275,11 @@ impl Snapshot {
             }
             if op == "activate" { self.provider_transfer = action == "dropbox"; }
             if action.starts_with("taildrop:") || action == "sharelink" {
-                let cursor = self.cursor.as_ref().ok_or("Cursor source was not captured; reopen the menu.")?;
+                let cursor = self.cursor.as_ref().ok_or("The item under the cursor changed; reopen the menu.")?;
                 cursor.current()?;
                 return Ok(format!(r#""action":"{}","paths":["{}"]"#, escape(&action), escape(&cursor.path.to_string_lossy())));
             }
-            let needs_paths = op == "validate" || matches!(action.as_str(), "copy" | "cut" | "copypath" | "addFavourite" | "localsend") || action.starts_with("compress:") || action.starts_with("runScript:") || action.starts_with("localsend:");
+            let needs_paths = op == "validate" || matches!(action.as_str(), "copy" | "cut" | "compare" | "copypath" | "copyAs" | "copyPath" | "copyName" | "copyStem" | "copydirpath" | "copyUri" | "copyQuoted" | "showOriginal" | "makeExecutable" | "pasteAs" | "pasteLink" | "pasteAbsoluteLink" | "pasteHardLink" | "addFavourite" | "localsend") || action.starts_with("compress:") || action.starts_with("runScript:") || action.starts_with("localsend:") || action.starts_with("copyAs:") || action.starts_with("pasteAs:");
             let paths: Vec<String> = if needs_paths { self.items.iter().map(|i| format!(r#""{}""#, escape(&i.path.to_string_lossy()))).collect() } else { Vec::new() };
             return Ok(format!(r#""action":"{}","paths":[{}],"dest":"{}""#,
                 escape(&action), paths.join(","),
@@ -273,11 +293,12 @@ impl Snapshot {
                 let kind = if meta.file_type().is_symlink() { "Symbolic link" } else if meta.is_dir() { "Directory" }
                            else if meta.is_file() { "File" } else { "Special file" };
                 let target = if meta.file_type().is_symlink() {
-                    std::fs::read_link(&item.path).map_err(|e| format!("Could not read symlink: {}.", e))?.to_string_lossy().to_string()
+                    std::fs::read_link(&item.path).map_err(|e| format!("Could not read the link: {}.", crate::error::io_message(&e)))?.to_string_lossy().to_string()
                 } else { String::new() };
-                Ok(format!(r#""path":"{}","kind":"{}","directory":{},"symlink":{},"target":"{}","bytes":{},"modified":{},"mode":"{:04o}","owner":"{}","uid":{},"gid":{}"#,
+                Ok(format!(r#""path":"{}","kind":"{}","directory":{},"symlink":{},"target":"{}","bytes":{},"modified":{},"mode":"{:04o}","owner":"{}","uid":{},"gid":{},"tags":{},"photo":{}"#,
                     escape(&item.path.to_string_lossy()), kind, meta.is_dir(), meta.file_type().is_symlink(), escape(&target),
-                    meta.len(), meta.mtime(), meta.mode() & 0o7777, escape(&super::owner::name(meta.uid())), meta.uid(), meta.gid()))
+                    meta.len(), meta.mtime(), meta.mode() & 0o7777, escape(&super::owner::name(meta.uid())), meta.uid(), meta.gid(), super::tags::names_json(&item.path),
+                    super::metareq::photo_json(&super::metareq::photo(&item.path, true))))
             }
             "applications" => {
                 let found = menu_registry::catalogue(registry, &item.path, field_bool(line, "installed"), cancel)?;
@@ -300,7 +321,7 @@ impl Snapshot {
                         return Err(format!("Opened it, but {} has no file type to set a default for.", item.path.display()));
                     }
                     if let Err(error) = menu_registry::set_default(registry, &mime, &app.id, cancel) {
-                        return Err(format!("Opened it, but the default was not saved: {}", error));
+                        return Err(format!("Opened it, but the default was not saved: {}.", error.trim_end_matches('.')));
                     }
                 }
                 Ok(format!(r#""path":"{}""#, escape(&item.path.to_string_lossy())))
@@ -310,7 +331,7 @@ impl Snapshot {
     }
     fn take_deletion(&mut self, token: usize) -> Result<Arc<super::menudelete::Review>, String> {
         self.deletion.take().filter(|review| token > 0 && review.token == token)
-            .ok_or_else(|| "Deletion confirmation expired; review a fresh confirmation.".into())
+            .ok_or_else(|| DELETE_EXPIRED.into())
     }
     fn check_provider_destination(&self, dest: &Path) -> Result<(), String> {
         let selected = self.provider_destination.as_ref().filter(|selected| selected.path == dest)
@@ -348,7 +369,7 @@ pub fn create_file(parent: &Path, name: &str) -> Result<(PathBuf, super::undo::I
     let path = parent.join(name);
     let file = OpenOptions::new().write(true).create_new(true).open(&path)
         .map_err(|e| format!("Could not create {}: {}.", path.display(), crate::error::io_message(&e)))?;
-    let meta = file.metadata().map_err(|e| format!("Created {}, but could not record its identity: {}.", path.display(), crate::error::io_message(&e)))?;
+    let meta = file.metadata().map_err(|e| format!("Created {}, but undo cannot remove it: {}.", path.display(), crate::error::io_message(&e)))?;
     Ok((path, super::undo::ItemIdentity::record(&meta)))
 }
 
@@ -357,7 +378,81 @@ mod tests {
     use super::*;
     use crate::backend::testdir::TestDir;
     use std::os::unix::fs::symlink;
+    pub(super) const CHANGED: &str = "Selected items changed; reopen the menu.";
 
+    // A menu whose worker never runs: no scheduling luck decides what stays queued.
+    pub(super) fn unstarted_menu() -> (MenuActions, std::sync::mpsc::Receiver<OpMsg>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let menu = MenuActions {
+            slot: Arc::new(MenuSlot::default()),
+            replies: tx,
+            snapshot: Arc::new(Mutex::new(Snapshot::default())),
+            cancellation: Mutex::new(Cancellation::default()),
+            registry: Registry::default(),
+            requested_id: AtomicUsize::new(0),
+            restoration: Arc::new(Mutex::new((0, Vec::new()))),
+        };
+        (menu, rx)
+    }
+
+    #[test]
+    fn a_queued_snapshot_yields_its_slot_to_a_newer_snapshot() {
+        let (menu, rx) = unstarted_menu();
+        let line = |id: usize| format!(r#"{{"c":"menuaction","op":"snapshot","id":{}}}"#, id);
+        assert!(menu.request(line(41), vec![], None));
+        assert!(menu.request(line(42), vec![], None),
+            "a reopen during its own snapshot must not refuse while that snapshot is still queued");
+        match rx.try_recv().expect("the displaced snapshot must still be answered") {
+            OpMsg::Meta { line } => assert!(field_usize(&line, "id") == Some(41) && field_bool(&line, "cancelled")),
+            _ => panic!("a displaced snapshot is answered as Meta"),
+        }
+        let queued = menu.slot.take().expect("the newer snapshot must hold the slot");
+        assert_eq!(field_usize(&queued.0, "id"), Some(42), "the older snapshot must be displaced and answered, never run");
+        menu.slot.close();
+        assert!(menu.slot.take().is_none());
+    }
+
+    #[test]
+    fn queued_work_is_never_displaced_by_a_snapshot() {
+        let (menu, rx) = unstarted_menu();
+        let activate = r#"{"c":"menuaction","op":"activate","id":7,"action":"pasteAs:pasteLink"}"#.to_string();
+        assert!(menu.request(activate, vec![], None));
+        assert!(!menu.request(r#"{"c":"menuaction","op":"snapshot","id":8}"#.to_string(), vec![], None),
+            "work must keep its slot; only the refusal may answer");
+        match rx.try_recv().expect("the refusal must still answer rather than hang") {
+            OpMsg::Meta { line } => {
+                assert_eq!(field_usize(&line, "id"), Some(8));
+                assert!(!field_bool(&line, "ok") && line.contains("still running"));
+            }
+            _ => panic!("a refusal must arrive as Meta"),
+        }
+        let queued = menu.slot.take().expect("the activate must still be queued");
+        assert_eq!(field_usize(&queued.0, "id"), Some(7));
+    }
+
+    #[test]
+    fn a_reopened_snapshot_is_answered_end_to_end() {
+        let sandbox = TestDir::new("menu-resnapshot");
+        let path = sandbox.file("item", "body");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let menu = MenuActions::new(tx);
+        let line = |id: usize| format!(r#"{{"c":"menuaction","op":"snapshot","id":{}}}"#, id);
+        let paths = vec![path.to_string_lossy().into_owned()];
+        assert!(menu.request(line(41), paths.clone(), None));
+        assert!(menu.request(line(42), paths, None));
+        // At most two replies are owed; the reopened snapshot's answer must be among them.
+        let mut saw42 = false;
+        for _ in 0..2 {
+            let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("a snapshot reply");
+            if let OpMsg::Meta { line } = reply {
+                if field_usize(&line, "id") == Some(42) && field_bool(&line, "ok") {
+                    saw42 = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw42, "the reopened snapshot must still be answered");
+    }
     #[test]
     fn cancellation_at_publication_cannot_resurrect_a_closed_snapshot() {
         let published = Mutex::new(Snapshot::default());
@@ -449,7 +544,7 @@ mod tests {
         let mut snapshot = Snapshot::default();
         assert!(snapshot.handle(r#"{"op":"snapshot","id":3}"#, vec![path.to_string_lossy().into()]).contains(r#""ok":true"#));
         assert!(snapshot.handle(r#"{"op":"activate","id":3,"action":"addFavourite"}"#, vec![]).contains(&format!(r#""paths":["{}"]"#, path.display())));
-        assert!(snapshot.handle(r#"{"op":"validate","id":2}"#, vec![]).contains("expired"));
+        assert!(snapshot.handle(r#"{"op":"validate","id":2}"#, vec![]).contains(crate::backend::menu_actions::SELECTION_CHANGED));
         let moved = sandbox.join("old");
         assert!(path.is_absolute() && path.starts_with(sandbox.path()) && moved.starts_with(sandbox.path()));
         std::fs::rename(&path, moved).unwrap();
@@ -504,7 +599,7 @@ mod tests {
             assert!(crate::json::field_str_array(&reply, "paths").is_empty());
         }
         snapshot.handle(r#"{"op":"snapshot","id":12}"#, vec![marked.to_string_lossy().into()]);
-        assert!(snapshot.handle(r#"{"op":"activate","id":12,"action":"taildrop:peer"}"#, vec![]).contains("Cursor source was not captured"));
+        assert!(snapshot.handle(r#"{"op":"activate","id":12,"action":"taildrop:peer"}"#, vec![]).contains("The item under the cursor changed; reopen the menu."));
         assert_eq!(std::fs::read_to_string(marked).unwrap(), "marked");
         assert_eq!(std::fs::read_to_string(cursor).unwrap(), "replacement");
     }
@@ -555,6 +650,25 @@ mod tests {
         assert!(line.contains(r#""symlink":true"#));
         assert_eq!(field_str(&line, "target"), Some(target.to_string_lossy().into()));
         snapshot.handle(r#"{"op":"close","id":9}"#, vec![]);
-        assert!(snapshot.handle(r#"{"op":"properties","id":9}"#, vec![]).contains("expired"));
+        assert!(snapshot.handle(r#"{"op":"properties","id":9}"#, vec![]).contains(crate::backend::menu_actions::SELECTION_CHANGED));
+    }
+    #[test]
+    fn properties_carry_a_jpeg_s_photo_facts_and_a_plain_file_carries_none() {
+        let sandbox = TestDir::new("menu-photo");
+        // FFD8, APP1 "Exif\0\0" whose IFD0 holds one Model of "R6", then EOI.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x22];
+        jpeg.extend_from_slice(b"Exif\0\0II*\0\x08\0\0\0\x01\0\x10\x01\x02\0\x03\0\0\0R6\0\0\0\0\0\0\xFF\xD9");
+        let photo = sandbox.file("shot.jpg", "");
+        std::fs::write(&photo, jpeg).unwrap();
+        let plain = sandbox.file("notes.txt", "body");
+        let mut snapshot = Snapshot::default();
+        snapshot.handle(r#"{"op":"snapshot","id":4}"#, vec![photo.to_string_lossy().into()]);
+        assert!(snapshot.handle(r#"{"op":"properties","id":4}"#, vec![]).contains(r#""photo":{"model":"R6"}"#));
+        snapshot.handle(r#"{"op":"snapshot","id":5}"#, vec![plain.to_string_lossy().into()]);
+        assert!(snapshot.handle(r#"{"op":"properties","id":5}"#, vec![]).contains(r#""photo":null"#));
     }
 }
+
+#[cfg(test)]
+#[path = "menu_actions_wording_tests.rs"]
+mod wording;

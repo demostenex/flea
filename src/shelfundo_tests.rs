@@ -9,13 +9,15 @@ fn moved_step(from: &Path, to: &Path) -> Step {
         to: to.to_path_buf(),
         before: ItemIdentity::inspect(to).unwrap(),
         after: ItemIdentity::inspect(to).unwrap(),
+        rename_fat: false,
     }
 }
 
 fn move_of(dir: &Path, name: &str) -> Move {
     let to = dir.join(name);
-    let (dev, ino, kind) = ItemIdentity::inspect(&to).unwrap().parts();
-    Move { from: dir.join("was").join(name).to_string_lossy().to_string(), to: to.to_string_lossy().to_string(), dev, ino, kind }
+    let landed = ItemIdentity::inspect(&to).unwrap();
+    let (dev, ino, kind) = landed.parts();
+    Move { from: dir.join("was").join(name).to_string_lossy().to_string(), to: to.to_string_lossy().to_string(), dev, ino, kind, born: landed.born() }
 }
 
 #[test]
@@ -70,6 +72,25 @@ fn undo_refuses_to_walk_a_stranger_back() {
     assert!(landed.exists(), "and it is left exactly where it is");
 }
 
+// Forge only the recorded birth stamp so inode allocation cannot decide this refusal.
+#[test]
+fn a_row_born_at_another_time_is_a_stranger_and_a_row_with_no_birth_time_is_not() {
+    let dir = TestDir::new("shelfundo-born");
+    std::fs::create_dir_all(dir.path().join("was")).unwrap();
+    let landed = dir.path().join("a.txt");
+    std::fs::write(&landed, "a").unwrap();
+    let mut step = move_of(dir.path(), "a.txt");
+    let Some((sec, nsec)) = step.born else { return };
+    step.born = Some((sec.wrapping_add(1), nsec));
+    let refused = put_back(&step).expect_err("same device, inode and kind, another birth time");
+    assert!(refused.contains("was replaced since the move"), "{}", refused);
+    assert!(landed.exists(), "and it is left exactly where it is");
+    // A row written before birth time was kept falls back to device, inode and kind.
+    step.born = None;
+    put_back(&step).expect("nothing contradicts the row");
+    assert!(dir.path().join("was/a.txt").exists());
+}
+
 #[test]
 fn undo_puts_the_file_back_where_the_move_took_it_from() {
     let dir = TestDir::new("shelfundo-back");
@@ -96,6 +117,30 @@ fn a_row_missing_a_field_is_not_a_move() {
         fields.retain(|(name, _)| name != missing);
         let doc = Json::Obj(vec![("moves".to_string(), Json::Arr(vec![Json::Obj(fields)]))]);
         assert!(moves_of(&doc).is_empty(), "a row with no {} is not reversible", missing);
+    }
+}
+
+// Sample input: a row with "born":["1789426900","5000"], seconds then nanoseconds, or with no born at all.
+#[test]
+fn a_row_loads_with_its_birth_time_or_without_one_and_a_malformed_one_is_dropped() {
+    let text = |value: &str| Json::Str(value.to_string());
+    let doc = |born: Option<Json>| {
+        let mut fields = vec![
+            ("from".to_string(), text("/a")),
+            ("to".to_string(), text("/b")),
+            ("dev".to_string(), text("66306")),
+            ("ino".to_string(), text("41")),
+            ("kind".to_string(), text("32768")),
+        ];
+        fields.extend(born.map(|b| ("born".to_string(), b)));
+        Json::Obj(vec![("moves".to_string(), Json::Arr(vec![Json::Obj(fields)]))])
+    };
+    assert_eq!(moves_of(&doc(None))[0].born, None, "a row from before birth time was kept still loads");
+    let pair = Json::Arr(vec![text("1789426900"), text("5000")]);
+    assert_eq!(moves_of(&doc(Some(pair)))[0].born, Some((1_789_426_900, 5000)));
+    let too_big = Json::Arr(vec![text("1"), text("4294967296")]);
+    for bad in [Json::Null, text("x"), Json::Arr(Vec::new()), Json::Arr(vec![text("1")]), Json::Arr(vec![text("a"), text("1")]), too_big] {
+        assert!(moves_of(&doc(Some(bad.clone()))).is_empty(), "a malformed birth time is no move: {:?}", bad);
     }
 }
 
@@ -134,8 +179,9 @@ fn undo_puts_the_pin_back_on_the_path_it_came_from() {
     let mut steps = Vec::new();
     for (from, to) in home.iter().zip(&landed) {
         std::fs::rename(from, to).unwrap();
-        let (dev, ino, kind) = ItemIdentity::inspect(Path::new(to)).unwrap().parts();
-        steps.push(Move { from: from.clone(), to: to.clone(), dev, ino, kind });
+        let landed = ItemIdentity::inspect(Path::new(to)).unwrap();
+        let (dev, ino, kind) = landed.parts();
+        steps.push(Move { from: from.clone(), to: to.clone(), dev, ino, kind, born: landed.born() });
     }
     shelf.settle(&home).unwrap();
     shelf.repoint(&[(home[1].clone(), landed[1].clone())]).unwrap();
@@ -150,4 +196,34 @@ fn undo_puts_the_pin_back_on_the_path_it_came_from() {
                "the pin is back on its own path and the loose row is back on the shelf");
     let text = std::fs::read_to_string(shelf.pile_file()).unwrap();
     assert!(text.contains("\"pinned\": true"), "and it is still a pin: {}", text);
+}
+
+#[test]
+fn a_move_that_left_nothing_at_its_landing_says_why_in_words() {
+    let dir = TestDir::new("shelfundogone");
+    let to = dir.path().join("never-written").to_string_lossy().to_string();
+    let step = Move { from: "/a".to_string(), to: to.clone(), dev: 1, ino: 1, kind: 0, born: None };
+    let why = put_back(&step).unwrap_err();
+    let reason = crate::error::io_message(&std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert_eq!(why, format!("{} is not where the move left it: {}", to, reason));
+}
+
+#[test]
+fn a_record_with_no_folder_above_it_says_so_in_the_shelfs_words() {
+    let dir = TestDir::new("shelfundoroot");
+    let mut moves = Moves::at(dir.path());
+    moves.file = PathBuf::from("/");
+    let step = Move { from: "/a".to_string(), to: "/b".to_string(), dev: 1, ino: 1, kind: 0, born: None };
+    assert_eq!(moves.record(&[step], 1_000).unwrap_err(), "the shelf has no folder to write in");
+}
+
+#[test]
+fn a_record_that_cannot_be_spent_says_why_in_words() {
+    let dir = TestDir::new("shelfundospent");
+    let moves = Moves::at(dir.path());
+    // A folder where the record belongs: removing it is refused, and the refusal is not a missing file.
+    std::fs::create_dir_all(&moves.file).unwrap();
+    let why = moves.take().unwrap_err();
+    assert!(why.starts_with(&format!("{} could not be spent: ", moves.file.display())), "{}", why);
+    assert!(!why.contains('('), "no Debug name of an error kind: {}", why);
 }

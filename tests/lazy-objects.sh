@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "$0")/headless-commons.sh"
 # Bridge and wrapper arrive off launch; the host builds with the window, so its Loader stays active.
 set -u
 . "$(dirname "$0")/../tools/flea-sandbox-guard"
@@ -34,26 +35,27 @@ ln -s "$tree/ui/NetworkPlaces.qml" "$test_root/bridge-config/NetworkPlaces.qml"
 ln -s "$tree/ui/GvfsBridge.qml" "$test_root/bridge-config/GvfsBridge.qml"
 ln -s "$tree/ui/js" "$test_root/bridge-config/js"
 ln -s "$tree/tests/lazy-live.qml" "$test_root/bridge-config/shell.qml"
-bridge_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 timeout 20 qs -p "$test_root/bridge-config" 2>&1)
+bridge_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 timeout 20 qs -p "$test_root/bridge-config" 2>&1)
 printf '%s\n' "$bridge_out" | grep -q 'LAZY_OBJECTS bridge=absent-then-built served-on-same-call' || { printf 'FAIL bridge did not arrive whole on first use\n%s\n' "$bridge_out"; exit 1; }
 printf '%s\n' "$bridge_out" | grep -q 'LAZY_OBJECTS FAIL' && { printf 'FAIL bridge live refused\n%s\n' "$bridge_out"; exit 1; }
 printf 'lazy-objects: live bridge absent before first use, built and serving after\n'
 # The same probe in a tree without GvfsBridge.qml: the ensure answers null and the
-# request finishes failed naming that file, with no password retry.
+# request finishes failed with a reason and no password retry, and the log warning names that file.
 mkdir -p "$test_root/absent-config"
 ln -s "$tree/ui/NetworkMounts.qml" "$test_root/absent-config/NetworkMounts.qml"
 ln -s "$tree/ui/MountListing.qml" "$test_root/absent-config/MountListing.qml"
 ln -s "$tree/ui/NetworkPlaces.qml" "$test_root/absent-config/NetworkPlaces.qml"
 ln -s "$tree/ui/js" "$test_root/absent-config/js"
 ln -s "$tree/tests/lazy-live.qml" "$test_root/absent-config/shell.qml"
-absent_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 LAZY_BRIDGE_ABSENT=1 timeout 20 qs -p "$test_root/absent-config" 2>&1)
-printf '%s\n' "$absent_out" | grep -q 'LAZY_OBJECTS bridge-absent-fails-naming-file' || { printf 'FAIL missing bridge did not fail naming its file\n%s\n' "$absent_out"; exit 1; }
+absent_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 LAZY_BRIDGE_ABSENT=1 timeout 20 qs -p "$test_root/absent-config" 2>&1)
+printf '%s\n' "$absent_out" | grep -q 'LAZY_OBJECTS bridge-absent-fails-with-reason' || { printf 'FAIL missing bridge did not fail with a reason\n%s\n' "$absent_out"; exit 1; }
+printf '%s\n' "$absent_out" | grep -q 'GvfsBridge.qml did not load: Loader status' || { printf 'FAIL missing bridge warning did not name its file\n%s\n' "$absent_out"; exit 1; }
 printf '%s\n' "$absent_out" | grep -q 'LAZY_OBJECTS FAIL' && { printf 'FAIL missing bridge live refused\n%s\n' "$absent_out"; exit 1; }
-printf 'lazy-objects: missing bridge fails naming GvfsBridge.qml with no retry\n'
-ln -s /usr/share/omarchy/shell/Commons "$test_root/swap-config/Commons"
+printf 'lazy-objects: missing bridge fails with a reason, warns naming GvfsBridge.qml, no retry\n'
+headless_commons "$test_root" "$test_root/swap-config/Commons" || exit 1
 ln -s /usr/share/omarchy/shell/Ui "$test_root/swap-config/Ui"
 ln -s "$tree/tests/lazy-swap-live.qml" "$test_root/swap-config/shell.qml"
-swap_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_FORCE_STDERR_LOGGING=1 LAZY_SWAP_UI="$tree/ui" timeout 20 qs -p "$test_root/swap-config" 2>&1)
+swap_out=$(env HOME="$test_root/home" PATH="/usr/bin:/bin" QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 LAZY_SWAP_UI="$tree/ui" timeout 20 qs -p "$test_root/swap-config" 2>&1)
 printf '%s\n' "$swap_out" | grep -q 'LAZY_SWAP wrapper=absent-then-built' || { printf 'FAIL wrapper did not arrive whole on first open\n%s\n' "$swap_out"; exit 1; }
 printf '%s\n' "$swap_out" | grep -q 'LAZY_SWAP FAIL' && { printf 'FAIL swap live refused\n%s\n' "$swap_out"; exit 1; }
 printf 'lazy-objects: live wrapper absent before first open, whole after\n'

@@ -1,5 +1,6 @@
 import QtQuick
 import "." as Flea
+import "js/Format.js" as Format
 
 // Favourite records keep their exact label/path; only the drag handle initiates reordering.
 Item {
@@ -11,16 +12,19 @@ Item {
     readonly property Item dragItem: grip
     readonly property Item removeItem: remove
     implicitHeight: Theme.railRowHeight
+    // The remove button's accessible name, filled by Format.fill.
+    readonly property string removeWord: "Remove %1"
 
     Flea.Glyph {
         id: icon
         anchors.left: parent.left
         anchors.leftMargin: Theme.spacing.rowPaddingX
         anchors.verticalCenter: parent.verticalCenter
-        width: Theme.railIconSize
+        // Sidebar040: the Built in rows' own 19 px mark slot, so every label in the pane starts on one column.
+        width: Theme.markSize
         height: width
         name: root.row.glyph || "folder"
-        color: root.row.error ? Theme.color.error : Theme.color.muted
+        color: root.row.error ? Theme.color.error : Theme.color.mutedFrame
     }
     Text {
         anchors.left: icon.right
@@ -41,7 +45,8 @@ Item {
         anchors.rightMargin: Theme.spacing.gap
         anchors.verticalCenter: parent.verticalCenter
         width: Math.min(implicitWidth, root.width * 0.46)
-        text: root.row.value || ""
+        // Sidebar040: a favourite reads as the person writes it; row.value stays the stored path for every action.
+        text: root.row.display !== undefined ? root.row.display : (root.row.value || "")
         font.family: Theme.font.family
         font.pixelSize: Theme.font.caption
         color: root.row.error ? Theme.color.error : Theme.color.muted
@@ -50,17 +55,16 @@ Item {
     }
     // SettingsRest rule 4: an action that acts on one row reads as a mark on that row, where a button
     // under the list leaves its target to be inferred from a cursor somewhere above it.
-    Flea.Glyph {
+    // Sidebar040: the handle and the remove mark draw at the mark size inside flush 24 px boxes.
+    Item {
         id: remove
         anchors.right: parent.right
         anchors.rightMargin: Theme.spacing.rowPaddingX
         anchors.verticalCenter: parent.verticalCenter
         width: Theme.hitMin
         height: Theme.hitMin
-        name: "x"
-        color: Theme.color.muted
         Accessible.role: Accessible.Button
-        Accessible.name: "Remove " + (root.row.label || "")
+        Accessible.name: Format.fill(root.removeWord, root.row.label || "")
         Accessible.onPressAction: root.removed()
         HoverHandler { cursorShape: Qt.PointingHandCursor }
         TapHandler {
@@ -68,17 +72,29 @@ Item {
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: root.removed()
         }
+        Flea.Glyph {
+            anchors.centerIn: parent
+            width: Theme.markSize
+            height: Theme.markSize
+            name: "x"
+            color: Theme.color.mutedFrame
+        }
     }
 
-    Flea.Glyph {
+    Item {
         id: grip
         anchors.right: remove.left
         anchors.rightMargin: 0
         anchors.verticalCenter: parent.verticalCenter
         width: Theme.hitMin
         height: Theme.hitMin
-        name: "list"
-        color: Theme.color.muted
+        Flea.Glyph {
+            anchors.centerIn: parent
+            width: Theme.markSize
+            height: Theme.markSize
+            name: "list"
+            color: Theme.color.mutedFrame
+        }
         DragHandler {
             id: drag
             target: null

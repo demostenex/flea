@@ -127,11 +127,16 @@ pub(crate) struct CloseCounts {
     pub failed: usize,
     pub skipped: usize,
     pub cancelled: bool,
+    pub kept_ok: usize,
 }
 
 #[cfg(test)]
 #[path = "movebatch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "usbrca_tests.rs"]
+mod usbrca_tests;
 
 impl MoveBatch {
     pub(crate) fn new() -> Self {
@@ -168,13 +173,13 @@ fn journal_partial(
 ) -> Result<(), FleaError> {
     let (manifest, loud) = crate::backend::copymanifest::finish_loud(manifest);
     if let Some(e) = loud {
-        err.msg.push_str(&format!("; copy manifest failed: {e}"));
+        err.msg = crate::backend::ops::manifest_failed(&err.msg, &e);
     }
     steps.push(undo::copied_partial(src, dst, source.clone(), manifest)?);
     Ok(())
 }
 
-// The folders a batch filled, confirmed once instead of once per item; a failure keeps every source.
+// The folders a batch filled, confirmed once; held files settle first so sources go after the bytes.
 fn confirm_batch(durability: &mut Durability, dsts: &[PathBuf]) -> Result<(), FleaError> {
     let failed = if durability.durable {
         durability.flush_dirs_for_many(dsts).is_err()
@@ -282,6 +287,7 @@ pub(crate) fn stage_copy(
         tree: None,
         manifest: crate::backend::copymanifest::writer_for_move(src, dst),
         durability: Some(durability),
+        for_move: true,
     };
     let outcome = copy_any(src, dst, &mut p);
     let partial = p.partial.take();
@@ -392,6 +398,9 @@ fn finish_item(
     };
     match remove_any(&item.src) {
         Ok(()) => {
+            // Logged in test builds, so a batch pins its first removal after its folder fsync.
+            #[cfg(test)]
+            crate::backend::durable::test_log("remove");
             if let Some(parent) = item.src.parent() {
                 durability.touch(parent);
             }
@@ -399,6 +408,8 @@ fn finish_item(
                 Ok(step) => {
                     steps.push(step);
                     counts.ok += 1;
+                    // A deferred merge item counts only where it landed, so its kept name rides its own ok.
+                    counts.kept_ok += usize::from(super::merge::kept_name(&item.dst, &item.name));
                     send_item(tx, id, item.index, &item.name, true, "");
                 }
                 Err(e) => {

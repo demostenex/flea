@@ -80,4 +80,10 @@ function run(check) {
           pair(null, "/home/gm/Pictures", "/tmp/asked"), "/tmp/asked | /tmp/asked @0")
     check("a saved pair of the wrong length is no pair",
           pair({ paths: ["/home/gm/Music"], focus: 1 }, "/home/gm/Pictures", "/tmp/asked"), "/tmp/asked | /tmp/asked @0")
+
+    // Defect 26: the restore's listing deadline, proved live by tests/ui.sh hanglisting.
+    check("the restore waits this long for its listing", Startup.LISTING_WAIT_MS, 10000)
+
+    // Defect 25: the inspector's answer deadline, proved live by tests/ui.sh hanginspect.
+    check("the inspector waits this long for its answer", Startup.INSPECT_WAIT_MS, 10000)
 }

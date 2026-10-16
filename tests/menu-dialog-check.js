@@ -11,10 +11,13 @@ function dialog() {
     const events = [];
     const state = {opened: false, action: 'deletePermanently', committing: true, busy: true, requestId: 3,
         facts: {count: 2}, checkPending: false, errorText: '', confirmation: {close() { events.push('hide'); }, open() { events.push('show'); }},
-        closeFocus: {forceActiveFocus() { events.push('focus-cancel'); }},
+        closeButton: {forceActiveFocus() { events.push('focus-cancel'); }},
         refreshDeletion() { events.push('refresh'); }, checkDeletion() { events.push('check'); },
         deleted(message) { events.push(message); }, finish() { events.push('finish'); }, events};
     Object.defineProperty(state, 'deletionActive', {get() { return this.action === 'deletePermanently' && this.committing; }});
+    // Production reads root.ownedOps; the harness names the same list through root.
+    state.ownedOps = ["properties", "prepareDelete", "refreshDelete", "checkDelete", "delete", "validate", "newFile", ""];
+    state.root = state;
     vm.createContext(state);
     vm.runInContext('function receive(message) {' + receive[1] + '\n}', state);
     return state;
@@ -57,7 +60,7 @@ const menuSource = fs.readFileSync(path.join(__dirname, '../ui/PaneMenuActions.q
 const activate = menuSource.match(/^    function activate\(action, selected\) \{([\s\S]*?)^    \}/m);
 assert.ok(activate, 'the production menu activation gate must be present');
 let requested = 0;
-const activation = vm.createContext({pane: {menuSelectionIdentity: 'current'}, identity: 'current', requestId: 3,
+const activation = vm.createContext({pane: {menuSelectionIdentity() { return 'current'; }}, identity: 'current', requestId: 3,
     ready: true, activationUsed: false, deleting: false, survivorId: 0, validateActivation() { requested++; }});
 vm.runInContext('function activate(action, selected) {' + activate[1] + '\n}', activation);
 activation.activate('duplicate', true);
@@ -65,20 +68,100 @@ activation.activate('duplicate', true);
 assert.equal(requested, 1, 'repeated activation consumes one menu snapshot only once');
 assert.equal(activation.activationUsed, true);
 console.log('menu dialog: 17 checks, 0 failed');
+const COUNT_SINGLE = 1;
+const COUNT_MULTI = 2;
+// Single-item snapshots discover; multi-item ones never ask.
+// Sample input: {"t":"menuaction","id":7,"op":"snapshot","ok":true,"count":1}
+const menuResult = menuSource.match(/^        function onMenuResult\(message\) \{([\s\S]*?)^        \}/m);
+assert.ok(menuResult, 'the production snapshot reply handler must be present');
+function snapshotSends(count, opts) {
+    const sends = [];
+    const menu = { opened: opts.opened !== false, hasRow: opts.hasRow !== false,
+        refreshProviderRows() {}, providersSettled() {}, validateChoice() { return true; } };
+    const root = { requestId: 7, identity: 'cur', ready: false, pendingAction: '',
+        pendingActivation: false, providersRefreshing: false, launchingId: 0,
+        openWithApps: [], openWithLoaded: false, item: null,
+        finishProviders() {}, providersFinished() {}, validateActivation() {}, show() {},
+        pane: { menuSelectionIdentity() { return opts.identity || 'cur'; }, message() {},
+            contextMenu() { return menu; }, backend: { send(m) { sends.push(m); } } } };
+    const ctx = vm.createContext({ root });
+    vm.runInContext('function onMenuResult(message) {' + menuResult[1] + '\n}', ctx);
+    ctx.onMenuResult({ id: opts.stale === true ? 8 : 7, op: 'snapshot', ok: true, count });
+    return sends.filter((m) => m.op === 'applications');
+}
+assert.equal(snapshotSends(COUNT_SINGLE, {}).length, 1, 'count1 asks applications once');
+assert.equal(snapshotSends(COUNT_MULTI, {}).length, 0, 'count2 never asks applications');
+assert.equal(snapshotSends(COUNT_SINGLE, { opened: false }).length, 0, 'closed menu never asks');
+assert.equal(snapshotSends(COUNT_SINGLE, { stale: true }).length, 0, 'stale id never asks');
+assert.equal(snapshotSends(COUNT_SINGLE, { identity: 'other' }).length, 0, 'identity mismatch never asks');
+console.log('menu snapshot: 5 checks, 0 failed');
 
+// Sample input: stepFocus(false) then stepFocus(true) over the visible controls.
 const stepFocus = source.match(/^    function stepFocus\(back\) \{([\s\S]*?)^    \}/m);
 assert.ok(stepFocus, 'the production focus handler must be present');
 let focusChecks = 1;
-for (const name of ['field', 'appList', 'closeFocus', 'submitFocus']) {
-    const start = source.indexOf('id: ' + name);
-    const nextId = source.indexOf('id: ', start + 4);
-    const control = source.slice(start, nextId < 0 ? source.length : nextId);
-    assert.ok(control.includes('Keys.onTabPressed: root.stepFocus(false)')
-        && control.includes('Keys.onBacktabPressed: root.stepFocus(true)'), name + ' must intercept Qt traversal');
+// appList left this dialog in efd8c05c; OpenWithDialog owns that list now.
+const FOCUS_BLOCKS = ['root', 'field', 'closeButton', 'submitButton'];
+const QT_SHIFT = 0x04000000; // Real Qt.ShiftModifier value, carried by the mock.
+function controlBlock(name) {
+    // Line-anchored: a bare prefix also matches id: requestId inside a call.
+    const re = /^[ \t]*id: ([A-Za-z_][A-Za-z0-9_]*)/mg;
+    let m, start = -1, end = source.length;
+    while ((m = re.exec(source)) !== null) {
+        if (start < 0 && m[1] === name) start = m.index;
+        else if (start >= 0) { end = m.index; break; }
+    }
+    assert.ok(start >= 0, name + ' names a real control');
+    return source.slice(start, end);
+}
+function tabBody(block) {
+    const handler = block.match(/Keys\.onTabPressed:\s*function\(event\)\s*\{([\s\S]*?)\}/);
+    assert.ok(handler, 'a Tab handler must be present');
+    return handler[1];
+}
+function backCall(block) {
+    const handler = block.match(/Keys\.onBacktabPressed:\s*([^\n]+)/);
+    assert.ok(handler, 'a Backtab handler must be present');
+    return handler[1];
+}
+// A DialogButton reads Shift itself and reports through tabbed, so its handler only passes back on.
+function driveTabbed(name, block) {
+    const handler = block.match(/onTabbed:\s*(function\s*\(from, back\)\s*\{[^\n]*\})/);
+    assert.ok(handler, name + ' reports Tab through onTabbed');
+    const ctx = { calls: [], root: null };
+    ctx.root = { stepFocus(back) { ctx.calls.push(back); } };
+    vm.createContext(ctx);
+    vm.runInContext('(' + handler[1] + ')(null, false)', ctx);
+    assert.equal(ctx.calls.pop(), false, name + ' Tab steps forward');
+    focusChecks++;
+    vm.runInContext('(' + handler[1] + ')(null, true)', ctx);
+    assert.equal(ctx.calls.pop(), true, name + ' Shift+Tab steps back');
+    focusChecks++;
+    assert.match(block, /tabHandle: true/, name + ' hands Tab to the dialog');
     focusChecks++;
 }
+function drivePolarity(name) {
+    const block = controlBlock(name);
+    if (block.indexOf('Keys.onTabPressed') < 0) return driveTabbed(name, block);
+    const ctx = { calls: [], Qt: { ShiftModifier: QT_SHIFT }, root: null };
+    ctx.root = { stepFocus(back) { ctx.calls.push(back); } };
+    vm.createContext(ctx);
+    vm.runInContext('function onTab(event) {' + tabBody(block) + '\n}', ctx);
+    ctx.onTab({ modifiers: 0, accepted: false });
+    assert.equal(ctx.calls.pop(), false, name + ' plain Tab steps forward');
+    focusChecks++;
+    ctx.onTab({ modifiers: QT_SHIFT, accepted: false });
+    assert.equal(ctx.calls.pop(), true, name + ' Shift+Tab steps back');
+    focusChecks++;
+    const call = backCall(block);
+    if (call.indexOf('function') === 0) vm.runInContext('(' + call + ')({modifiers: 0})', ctx);
+    else vm.runInContext('(' + call + ')', ctx);
+    assert.equal(ctx.calls.pop(), true, name + ' Backtab steps back');
+    focusChecks++;
+}
+for (const name of FOCUS_BLOCKS) drivePolarity(name);
 const controls = {};
-for (const name of ['field', 'appList', 'closeFocus', 'submitFocus']) {
+for (const name of ['field', 'closeButton', 'submitButton']) {
     controls[name] = {visible: false, enabled: true, activeFocusOnTab: true, activeFocus: false,
         forceActiveFocus() {
             for (const item of Object.values(controls)) item.activeFocus = false;
@@ -91,27 +174,28 @@ function focused(expected, label) {
     assert.equal(Object.keys(controls).find(name => controls[name].activeFocus), expected, label);
     focusChecks++;
 }
-controls.closeFocus.visible = true;
+controls.closeButton.visible = true;
 controls.stepFocus(false);
-focused('closeFocus', 'Properties enters its only visible control');
+focused('closeButton', 'Properties enters its only visible control');
 controls.stepFocus(false);
-focused('closeFocus', 'Properties Tab wraps within Close');
+focused('closeButton', 'Properties Tab wraps within Close');
 controls.stepFocus(true);
-focused('closeFocus', 'Properties Shift+Tab wraps within Close');
+focused('closeButton', 'Properties Shift+Tab wraps within Close');
 controls.field.visible = true;
-controls.submitFocus.visible = true;
+controls.submitButton.visible = true;
 controls.stepFocus(false);
-focused('submitFocus', 'an available input action follows Cancel');
+focused('submitButton', 'an available input action follows Cancel');
 controls.stepFocus(false);
 focused('field', 'input action wraps to its field');
 controls.field.enabled = false;
-controls.submitFocus.activeFocusOnTab = false;
+controls.submitButton.enabled = false;
 controls.stepFocus(true);
-focused('closeFocus', 'busy or unavailable controls cannot receive focus');
-controls.closeFocus.activeFocus = false;
-controls.appList.visible = true;
+focused('closeButton', 'busy or unavailable controls cannot receive focus');
+controls.closeButton.activeFocus = false;
+controls.field.enabled = true;
+controls.submitButton.enabled = true;
 controls.stepFocus(true);
-focused('closeFocus', 'reverse entry without a current target reaches the last available control');
+focused('submitButton', 'reverse entry without a current target reaches the last control');
 controls.stepFocus(true);
-focused('appList', 'Open With reverses into the available application list');
+focused('closeButton', 'reverse steps back into Close');
 console.log('menu focus: ' + focusChecks + ' checks, 0 failed');

@@ -7,141 +7,248 @@ use crate::backend::archivelist::parse_reader;
 use crate::backend::opsreq::op_err;
 use crate::error::{from_io, FleaError};
 use std::io::{self, Read};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+// What both archive runners answer when the jail's programs are missing.
+pub(crate) const SANDBOX_MISSING: &str = "the sandbox is unavailable: bubblewrap or prlimit is not installed";
 // A private directory beside the destination, so the rename that follows never crosses a filesystem.
 pub(crate) const WORK_PREFIX: &str = ".flea-work-";
 // A cancel is observed within this; a killed child is reaped on the next round.
 const CANCEL_STEP: Duration = Duration::from_millis(50);
+// How long a cancel waits for the jail's last writer to reach EOF before it answers.
+pub(crate) const CANCEL_DRAIN_SECS: u64 = 10;
+// The EOF wait polls at this step, so a fast EOF answers promptly rather than at the bound.
+const CANCEL_DRAIN_STEP: Duration = Duration::from_millis(10);
+
+// Test seams, thread-local so parallel tests share nothing; defaults are production.
+#[cfg(test)]
+thread_local! {
+    static READER_HOLD_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DRAIN_SECS: std::cell::Cell<u64> = const { std::cell::Cell::new(CANCEL_DRAIN_SECS) };
+    // The cap the last job on this thread ran under (None: none yet, Some(None): uncapped), so a test tells convert's runner from an archive's.
+    static LAST_CPU: std::cell::Cell<Option<Option<u32>>> = const { std::cell::Cell::new(None) };
+    // Microseconds the runner waits between the jail's spawn and its first cancel poll, so a test can land a cancel while bwrap is still starting.
+    static SPAWN_HOLD_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn set_spawn_hold_us(us: u64) {
+    SPAWN_HOLD_US.with(|c| c.set(us));
+}
+#[cfg(test)]
+pub(crate) fn last_cpu() -> Option<Option<u32>> {
+    LAST_CPU.with(|c| c.get())
+}
+#[cfg(test)]
+pub(crate) fn set_reader_hold_ms(ms: u64) {
+    READER_HOLD_MS.with(|c| c.set(ms));
+}
+#[cfg(test)]
+pub(crate) fn set_drain_secs(secs: u64) {
+    DRAIN_SECS.with(|c| c.set(secs));
+}
+pub(crate) fn drain_secs() -> u64 {
+    #[cfg(test)]
+    {
+        DRAIN_SECS.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        CANCEL_DRAIN_SECS
+    }
+}
 
 pub struct Work {
     pub dir: PathBuf,
+    kept: bool,
 }
 
-// Archive and convert run concurrently by design, so the pid alone does not name a job: two of them
-// beside the same destination would claim one path, and the second's cleanup would destroy the
-// first's in-flight output. The counter is what makes a name belong to one job.
+// Concurrent jobs share a destination, so a counter names each work directory rather than the pid alone.
 static WORK_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-// A name already taken means a leftover from a killed run, and stepping past it is bounded so a
-// directory full of them cannot spin.
+// A taken name is a killed run's leftover, so the search for a free one is bounded.
 const WORK_ATTEMPTS: usize = 64;
 
 impl Work {
-    // create_dir, not create_dir_all: a name already taken is a collision and must never merge, and
-    // create_new semantics are also what stops this from adopting somebody else's live directory.
+    // create_dir alone: a taken name is a collision and must never merge with a live directory.
     pub fn new(beside: &Path, tag: &str) -> Result<Work, FleaError> {
         let mut last = String::new();
         for _ in 0..WORK_ATTEMPTS {
             let seq = WORK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir = beside.join(format!("{}{}-{}-{}", WORK_PREFIX, tag, std::process::id(), seq));
             match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(Work { dir }),
-                // Nothing is ever removed here: a name in use may be a live sibling's, and the only
-                // safe answer to a taken name is a different name.
+                Ok(()) => return Ok(Work { dir, kept: false }),
+                // A taken name may be a live sibling's, so the only safe answer is a different name.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     last = dir.to_string_lossy().to_string();
                 }
                 Err(e) => return Err(from_io("archive", &dir.to_string_lossy(), &e)),
             }
         }
-        Err(op_err("archive", &last, "no free work directory beside the destination"))
+        Err(op_err("archive", &last, "a temporary folder could not be made beside the destination"))
+    }
+
+    // A cancel past the drain bound leaves the folder for the operator: the tool may still write.
+    pub fn keep(&mut self) {
+        self.kept = true;
     }
 }
 
 impl Drop for Work {
     fn drop(&mut self) {
-        // Only ever a directory this process made, under a name only this module writes.
+        if self.kept {
+            return;
+        }        // Only ever a directory this process made, under a name only this module writes.
         if self.dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with(WORK_PREFIX)) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 }
 
-// The tools print their own diagnosis on stderr and do not always exit non-zero, so success is read
-// off the filesystem: the file the job was told to produce either exists afterwards or it does not.
-// what names the operation this jail is running, because the same jail runs the archive tools and
-// the image converter: reporting every one of them as "archive" told an operator converting a PNG
-// that the archive tool had failed.
-pub fn run_boxed(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path) -> Result<(), FleaError> {
-    // Fail closed: the jail is the only containment for these tools, so a missing bwrap or prlimit
-    // refuses the job rather than running it unsandboxed, the same rule thumbs.rs already follows.
-    if !sandbox::available() {
-        let tool = inner.first().map_or("", |s| s.as_str());
-        return Err(op_err(what, tool, "the sandbox is unavailable: bwrap or prlimit is not on PATH"));
+// The signal a job died from; anything else keeps its number rather than a guessed name.
+fn signal_name(signal: i32) -> Option<&'static str> {
+    match signal {
+        6 => Some("SIGABRT"),
+        9 => Some("SIGKILL"),
+        11 => Some("SIGSEGV"),
+        15 => Some("SIGTERM"),
+        24 => Some("SIGXCPU"),
+        _ => None,
     }
-    let full = sandbox::wrap(&inner, read_only, writable);
-    let out = Command::new(&full[0])
-        .args(&full[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .output()
-        .map_err(|e| from_io(what, &full[0], &e))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let text = String::from_utf8_lossy(&out.stderr);
-    let fallback = format!("the {} tool failed", what);
-    Err(op_err(what, "", text.lines().last().unwrap_or(&fallback)))
 }
 
+// bwrap renders a tool the kernel killed as exit 128+n, so this offset recovers the signal.
+const BWRAP_SIGNAL_BASE: i32 = 128;
 
-// run_boxed, watched for a cancel: kill and reap here, so nothing is renamed and stderr is drained.
-pub fn run_boxed_cancellable(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path,
-                             cancel: &AtomicBool) -> Result<(), FleaError> {
-    run_boxed_cancellable_inner(what, inner, read_only, writable, cancel, None)
+// Issue #211: stderr's last non-blank line diagnoses a bad archive; otherwise the status names the signal.
+pub(crate) fn failure_message(what: &str, status: &ExitStatus, stderr: &str) -> String {
+    // A blank line is not a diagnosis.
+    if let Some(line) = stderr.lines().rev().find(|line| !line.trim().is_empty()) {
+        return line.trim().to_string();
+    }
+    let killed = |signal: i32| match signal_name(signal) {
+        Some(name) => format!("the {} tool stopped before it finished (signal {})", what, name),
+        None => format!("the {} tool stopped before it finished (signal {})", what, signal),
+    };
+    if let Some(signal) = status.signal() {
+        return killed(signal);
+    }
+    match status.code() {
+        // 128+n is bwrap's rendering of a signal; an unknown one stays an exit status.
+        Some(code) if signal_name(code - BWRAP_SIGNAL_BASE).is_some() => killed(code - BWRAP_SIGNAL_BASE),
+        Some(code) => format!("the {} tool could not finish (exit status {})", what, code),
+        // Unreachable in practice; this function always answers a sentence rather than panicking.
+        None => format!("the {} tool could not finish", what),
+    }
 }
 
-fn run_boxed_cancellable_inner(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path,
-                               cancel: &AtomicBool, started: Option<&AtomicU32>) -> Result<(), FleaError> {
-    if !sandbox::available() {
-        let tool = inner.first().map_or("", |s| s.as_str());
-        return Err(op_err(what, tool, "the sandbox is unavailable: bwrap or prlimit is not on PATH"));
+// A writer past the kill can still hold stderr open; true means its EOF arrived in bound.
+fn drain_reader(reader: std::thread::JoinHandle<String>) -> bool {
+    let eof = Instant::now() + Duration::from_secs(drain_secs());
+    while !reader.is_finished() && Instant::now() < eof {
+        std::thread::sleep(CANCEL_DRAIN_STEP);
     }
-    let full = sandbox::wrap(&inner, read_only, writable);
-    let mut child = Command::new(&full[0])
-        .args(&full[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| from_io(what, &full[0], &e))?;
-    if let Some(pid) = started {
-        pid.store(child.id(), Ordering::SeqCst);
+    if !reader.is_finished() {
+        return false;
     }
-    let stderr = child.stderr.take();
-    let reader = std::thread::spawn(move || {
+    reader.join().ok();
+    true
+}
+
+// A jailed tool's stderr, read whole on its own thread so a full pipe never stalls the tool.
+pub(crate) fn spawn_stderr_reader(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String> {
+    #[cfg(test)]
+    let hold_ms = READER_HOLD_MS.with(|c| c.get());
+    std::thread::spawn(move || {
         let mut text = String::new();
         if let Some(mut pipe) = stderr {
             pipe.read_to_string(&mut text).ok();
         }
+        #[cfg(test)]
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
         text
-    });
+    })
+}
+
+// A cancel kills the jail and answers after the last stderr writer's EOF; past the bound the work folder stays.
+pub(crate) fn cancel_failure(what: &str, jailed: &mut crate::backend::jail::Jailed,
+                             reader: std::thread::JoinHandle<String>, work: &mut Work) -> FleaError {
+    crate::backend::jail::kill_tree(jailed);
+    if drain_reader(reader) {
+        return op_err(what, "", "cancelled");
+    }
+    let name = work.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    work.keep();
+    // The sentence names the caller, so a convert timeout says convert and not archive.
+    op_err(what, "", &format!("cancelled; the {what} tool did not exit, so its work folder {name} was left in place"))
+}
+
+// The cancellable runner, watched for a cancel: kill and reap here, so nothing is renamed and stderr is drained.
+pub fn run_boxed_cancellable(what: &str, inner: Vec<String>, read_only: &Path, work: &mut Work,
+                             cancel: &AtomicBool) -> Result<(), FleaError> {
+    run_boxed_cancellable_inner(what, inner, read_only, work, cancel, None, None)
+}
+
+// Convert keeps its CPU cap on the cancellable runner; archive jobs run uncapped.
+pub fn run_boxed_cancellable_capped(what: &str, inner: Vec<String>, read_only: &Path, work: &mut Work,
+                                    cancel: &AtomicBool) -> Result<(), FleaError> {
+    run_boxed_cancellable_inner(what, inner, read_only, work, cancel, None, Some(sandbox::CPU_SECONDS))
+}
+
+// Test seam: the convert runner with a lower cap, so the pin burns seconds, not 30 s.
+#[cfg(test)]
+fn run_boxed_cancellable_capped_with_cpu(what: &str, inner: Vec<String>, read_only: &Path, work: &mut Work,
+                                         cancel: &AtomicBool, cpu_seconds: u32) -> Result<(), FleaError> {
+    run_boxed_cancellable_inner(what, inner, read_only, work, cancel, None, Some(cpu_seconds))
+}
+
+fn run_boxed_cancellable_inner(what: &str, inner: Vec<String>, read_only: &Path, work: &mut Work,
+                               cancel: &AtomicBool, started: Option<&AtomicU32>, cpu: Option<u32>) -> Result<(), FleaError> {
+    #[cfg(test)]
+    LAST_CPU.with(|c| c.set(Some(cpu)));
+    if !sandbox::available() {
+        let tool = inner.first().map_or("", |s| s.as_str());
+        return Err(op_err(what, tool, SANDBOX_MISSING));
+    }
+    // The cap is the only difference between the convert jail and the archive one.
+    let mut full = match cpu {
+        Some(seconds) => sandbox::wrap_with(&inner, read_only, &work.dir, Some(seconds)),
+        None => sandbox::wrap_archive(&inner, read_only, &work.dir),
+    };
+    sandbox::add_status(&mut full, inner.len());
+    let mut jailed = crate::backend::jail::spawn_jailed(&full, |cmd| {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+    })
+    .map_err(|e| from_io(what, &full[0], &e))?;
+    if let Some(pid) = started {
+        pid.store(jailed.child.id(), Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    std::thread::sleep(Duration::from_micros(SPAWN_HOLD_US.with(|c| c.get())));
+    let reader = spawn_stderr_reader(jailed.child.stderr.take());
     loop {
         if cancel.load(Ordering::Relaxed) {
-            // --die-with-parent takes the decoder; the wait here is what reaps the launcher.
-            child.kill().ok();
-            child.wait().ok();
-            reader.join().ok();
-            return Err(op_err(what, "", "cancelled"));
+            return Err(cancel_failure(what, &mut jailed, reader, work));
         }
-        match child.try_wait() {
+        match jailed.child.try_wait() {
             Ok(Some(status)) => {
                 let text = reader.join().unwrap_or_default();
                 if status.success() {
                     return Ok(());
                 }
-                let fallback = format!("the {} tool failed", what);
-                return Err(op_err(what, "", text.lines().last().unwrap_or(&fallback)));
+                return Err(op_err(what, "", &failure_message(what, &status, &text)));
             }
             Ok(None) => std::thread::sleep(CANCEL_STEP),
             Err(e) => {
-                child.kill().ok();
-                child.wait().ok();
+                crate::backend::jail::kill_tree(&mut jailed);
                 reader.join().ok();
                 return Err(from_io(what, &full[0], &e));
             }
@@ -150,20 +257,24 @@ fn run_boxed_cancellable_inner(what: &str, inner: Vec<String>, read_only: &Path,
 }
 
 #[cfg(test)]
-fn run_boxed_cancellable_observed(what: &str, inner: Vec<String>, read_only: &Path, writable: &Path,
+fn run_boxed_cancellable_observed(what: &str, inner: Vec<String>, read_only: &Path, work: &mut Work,
                                   cancel: &AtomicBool, started: &AtomicU32) -> Result<(), FleaError> {
-    run_boxed_cancellable_inner(what, inner, read_only, writable, cancel, Some(started))
+    run_boxed_cancellable_inner(what, inner, read_only, work, cancel, Some(started), None)
+}
+
+// The convert runner with its own CPU cap and a spawn witness, so a timeout test cancels a live child.
+#[cfg(test)]
+pub(crate) fn run_boxed_cancellable_capped_observed(what: &str, inner: Vec<String>, read_only: &Path,
+                                                   work: &mut Work, cancel: &AtomicBool,
+                                                   started: &AtomicU32) -> Result<(), FleaError> {
+    run_boxed_cancellable_inner(what, inner, read_only, work, cancel, Some(started), Some(sandbox::CPU_SECONDS))
 }
 
 pub fn is_empty_dir(dir: &Path) -> bool {
     std::fs::read_dir(dir).map(|mut e| e.next().is_none()).unwrap_or(true)
 }
 
-// How many members the index names that should have produced something in the destination, per
-// Row::produces_destination_entry, or None when the index could not be read at all. None is the
-// honest answer for a listing that failed, timed out or was truncated, because a count of zero from a
-// read that never finished is indistinguishable from an archive holding nothing, and reading the
-// first as the second is what restored the defect this check exists for.
+// How many members the index names that should appear in the destination, or None for an index that could not be read: a zero from an unfinished read is not an empty result.
 #[cfg(test)]
 pub fn archive_produced_count(formats: &Formats, archive: &Path) -> Option<usize> {
     let cancel = AtomicBool::new(false);
@@ -187,27 +298,25 @@ fn archive_produced_count_inner(inner: Vec<String>, spec: ListSpec, read_only: &
     if !sandbox::available() {
         return Ok(None);
     }
-    let full = sandbox::wrap_readonly(&inner, read_only);
-    // Streamed, not .output(): buffering the whole index here would contradict the streaming
-    // contract the parser exists for, and a 200k-entry archive is exactly the case that motivated it.
-    let mut child = match Command::new(&full[0])
-        .args(&full[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
+    let mut full = sandbox::wrap_readonly(&inner, read_only);
+    sandbox::add_status(&mut full, inner.len());
+    // Streamed, not .output(): a 200k-entry index must never be buffered whole.
+    let mut jailed = match crate::backend::jail::spawn_jailed(&full, |cmd| {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+    }) {
+        Ok(jailed) => jailed,
         Err(_) => return Ok(None),
     };
     if let Some(pid) = started {
-        pid.store(child.id(), Ordering::SeqCst);
+        pid.store(jailed.child.id(), Ordering::SeqCst);
     }
     let deadline = Instant::now() + Duration::from_millis(crate::backend::archivelist::ARCHIVE_READ_MS);
-    let output = match child.stdout.take() {
+    let output = match jailed.child.stdout.take() {
         Some(output) => output,
         None => {
-            kill_and_reap(&mut child);
+            crate::backend::jail::kill_tree(&mut jailed);
             return Ok(None);
         }
     };
@@ -216,11 +325,11 @@ fn archive_produced_count_inner(inner: Vec<String>, spec: ListSpec, read_only: &
     });
     loop {
         if cancelled(cancel) {
-            kill_and_reap(&mut child);
-            let _ = parser.join();
+            // Kills the sandbox init too, and never waits for the parser drain.
+            crate::backend::jail::kill_tree(&mut jailed);
             return Err(op_err("archive", "", "cancelled"));
         }
-        match child.try_wait() {
+        match jailed.child.try_wait() {
             Ok(Some(status)) => {
                 let listed = match parser.join() {
                     Ok(listed) => listed,
@@ -235,14 +344,12 @@ fn archive_produced_count_inner(inner: Vec<String>, spec: ListSpec, read_only: &
                 return Ok(Some(listed.produced_entries));
             }
             Ok(None) if Instant::now() >= deadline => {
-                kill_and_reap(&mut child);
-                let _ = parser.join();
+                crate::backend::jail::kill_tree(&mut jailed);
                 return Ok(None);
             }
             Ok(None) => std::thread::sleep(CANCEL_STEP),
             Err(_) => {
-                kill_and_reap(&mut child);
-                let _ = parser.join();
+                crate::backend::jail::kill_tree(&mut jailed);
                 return Ok(None);
             }
         }
@@ -251,11 +358,6 @@ fn archive_produced_count_inner(inner: Vec<String>, spec: ListSpec, read_only: &
 
 fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
-}
-
-fn kill_and_reap(child: &mut Child) {
-    child.kill().ok();
-    child.wait().ok();
 }
 
 struct ReadyReader<R> {
@@ -283,103 +385,10 @@ fn archive_produced_count_with_inner(inner: Vec<String>, spec: ListSpec, read_on
                                  Some(Arc::clone(ready)))
 }
 
+#[cfg(test)]
+#[path = "archivework_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::testdir::TestDir;
-
-    #[test]
-    fn a_work_directory_is_made_beside_the_destination_and_goes_with_its_own_drop() {
-        let d = TestDir::new("archwork");
-        let kept;
-        {
-            let w = Work::new(d.path(), "arc").expect("work");
-            kept = w.dir.clone();
-            assert!(kept.is_dir());
-            assert!(kept.file_name().unwrap().to_string_lossy().starts_with(WORK_PREFIX));
-            // Beside the destination, so the rename that follows never crosses a filesystem.
-            assert_eq!(kept.parent().unwrap(), d.path());
-        }
-        assert!(!kept.exists(), "the work directory goes with the job that made it");
-    }
-
-    // Cancel kills and reaps; the exact spawned pid keeps the /proc gate off other suites' processes.
-    #[test]
-    fn a_cancelled_child_is_killed_and_reaped_rather_than_left_running() {
-        if crate::backend::sandboxprobe::skipped() { return; }
-        let d = TestDir::new("archworkcancel");
-        let work = Work::new(d.path(), "ext").expect("work");
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let started_pid = std::sync::Arc::new(AtomicU32::new(0));
-        let flag = std::sync::Arc::clone(&cancel);
-        let child_pid = std::sync::Arc::clone(&started_pid);
-        let notifier = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while child_pid.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            flag.store(true, Ordering::Relaxed);
-        });
-        let seconds = format!("30.{}", std::process::id());
-        let began = std::time::Instant::now();
-        let e = run_boxed_cancellable_observed("archive", vec!["/usr/bin/sleep".to_string(), seconds],
-                                               d.path(), &work.dir, &cancel, &started_pid).unwrap_err();
-        notifier.join().expect("the cancellation notifier finished");
-        assert_eq!(e.msg, "cancelled");
-        assert!(began.elapsed() < Duration::from_secs(10), "a cancelled child was waited out");
-        assert!(work.dir.is_dir(), "the runner must not remove the caller's staging directory");
-        let pid = started_pid.load(Ordering::SeqCst);
-        assert_ne!(pid, 0, "the cancellation fixture never observed its child pid");
-        let proc_entry = PathBuf::from(format!("/proc/{pid}"));
-        assert!(!proc_entry.exists(), "the owned child was not reaped");
-    }
-
-    // The parser must cancel while a real jailed child holds stdout open after one bounded line.
-    #[test]
-    fn a_cancelled_index_reader_kills_and_reaps_a_child_blocked_on_stdout() {
-        if crate::backend::sandboxprobe::skipped() { return; }
-        let d = TestDir::new("archworkindexcancel");
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let started = std::sync::Arc::new(AtomicU32::new(0));
-        let ready = std::sync::Arc::new(AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&cancel);
-        let parsed = std::sync::Arc::clone(&ready);
-        let notifier = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !parsed.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            flag.store(true, Ordering::Relaxed);
-        });
-        let fixture = "printf '%s\\n' '-rw-r--r-- 0 gm gm 1 Jan 1 00:00 a.txt'; exec /usr/bin/sleep 600";
-        let result = archive_produced_count_with_inner(
-            vec!["/usr/bin/sh".to_string(), "-c".to_string(), fixture.to_string()],
-            crate::backend::archivespec::tar_spec(), d.path(), &cancel, &started, &ready,
-        );
-        notifier.join().expect("the readiness notifier finished");
-        let error = result.unwrap_err();
-        assert_eq!(error.msg, "cancelled");
-        assert!(ready.load(Ordering::SeqCst), "the fixture never delivered its first line");
-        let pid = started.load(Ordering::SeqCst);
-        assert_ne!(pid, 0, "the verification fixture never exposed its child pid");
-        let proc_entry = PathBuf::from(format!("/proc/{pid}"));
-        assert!(!proc_entry.exists(), "the blocked verification child was not reaped");
-    }
-
-    #[test]
-    fn two_work_directories_beside_the_same_destination_never_share_a_path() {
-        let d = TestDir::new("archwork2");
-        let first = Work::new(d.path(), "ext").expect("first");
-        let second = Work::new(d.path(), "ext").expect("second");
-        assert_ne!(first.dir, second.dir, "a second job must not claim the first job's directory");
-        assert!(first.dir.is_dir(), "and must not have destroyed it");
-        assert!(second.dir.is_dir());
-        // In flight, so a live sibling's contents have to survive the other one being created.
-        std::fs::write(first.dir.join("in-flight"), b"payload").expect("write");
-        let third = Work::new(d.path(), "ext").expect("third");
-        assert!(first.dir.join("in-flight").is_file(), "a third job must not destroy either");
-        assert_ne!(third.dir, first.dir);
-        assert_ne!(third.dir, second.dir);
-    }
-}
+#[path = "archivework_text_tests.rs"]
+mod text_tests;

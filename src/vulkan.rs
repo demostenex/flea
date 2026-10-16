@@ -46,12 +46,17 @@ type DestroyInstance = unsafe extern "C" fn(*mut c_void, *const c_void);
 // vendorID and deviceID sit at these offsets in VkPhysicalDeviceProperties, which PROPERTIES_BYTES is sized to hold.
 const VENDOR_ID_OFFSET: usize = 8;
 const DEVICE_ID_OFFSET: usize = 12;
+// deviceType follows deviceID at offset 16 in VkPhysicalDeviceProperties.
+const DEVICE_TYPE_OFFSET: usize = 16;
 const PROPERTIES_BYTES: usize = 2048;
 
+// VkPhysicalDeviceType VK_PHYSICAL_DEVICE_TYPE_CPU, the kind lavapipe reports.
+const DEVICE_TYPE_CPU: u32 = 4;
+
 // PCI vendor ids, the values /sys/class/drm/card*/device/vendor carries.
-const PCI_VENDOR_NVIDIA: u32 = 0x10de;
-const PCI_VENDOR_INTEL: u32 = 0x8086;
-const PCI_VENDOR_AMD: u32 = 0x1002;
+pub(crate) const PCI_VENDOR_NVIDIA: u32 = 0x10de;
+pub(crate) const PCI_VENDOR_INTEL: u32 = 0x8086;
+pub(crate) const PCI_VENDOR_AMD: u32 = 0x1002;
 const PCI_VENDOR_VIRTIO: u32 = 0x1af4;
 
 // VkPhysicalDeviceLimits contains VkDeviceSize fields, so the driver write needs 8-byte alignment.
@@ -65,7 +70,7 @@ const WAYLAND_SURFACE: &CStr = c"VK_KHR_wayland_surface";
 const XCB_SURFACE: &CStr = c"VK_KHR_xcb_surface";
 
 // Only WAYLAND_DISPLAY is read, so a Wayland session wins on a box that has both set.
-fn platform_surface() -> &'static CStr {
+pub(crate) fn platform_surface() -> &'static CStr {
     surface_for(std::env::var_os("WAYLAND_DISPLAY").as_deref())
 }
 
@@ -100,14 +105,14 @@ unsafe fn entry(library: *mut c_void, symbol: &CStr) -> Result<*mut c_void, Stri
     Ok(found)
 }
 
-// Ok lists each device's PCI (vendor, device) in enumerate order; the error is the sentence the operator reads.
-pub fn usable() -> Result<Vec<(u32, u32)>, String> {
+// Ok lists each device's PCI (vendor, device) plus its VkPhysicalDeviceType in enumerate order; the error is the sentence the operator reads.
+pub fn usable() -> Result<Vec<(u32, u32, u32)>, String> {
     usable_with(&[SURFACE, platform_surface()])
 }
 
 // Split from usable() so a test can ask the same question with an extension no loader can offer.
 // corner: the handle is never dlclose()d, because this process execs qs a moment later.
-fn usable_with(extensions: &[&CStr]) -> Result<Vec<(u32, u32)>, String> {
+fn usable_with(extensions: &[&CStr]) -> Result<Vec<(u32, u32, u32)>, String> {
     let names: Vec<*const c_char> = extensions.iter().map(|e| e.as_ptr()).collect();
     let asked: Vec<String> = extensions
         .iter()
@@ -159,7 +164,7 @@ fn usable_with(extensions: &[&CStr]) -> Result<Vec<(u32, u32)>, String> {
         let listed = enumerate(instance, &mut filled, handles.as_mut_ptr());
         // VK_INCOMPLETE still wrote `filled` handles; treating it as failure would drop to OpenGL.
         let complete = listed == VK_SUCCESS || listed == VK_INCOMPLETE;
-        let ids: Vec<(u32, u32)> = if complete {
+        let ids: Vec<(u32, u32, u32)> = if complete {
             handles
                 .iter()
                 .take(filled as usize)
@@ -176,13 +181,14 @@ fn usable_with(extensions: &[&CStr]) -> Result<Vec<(u32, u32)>, String> {
     }
 }
 
-// Sample input: a VkPhysicalDevice and vkGetPhysicalDeviceProperties, which writes vendorID then deviceID.
-fn pci_id(handle: *mut c_void, get: GetPhysicalDeviceProperties) -> (u32, u32) {
+// Sample input: a VkPhysicalDevice and vkGetPhysicalDeviceProperties, which writes vendorID then deviceID then deviceType.
+fn pci_id(handle: *mut c_void, get: GetPhysicalDeviceProperties) -> (u32, u32, u32) {
     let mut buf = PropertiesBuf([0u8; PROPERTIES_BYTES]);
     unsafe { get(handle, buf.0.as_mut_ptr()) }
     (
         u32::from_ne_bytes(buf.0[VENDOR_ID_OFFSET..DEVICE_ID_OFFSET].try_into().unwrap()),
         u32::from_ne_bytes(buf.0[DEVICE_ID_OFFSET..DEVICE_ID_OFFSET + 4].try_into().unwrap()),
+        u32::from_ne_bytes(buf.0[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 4].try_into().unwrap()),
     )
 }
 
@@ -205,12 +211,12 @@ pub fn drop_display_pin(command: &mut Command) {
 }
 
 // The display GPU's ICD list; AGENTS.md rule 5 says why an index pin cannot do this job.
-pub fn display_pin(devices: &[(u32, u32)]) -> DisplayPin {
+pub fn display_pin(devices: &[(u32, u32, u32)]) -> DisplayPin {
     display_pin_in(devices, Path::new("/sys/class/drm"), &icd_search_dirs())
 }
 
 // Split from display_pin so a test can drive the whole chain against a fake sysfs and icd dir.
-fn display_pin_in(devices: &[(u32, u32)], drm: &Path, icd_dirs: &[PathBuf]) -> DisplayPin {
+fn display_pin_in(devices: &[(u32, u32, u32)], drm: &Path, icd_dirs: &[PathBuf]) -> DisplayPin {
     icd_for_displays(devices, &display_pci_ids(drm), &card_pci_ids(drm), icd_dirs)
 }
 
@@ -234,28 +240,30 @@ fn icd_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-// Sample input: devices [(0x8086, 0xa788), (0x10de, 0x27e0)] and displays [(0x10de, 0x27e0)].
-fn needs_icd_pin(devices: &[(u32, u32)], displays: &[(u32, u32)], cards: &[(u32, u32)]) -> bool {
+// Sample input: devices [(0x8086, 0xa788, 1), (0x10de, 0x27e0, 2)] and displays [(0x10de, 0x27e0)].
+fn needs_icd_pin(devices: &[(u32, u32, u32)], displays: &[(u32, u32)], cards: &[(u32, u32)]) -> bool {
     if displays.is_empty() || devices.is_empty() {
         return false;
     }
-    let has_display = devices.iter().any(|id| displays.contains(id));
-    // A rival must be a real card and a different vendor: a software ICD owns no card, and an ICD list is vendor granular.
+    let has_display = devices.iter().any(|id| displays.contains(&(id.0, id.1)));
+    // The other GPU must be a real card and a different vendor: a software ICD owns no card, and an ICD list is vendor granular.
     let excludable = devices.iter().any(|id| {
-        !displays.contains(id)
-            && cards.contains(id)
+        let pci = (id.0, id.1);
+        !displays.contains(&pci)
+            && cards.contains(&pci)
             && !displays.iter().any(|(vendor, _)| *vendor == id.0)
     });
     has_display && excludable
 }
 
-fn icd_for_displays(devices: &[(u32, u32)], displays: &[(u32, u32)], cards: &[(u32, u32)], icd_dirs: &[PathBuf]) -> DisplayPin {
+fn icd_for_displays(devices: &[(u32, u32, u32)], displays: &[(u32, u32)], cards: &[(u32, u32)], icd_dirs: &[PathBuf]) -> DisplayPin {
     if !needs_icd_pin(devices, displays, cards) {
         return DisplayPin::NotNeeded;
     }
-    let Some(gpu) = devices.iter().copied().find(|id| displays.contains(id)) else {
+    let Some(found) = devices.iter().copied().find(|id| displays.contains(&(id.0, id.1))) else {
         return DisplayPin::NotNeeded;
     };
+    let gpu = (found.0, found.1);
     let mut files = Vec::new();
     for dir in icd_dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
@@ -267,7 +275,7 @@ fn icd_for_displays(devices: &[(u32, u32)], displays: &[(u32, u32)], cards: &[(u
             }
             let Ok(body) = std::fs::read_to_string(&path) else { continue };
             let Some(lib) = icd_library(&body) else { continue };
-            let Some(vendor) = vendor_of_library(lib) else { continue };
+            let Some(vendor) = vendor_of_library(&lib) else { continue };
             if !displays.iter().any(|(v, _)| *v == vendor) {
                 continue;
             }
@@ -284,21 +292,66 @@ fn icd_for_displays(devices: &[(u32, u32)], displays: &[(u32, u32)], cards: &[(u
     }
 }
 
-// Sample input: the packaged nvidia_icd.json, whose library_path is libGLX_nvidia.so.0.
-fn icd_library(body: &str) -> Option<&str> {
-    let key = body.find("\"library_path\"")?;
-    let after = body[key + "\"library_path\"".len()..].trim_start();
-    let after = after.strip_prefix(':')?.trim_start();
-    let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    Some(&after[..end])
+// A packaged manifest is a few hundred bytes, and jsondoc's object parse is quadratic in its keys, so a larger file names nothing.
+pub(crate) const MANIFEST_BYTES: usize = 4096;
+
+// The loader reads ICD.library_path through cJSON: any case, first repeat; a repeat or a member elsewhere names nothing.
+// Sample input: the packaged nvidia_icd.json, whose ICD.library_path is libGLX_nvidia.so.0.
+pub(crate) fn icd_library(body: &str) -> Option<String> {
+    // The loader refuses a manifest that does not parse, so a library named in one drives nothing.
+    if body.len() > MANIFEST_BYTES || crate::jsondoc::parse(body).is_err() {
+        return None;
+    }
+    let library = crate::jsonmembers::only(crate::jsonmembers::only(body, "ICD")?, "library_path")?;
+    // The loader opens the path up to its first NUL, so a path holding one names a library this cannot tell.
+    crate::jsondoc::parse(library).ok()?.as_str().filter(|path| !path.contains('\0')).map(str::to_owned)
+}
+
+// One name test for the hasvk ICD, which the display pin skips.
+// Sample input: "libvulkan_intel_hasvk.so", and "libvulkan_intel.so" for the ANV ICD beside it.
+fn is_hasvk_library(lib: &str) -> bool {
+    lib.to_ascii_lowercase().contains("hasvk")
+}
+
+// Mesa's hasvk drives Gen7 and Gen8 Intel (Ivy Bridge to Broadwell, Bay Trail), whose ids all sit below this one.
+const HASVK_ID_CEILING: u32 = 0x1800;
+// Cherryview and Braswell are Gen8 on hasvk but carry ids above the ceiling.
+const CHERRYVIEW_IDS: [u32; 4] = [0x22b0, 0x22b1, 0x22b2, 0x22b3];
+// Broxton's first id is Gen9, which ANV drives, although it sits below the ceiling.
+const BROXTON_BELOW_CEILING: u32 = 0x0a84;
+
+// Sample input: (0x8086, 0x0412) Haswell GT2 and (0x8086, 0x22b0) Cherryview true, (0x8086, 0xa788) false.
+pub(crate) fn is_hasvk_intel(id: (u32, u32)) -> bool {
+    if id.0 != PCI_VENDOR_INTEL {
+        return false;
+    }
+    if CHERRYVIEW_IDS.contains(&id.1) {
+        return true;
+    }
+    id.1 < HASVK_ID_CEILING && id.1 != BROXTON_BELOW_CEILING
+}
+
+// Issue #160: hasvk draws garbled text, so a box whose every real GPU is a hasvk Intel GPU starts on OpenGL.
+// Sample input: [(0x8086, 0x0412, 1)] for a Haswell-only box, plus (0x10de, 0x27e0, 2) beside it.
+pub fn hasvk_only(devices: &[(u32, u32, u32)]) -> bool {
+    let mut real = false;
+    for id in devices {
+        if id.2 == DEVICE_TYPE_CPU {
+            continue;
+        }
+        if !is_hasvk_intel((id.0, id.1)) {
+            return false;
+        }
+        real = true;
+    }
+    real
 }
 
 // Sample input: "libGLX_nvidia.so.0", "libvulkan_intel.so", "libvulkan_intel_hasvk.so".
 fn vendor_of_library(lib: &str) -> Option<u32> {
     let lib = lib.to_ascii_lowercase();
     // hasvk is Haswell/Broadwell, not the display GPU beside a modern iGPU ICD.
-    if lib.contains("hasvk") {
+    if is_hasvk_library(&lib) {
         return None;
     }
     if lib.contains("nvidia") || lib.contains("nouveau") {
@@ -339,7 +392,7 @@ fn card_pci_ids(drm: &Path) -> Vec<(u32, u32)> {
 }
 
 // Sample input: "card1" is a card, "card1-DP-1" is one of its connectors, "renderD128" is a render node.
-fn is_card(name: &str) -> bool {
+pub(crate) fn is_card(name: &str) -> bool {
     match name.strip_prefix("card") {
         Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
         None => false,
@@ -387,7 +440,7 @@ fn connector_card(name: &str) -> Option<&str> {
 }
 
 // Sample input: "0x8086\n", "0XA788", "10de".
-fn parse_hex_id(raw: &str) -> Option<u32> {
+pub(crate) fn parse_hex_id(raw: &str) -> Option<u32> {
     let trimmed = raw.trim();
     let hex = trimmed
         .strip_prefix("0x")
@@ -399,6 +452,9 @@ fn parse_hex_id(raw: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // VkPhysicalDeviceType for a real GPU, the kinds a hasvk decision keeps.
+    const DEVICE_TYPE_INTEGRATED: u32 = 1;
+    const DEVICE_TYPE_DISCRETE: u32 = 2;
     use std::io::Write;
 
     // A build box with no Vulkan loader answers from the dlopen arm, which the two tests below cannot read, so they say so and skip.
@@ -447,14 +503,18 @@ mod tests {
     #[test]
     fn usable_reports_the_connected_card_pci_id() {
         let displays = display_pci_ids(Path::new("/sys/class/drm"));
-        // corner: one connected card is the only shape where a rival GPU cannot explain a mismatch.
+        // corner: one connected card is the only shape where another GPU cannot explain a mismatch.
         if displays.len() != 1 {
             return;
         }
         let Ok(ids) = usable() else {
             return;
         };
-        assert!(ids.contains(&displays[0]), "devices {ids:?} displays {displays:?}");
+        // corner: a CPU-only list (lavapipe beside a VM's virtual VGA) has no card that could report the id.
+        if !ids.is_empty() && ids.iter().all(|id| id.2 == DEVICE_TYPE_CPU) {
+            return;
+        }
+        assert!(ids.iter().any(|id| (id.0, id.1) == displays[0]), "devices {ids:?} displays {displays:?}");
     }
 
     #[test]
@@ -477,7 +537,21 @@ mod tests {
     #[test]
     fn icd_library_reads_the_packaged_nvidia_shape() {
         let body = "{\n    \"file_format_version\" : \"1.0.1\",\n    \"ICD\": {\n        \"library_path\": \"libGLX_nvidia.so.0\",\n        \"api_version\" : \"1.4.341\"\n    }\n}\n";
-        assert_eq!(icd_library(body), Some("libGLX_nvidia.so.0"));
+        assert_eq!(icd_library(body).as_deref(), Some("libGLX_nvidia.so.0"));
+        let lower = "{\"icd\":{\"Library_Path\":\"libvulkan_radeon.so\"}}";
+        assert_eq!(icd_library(lower).as_deref(), Some("libvulkan_radeon.so"), "cJSON matches either key in any case");
+        let metadata = "{\"comment\":\"library_path caf\\u00e9\",\"ICD\":{\"library_path\":\"libvulkan_radeon.so\",\"note\":\"library_path\"}}";
+        assert_eq!(icd_library(metadata).as_deref(), Some("libvulkan_radeon.so"), "only the two keys can be ambiguous");
+        for ambiguous in [
+            "{\"ICD\":{\"Library_Path\":\"libvulkan_radeon.so\",\"library_path\":\"libGLX_nvidia.so.0\"}}",
+            "{\"ICD\":{\"library_path\":\"libvulkan_radeon.so\",\"library_path\":\"libGLX_nvidia.so.0\"}}",
+            "{\"ICD\":{\"library_path\":\"libvulkan_radeon.so\",\"library\\u005fpath\":\"libGLX_nvidia.so.0\"}}",
+            "{\"ICD\":{\"library_path\":\"libvulkan_radeon.so\"},\"ICD\":{\"library_path\":\"libGLX_nvidia.so.0\"}}",
+            "{\"ICD\":{\"library_path\\u0000x\":\"libvulkan_radeon.so\",\"library_path\":\"libGLX_nvidia.so.0\"}}",
+            "{\"ICD\":{\"library_path\":\"libvulkan_radeon.so\\u0000/../libGLX_nvidia.so.0\"}}",
+        ] {
+            assert_eq!(icd_library(ambiguous), None, "{ambiguous}");
+        }
     }
 
     #[test]
@@ -489,28 +563,85 @@ mod tests {
         assert_eq!(vendor_of_library("libvulkan_radeon.so"), Some(PCI_VENDOR_AMD));
     }
 
+    // Issue #160: hasvk is Mesa's driver for Gen7 and Gen8 Intel; Gen9 and later are ANV's.
+    #[test]
+    fn hasvk_covers_gen7_and_gen8_intel_and_nothing_newer() {
+        assert!(is_hasvk_intel((PCI_VENDOR_INTEL, 0x0412)), "Haswell GT2");
+        assert!(is_hasvk_intel((PCI_VENDOR_INTEL, 0x0166)), "Ivy Bridge GT2");
+        assert!(is_hasvk_intel((PCI_VENDOR_INTEL, 0x0f31)), "Bay Trail");
+        assert!(is_hasvk_intel((PCI_VENDOR_INTEL, 0x1616)), "Broadwell GT2, Gen8");
+        assert!(is_hasvk_intel((PCI_VENDOR_INTEL, 0x22b0)), "Cherryview, Gen8 above the ceiling");
+        assert!(!is_hasvk_intel((PCI_VENDOR_INTEL, 0x0a84)), "Broxton, Gen9 below the ceiling");
+        assert!(!is_hasvk_intel((PCI_VENDOR_INTEL, 0x1916)), "Skylake GT2, Gen9");
+        assert!(!is_hasvk_intel((PCI_VENDOR_INTEL, 0xa788)), "a modern iGPU");
+        assert!(!is_hasvk_intel((PCI_VENDOR_INTEL, 0x1800)));
+        assert!(!is_hasvk_intel((PCI_VENDOR_NVIDIA, 0x0412)));
+    }
+
+    // Issue #160: a Haswell-only box draws garbled text on Vulkan, so the launcher falls back.
+    #[test]
+    fn a_haswell_only_box_is_hasvk_only() {
+        assert!(hasvk_only(&[(PCI_VENDOR_INTEL, 0x0412, DEVICE_TYPE_INTEGRATED)]));
+    }
+
+    // Issue #160: hasvk beside another usable device keeps Vulkan, the pin still decides the ICD.
+    #[test]
+    fn hasvk_beside_another_device_is_not_hasvk_only() {
+        assert!(!hasvk_only(&[(PCI_VENDOR_INTEL, 0x0412, DEVICE_TYPE_INTEGRATED), (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)]));
+        assert!(!hasvk_only(&[(PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)]));
+        assert!(!hasvk_only(&[(PCI_VENDOR_INTEL, 0xa788, DEVICE_TYPE_INTEGRATED)]));
+    }
+
+    // A CPU device beside hasvk is still hasvk-only: lavapipe reports VK_PHYSICAL_DEVICE_TYPE_CPU.
+    // Sample input: [(0x8086, 0x0412, 1), (0x10005, 0, 4)] answers true.
+    #[test]
+    fn a_cpu_device_beside_hasvk_is_still_hasvk_only() {
+        assert!(hasvk_only(&[(PCI_VENDOR_INTEL, 0x0412, DEVICE_TYPE_INTEGRATED), (0x10005, 0, DEVICE_TYPE_CPU)]));
+        assert!(!hasvk_only(&[(PCI_VENDOR_INTEL, 0x0412, DEVICE_TYPE_INTEGRATED), (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)]));
+        assert!(!hasvk_only(&[(0x10005, 0, DEVICE_TYPE_CPU)]));
+    }
+
+    // usable() errors on zero devices, so an empty list never reaches the fallback; it reads as not.
+    #[test]
+    fn no_device_is_never_hasvk_only() {
+        assert!(!hasvk_only(&[]));
+    }
+
+    // The minipc ICD pair, read the way the pin reads them: hasvk is recognised and skipped.
+    #[test]
+    fn the_minipc_icd_pair_names_hasvk_and_skips_it() {
+        let hasvk = "{\"ICD\":{\"library_path\":\"libvulkan_intel_hasvk.so\"}}\n";
+        let intel = "{\"ICD\":{\"library_path\":\"libvulkan_intel.so\"}}\n";
+        assert!(is_hasvk_library(&icd_library(hasvk).unwrap()));
+        assert!(!is_hasvk_library(&icd_library(intel).unwrap()));
+        assert_eq!(vendor_of_library(&icd_library(hasvk).unwrap()), None);
+        assert_eq!(vendor_of_library(&icd_library(intel).unwrap()), Some(PCI_VENDOR_INTEL));
+    }
+
     // Hybrid: Vulkan sees Intel and NVIDIA, only NVIDIA has a panel, so the Intel ICD has to go.
     #[test]
     fn a_gpu_with_no_display_needs_the_display_icd() {
-        let intel = (PCI_VENDOR_INTEL, 0xa788);
-        let nvidia = (PCI_VENDOR_NVIDIA, 0x27e0);
-        let cards = [intel, nvidia];
-        assert!(needs_icd_pin(&[intel, nvidia], &[nvidia], &cards));
-        assert!(needs_icd_pin(&[intel, nvidia], &[intel], &cards));
-        assert!(!needs_icd_pin(&[intel, nvidia], &[intel, nvidia], &cards));
-        assert!(!needs_icd_pin(&[nvidia], &[nvidia], &cards));
+        let intel = (PCI_VENDOR_INTEL, 0xa788, DEVICE_TYPE_INTEGRATED);
+        let nvidia = (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE);
+        let intel_pci = (PCI_VENDOR_INTEL, 0xa788);
+        let nvidia_pci = (PCI_VENDOR_NVIDIA, 0x27e0);
+        let cards = [intel_pci, nvidia_pci];
+        assert!(needs_icd_pin(&[intel, nvidia], &[nvidia_pci], &cards));
+        assert!(needs_icd_pin(&[intel, nvidia], &[intel_pci], &cards));
+        assert!(!needs_icd_pin(&[intel, nvidia], &[intel_pci, nvidia_pci], &cards));
+        assert!(!needs_icd_pin(&[nvidia], &[nvidia_pci], &cards));
         assert!(!needs_icd_pin(&[intel, nvidia], &[], &cards));
     }
 
     #[test]
     fn icd_for_displays_picks_the_nvidia_json_and_not_hasvk() {
         let root = fixture_root("icd-pick");
-        std::fs::write(root.join("nvidia_icd.json"), "{\"ICD\":{\"library_path\":\"libGLX_nvidia.so.0\"}}\n").unwrap();
+        std::fs::write(root.join("nvidia_icd.json"), "{\"comment\":\"library_path caf\\u00e9\",\"ICD\":{\"library_path\":\"libGLX_nvidia.so.0\"}}\n").unwrap();
         std::fs::write(root.join("intel_icd.json"), "{\"ICD\":{\"library_path\":\"libvulkan_intel.so\"}}\n").unwrap();
         std::fs::write(root.join("intel_hasvk_icd.json"), "{\"ICD\":{\"library_path\":\"libvulkan_intel_hasvk.so\"}}\n").unwrap();
-        let intel = (PCI_VENDOR_INTEL, 0xa788);
-        let nvidia = (PCI_VENDOR_NVIDIA, 0x27e0);
-        let picked = icd_for_displays(&[intel, nvidia], &[nvidia], &[intel, nvidia], &[root.clone()]);
+        let intel = (PCI_VENDOR_INTEL, 0xa788, DEVICE_TYPE_INTEGRATED);
+        let nvidia = (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE);
+        let picked = icd_for_displays(&[intel, nvidia], &[(PCI_VENDOR_NVIDIA, 0x27e0)], &[(PCI_VENDOR_INTEL, 0xa788), (PCI_VENDOR_NVIDIA, 0x27e0)], &[root.clone()]);
         let _ = std::fs::remove_dir_all(&root);
         match picked {
             DisplayPin::Pin { icd, .. } => {
@@ -544,8 +675,8 @@ mod tests {
         let icd = fixture_root("icd-hybrid");
         std::fs::write(icd.join("nvidia_icd.json"), "{\"ICD\":{\"library_path\":\"libGLX_nvidia.so.0\"}}\n").unwrap();
         std::fs::write(icd.join("intel_icd.json"), "{\"ICD\":{\"library_path\":\"libvulkan_intel.so\"}}\n").unwrap();
-        let pinned = display_pin_in(&[(PCI_VENDOR_INTEL, 0xa788), (PCI_VENDOR_NVIDIA, 0x27e0)], &drm, &[icd.clone()]);
-        let alone = display_pin_in(&[(PCI_VENDOR_NVIDIA, 0x27e0)], &drm, &[icd.clone()]);
+        let pinned = display_pin_in(&[(PCI_VENDOR_INTEL, 0xa788, DEVICE_TYPE_INTEGRATED), (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)], &drm, &[icd.clone()]);
+        let alone = display_pin_in(&[(PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)], &drm, &[icd.clone()]);
         let _ = std::fs::remove_dir_all(&drm);
         let _ = std::fs::remove_dir_all(&icd);
         match pinned {
@@ -568,16 +699,16 @@ mod tests {
 
     #[test]
     fn a_vulkan_device_that_owns_no_drm_card_is_not_a_rival_gpu() {
-        let intel = (PCI_VENDOR_INTEL, 0x3e92);
-        let lavapipe = (0x10005, 0x0);
-        assert!(!needs_icd_pin(&[intel, lavapipe], &[intel], &[intel]));
+        let intel = (PCI_VENDOR_INTEL, 0x3e92, DEVICE_TYPE_INTEGRATED);
+        let lavapipe = (0x10005, 0x0, DEVICE_TYPE_CPU);
+        assert!(!needs_icd_pin(&[intel, lavapipe], &[(PCI_VENDOR_INTEL, 0x3e92)], &[(PCI_VENDOR_INTEL, 0x3e92)]));
     }
 
     #[test]
     fn a_same_vendor_rival_cannot_be_excluded_by_an_icd_list() {
-        let igpu = (PCI_VENDOR_AMD, 0x164e);
-        let dgpu = (PCI_VENDOR_AMD, 0x744c);
-        assert!(!needs_icd_pin(&[igpu, dgpu], &[igpu], &[igpu, dgpu]));
+        let igpu = (PCI_VENDOR_AMD, 0x164e, DEVICE_TYPE_INTEGRATED);
+        let dgpu = (PCI_VENDOR_AMD, 0x744c, DEVICE_TYPE_DISCRETE);
+        assert!(!needs_icd_pin(&[igpu, dgpu], &[(PCI_VENDOR_AMD, 0x164e)], &[(PCI_VENDOR_AMD, 0x164e), (PCI_VENDOR_AMD, 0x744c)]));
     }
 
     #[test]
@@ -585,7 +716,7 @@ mod tests {
         let icd = fixture_root("icd-unknown");
         std::fs::write(icd.join("mystery_icd.json"), "{\"ICD\":{\"library_path\":\"libvulkan_mystery.so\"}}\n").unwrap();
         let answer = icd_for_displays(
-            &[(PCI_VENDOR_INTEL, 0xa788), (PCI_VENDOR_NVIDIA, 0x27e0)],
+            &[(PCI_VENDOR_INTEL, 0xa788, DEVICE_TYPE_INTEGRATED), (PCI_VENDOR_NVIDIA, 0x27e0, DEVICE_TYPE_DISCRETE)],
             &[(PCI_VENDOR_NVIDIA, 0x27e0)],
             &[(PCI_VENDOR_INTEL, 0xa788), (PCI_VENDOR_NVIDIA, 0x27e0)],
             &[icd.clone()],

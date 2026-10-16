@@ -15,7 +15,7 @@ One release feeds four packages:
 | `flea` | Omarchy's repository (OPR), the default | the tagged source, built and signed by Omarchy | OPR's own sync, which verifies `flea-vX.Y.Z.tar.gz` against `SHASUMS256.txt` a day or more after the tag |
 | `flea-bin` | AUR | the binary the workflow built; no Rust toolchain, seconds not minutes | the workflow, on every tag |
 | `flea` | AUR | `flea-vX.Y.Z.tar.gz` built on the user's machine; on Omarchy the OPR package of the same name comes first | the workflow, on every tag |
-| `flea-git` | AUR | `main`, built on the user's machine | the workflow, only when `packaging/flea-git/PKGBUILD` changes |
+| `flea-git` | AUR | `main`, built on the user's machine | the workflow, on every tag |
 
 The AUR PKGBUILDs are `packaging/flea-bin/PKGBUILD`, `packaging/flea/PKGBUILD` and
 `packaging/flea-git/PKGBUILD`. Those files are the source of truth: an edit made on the AUR itself is
@@ -27,11 +27,25 @@ replaced by the next tag, so a change goes in by pull request here.
    `version` in `Cargo.toml`, and `pkgver` in `PKGBUILD`, `packaging/flea-bin/PKGBUILD` and
    `packaging/flea/PKGBUILD`. `Cargo.lock` follows `Cargo.toml` on the next `cargo build`, and
    `--locked` fails until it has. `packaging/flea-git/PKGBUILD`'s `pkgver` is not one of them: the
-   workflow writes it.
+   workflow writes it. `"version"` in `shelf/manifest.json` is a fifth, and `cargo test` refuses a
+   tree where it differs from `Cargo.toml`, so the build job stops before anything is published. The
+   Enable shelf switch replaces a user's copy of the bar plugin only when the packaged version differs
+   from it, so a shelf change under an unchanged version would never reach anyone who has the shelf
+   on. Every `package()` stamps the packaged copy with `$pkgver-$pkgrel`, which is how `flea-git`
+   replaces the copy on each build between releases, and a rebuild of one release does too.
 2. Notes, optionally, in `docs/release-notes-X.Y.Z.md`. The workflow reads that file into the
    release body when it is the one creating the release; a release that already exists keeps
    whatever body it has.
-3. Tag and push. Only GM can create a `v*` tag (the ruleset below):
+3. Run `tools/flea-pkgrel-check` on the candidate commit before tagging: it fails when `pkgver`
+   changed since the previous `vX.Y.Z` tag and `pkgrel` is not 1 in either PKGBUILD, so a fresh
+   version always starts at 1 and only a rebuild of one version keeps a higher number.
+4. Push the candidate commit to a `candidate/X.Y.Z` branch. The Candidate workflow
+   (`.github/workflows/candidate.yml`) runs the release's verify checks, with `Cargo.toml`'s version
+   in place of the tag, and its build job up to publication on both runners: the same packages,
+   `cargo test --release --locked`, the build and the flea-bin tarball check. Tag only the commit it
+   passed, then delete the branch. A Docker image of the runner OS cannot stand in for this; 0.3.10
+   and 0.3.11 were each tagged three times on failures only the runners showed.
+5. Tag and push. Only the repository owner can create a `v*` tag (the ruleset below):
 
    ```
    git tag -a vX.Y.Z -m "Flea X.Y.Z"
@@ -96,8 +110,8 @@ Then the workflow runs five jobs, in order:
     `package()` reaches OPR only through a change there: 0.3.5's `packaging/flea.hook` needs
     `install -Dm644 packaging/flea.hook -t "$pkgdir/usr/share/libalpm/hooks"`.
   - `flea-git` gets the `pkgver` its `pkgver()` prints on the tag itself, `X.Y.Z.r0.g<7 hex>`. It is
-    pushed only when the rest of its PKGBUILD differs from the one on the AUR, because the AUR
-    guidelines forbid commits that only move a VCS package's `pkgver`.
+    pushed on every tag, like `flea` and `flea-bin` (decided 2026-10-01): only a PKGBUILD byte-identical
+    to the one on the AUR pushes nothing.
 
   Each leg then checks that the tag is still the newest `vX.Y.Z` on the remote, so rebuilding an old
   tag, or a run a newer tag overtook, ends in a warning and never downgrades the AUR. A missing
@@ -115,7 +129,15 @@ Then the workflow runs five jobs, in order:
   refused and the leg fails.
   When the AUR already carries the same files there is no commit and no push. SSH trusts only the
   three AUR host keys pinned in `packaging/aur.known_hosts`, with `StrictHostKeyChecking=yes`;
-  nothing is scanned or learned at run time.
+  nothing is scanned or learned at run time. After the workflow, `tools/flea-aur-versions X.Y.Z <tag commit>`
+  reads the AUR RPC and checks `flea` and `flea-bin` report `X.Y.Z-<pkgrel>`, the pkgrel each
+  PKGBUILD carries at the tag commit itself (so a rebuild at pkgrel 2 expects `X.Y.Z-2`, not
+  `X.Y.Z-1`), and `flea-git` the tag's own `pkgver`. Its usage is
+  `flea-aur-versions [--json FILE] X.Y.Z COMMIT`: one line per package on stdout, exit 1 on
+  any mismatch, exit 2 on usage errors. `tools/flea-pkgrel-check [COMMIT]` (default `HEAD`)
+  is the pre-tag guard above: it exits 0 when the check passes, 1 when the pkgver/pkgrel
+  guard fails, and 2 on usage, git or file errors, including a shallow checkout or a parent
+  with no reachable `vX.Y.Z` tag, which mean tags were never fetched.
 
 A run that failed for a reason outside the tree, a runner outage or a mirror that timed out, is
 started again. When only publish-aur failed, use `Re-run failed jobs` on that same run: it re-runs the
@@ -139,7 +161,7 @@ and no co-maintainer to add: the workflow pushes as taxin, who maintains the AUR
 account, one per line, so this key sits beside taxin's own and deleting its line revokes it alone,
 at once. An AUR key belongs to an account, not to a package, so it can push to every package that
 account maintains, and a pushed PKGBUILD runs on users' machines at their next update, unread,
-because `omarchy update` runs `yay -Sua --noconfirm`; that is why only a `v*` tag GM created can
+because `omarchy update` runs `yay -Sua --noconfirm`; that is why only a `v*` tag the repository owner created can
 read it. If taxin prefers to publish by hand, the workflow's legs skip green and each release is
 three `packaging/aur-push` runs from the tag with the checksums pinned, as "By hand" shows.
 
@@ -162,13 +184,13 @@ three `packaging/aur-push` runs from the tag with the checksums pinned, as "By h
    on the [AUR home page](https://aur.archlinux.org): `SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4`
    (Ed25519), `SHA256:uTa/0PndEgPZTf76e1DFqXKJEXKsn7m9ivhLQtzGOCI` (ECDSA),
    `SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8` (RSA).
-4. **The private half goes to GM** over an end-to-end encrypted channel
+4. **The private half goes to the repository owner** over an end-to-end encrypted channel
    that does not keep it: a one-time Bitwarden Send or 1Password share link, or Signal. Never email,
    Discord, or a GitHub issue or comment.
-5. **Delete both files** once GM has stored the key. The AUR has the public half, GitHub has the
+5. **Delete both files** once the repository owner has stored the key. The AUR has the public half, GitHub has the
    private half, and nothing else needs either.
 
-### GM, once
+### The repository owner, once
 
 1. **The environment.** On GitHub, Settings, Environments, New environment, named exactly `aur`.
    Under `Deployment branches and tags` choose `Selected branches and tags`, then
@@ -187,8 +209,8 @@ three `packaging/aur-push` runs from the tag with the checksums pinned, as "By h
    `release tags`, enforcement status `Active`. Bypass list: `Add bypass`, `Repository admin`.
    Target tags: `Add target`, `Include by pattern`, `v*`. Rules: `Restrict creations`,
    `Restrict updates`, `Restrict deletions` and `Block force pushes`. Create. On a personal
-   repository the owner is the only admin, so only GM can create, move or delete a `v*` tag, and with
-   step 1 only a tag GM created can read the key.
+   repository the owner is the only admin, so only the owner can create, move or delete a `v*` tag, and with
+   step 1 only a tag the owner created can read the key.
 5. **No second copy.** If a repository secret named `AUR_SSH_KEY` exists from an earlier setup,
    delete it (Settings, Secrets and variables, Actions, `Repository secrets`), so the key exists only
    behind the `v*` rule.
@@ -203,7 +225,7 @@ the only sign that nothing reached the AUR; the release itself is still complete
 
 Whenever a copy may have leaked, or someone who handled it should no longer have it: taxin makes a
 new pair (step 1), adds its public line to the account's `SSH Public Key` field, deletes the old line,
-and sends the private half as before; GM replaces the value of `AUR_SSH_KEY` in the `aur` environment,
+and sends the private half as before; the repository owner replaces the value of `AUR_SSH_KEY` in the `aur` environment,
 which can be overwritten but never read. Deleting the old public line is what revokes the old key,
 at once; when a leak is suspected, do that first.
 

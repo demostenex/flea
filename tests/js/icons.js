@@ -26,7 +26,7 @@ function run(check) {
     check("a row with no mode at all falls back to the icon name",
           Icons.glyphForRow("text-x-generic", 0), "file-text")
 
-    // GM ruled the brand marks are reproduced from the official artwork, not recut, so neither is a
+    // The brand marks are reproduced from the official artwork, not recut, so neither is a
     // cut glyph and neither belongs in PATHS. The recut strings must not come back.
     check("tailscale is not a cut glyph", Icons.PATHS["tailscale"] === undefined, true)
     check("dropbox is not a cut glyph", Icons.PATHS["dropbox"] === undefined, true)
@@ -70,8 +70,23 @@ function run(check) {
     // The picker rail's Recent mark, which reaches ui/PickerPlaces.qml by name and falls into the
     // same silent trap if PATHS never learns it.
     drawsItsOwnMark("history")
+
+    // Quick Look's Markdown bar draws LanguageMarks' Markdown mark by name, and a missing name falls back to the file mark in silence.
+    drawsItsOwnMark("markdown")
+    check("the Markdown mark is the board's cut", Icons.pathFor("markdown"), "M2 5h20v14H2z M5.5 15V9l3 3.5 3-3.5v6 M17 9v6 M14.5 12.5 17 15l2.5-2.5")
     check("Preview keeps the board's right-hand column", Icons.pathFor("preview"), "M3 3h18v18H3z M15 3v18")
     check("Folders first keeps the board's stacked rules", Icons.pathFor("folders-first"), "M2 12V4h6l2 2h12v6H2z M2 17h20 M2 21h20")
+
+    // ClickAndRefresh's Open items with row and Icons040 draw the pointer: an arrow head and its tail, both strokes.
+    drawsItsOwnMark("pointer")
+    check("the pointer is the board's cut", Icons.pathFor("pointer"), "M4 4l16 6.5-7 2-2 7z M13 13l6 6")
+
+    // MenuAdditions040 fills contrast's right half disc as well as stroking it; ui/Glyph.qml reads this table for the solid part.
+    check("Invert selection's solid part is the board's half disc", Icons.filledPathFor("contrast"), "M12 18a6 6 0 0 0 0-12v12z")
+    check("and it is one of the mark's own sub-paths", Icons.pathFor("contrast").indexOf(Icons.filledPathFor("contrast")) >= 0, true)
+    check("no other mark has a solid part",
+          Object.keys(Icons.PATHS).filter(function (name) { return Icons.filledPathFor(name) !== "" }).join(","), "contrast")
+    check("a name with no entry fills nothing", Icons.filledPathFor("nonesuch"), "")
 
     var sidebarNames = ["house", "download", "file-text", "image", "film", "music", "folder-git-2", "folder"]
     for (var j = 0; j < sidebarNames.length; j++) {
@@ -107,10 +122,15 @@ function run(check) {
           Icons.pathFor("sort"), "M11 5h10 M11 9h7 M11 13h4 M7 5v14 M7 19l-3-3 M7 19l3-3")
 
     // ui/ContextMenu.qml's New Folder row. The mark is drawn on Main.dc.html's specimen sheet with
-    // no consumer, and GM's ruling is that recut lucide geometry wins over the board's hand drawing.
+    // no consumer, and the rule is that recut lucide geometry takes precedence over the board's hand drawing.
     drawsItsOwnMark("folder-plus")
     check("folder-plus keeps the closed folder's own body, so the two marks cannot drift",
           Icons.pathFor("folder-plus").indexOf(Icons.pathFor("folder")) === 0, true)
     check("folder-plus is the recut lucide plus, not the board's 5 unit one",
           Icons.pathFor("folder-plus"), "M2 20V3h6l2 3h12v14H2z M12 10v6 M9 13h6")
+
+    // The compress submenu's With-password row, pinned like every other mark so a silent fallback cannot take it.
+    drawsItsOwnMark("key")
+    check("key is the set's own bow, shaft and teeth",
+          Icons.pathFor("key"), "M3 7a4 4 0 1 0 8 0a4 4 0 1 0-8 0 M10.5 10.5l8 8 M16 16l2.5-2.5 M18.5 18.5l1.5-1.5")
 }

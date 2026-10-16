@@ -1,14 +1,15 @@
 # Maintainer: GM <gianmarcomorales@icloud.com>
 
 pkgname=flea
-pkgver=0.3.6
+pkgver=0.3.11
 pkgrel=1
 pkgdesc='Fast, keyboard-first file manager for Omarchy'
 arch=('x86_64' 'aarch64')
-license=('MIT')
+license=('MIT' 'Apache-2.0' 'EPL-2.0' 'BSD-2-Clause')
 # omarchy owns /usr/share/omarchy/shell, which ui/Commons and ui/Ui link into; quickshell owns qs.
 # util-linux ships prlimit, which the thumbnail and archive sandboxes require alongside bubblewrap.
 # xdg-terminal-exec is what --terminal execs, so the topbar's terminal button needs it installed.
+# udisks2 ships udisksctl, which the unlock dialog and the relock after unmount use.
 # wl-clipboard ships wl-copy, which ui/Opener.qml pipes into for the menu's Copy Path row; nothing
 # else in this closure requires it, so on a clean Omarchy box that row failed silently without it.
 # python-gobject is what tools/flea-portal answers org.freedesktop.impl.portal.FileChooser with, and
@@ -26,19 +27,22 @@ license=('MIT')
 # what AFC talks to. Stock Omarchy installs gvfs-mtp, gvfs-nfs and gvfs-smb only, so on a clean box
 # an Android phone lists and nothing else does. Measured on an iPhone (iOS 26.6.2): its PTP leg mounts
 # and answers zero folders, and AFC is the one that lists DCIM, so the iPhone needs both.
-depends=('bubblewrap' 'expect' 'gcc-libs' 'glib2' 'glibc' 'gvfs' 'gvfs-afc' 'gvfs-dnssd' 'gvfs-gphoto2' 'gvfs-mtp' 'gvfs-nfs' 'gvfs-smb' 'hicolor-icon-theme' 'kimageformats' 'libheif' 'omarchy' 'python' 'python-gobject' 'qt6-multimedia' 'qt6-webengine' 'quickshell' 'shared-mime-info' 'usbmuxd' 'util-linux' 'wl-clipboard' 'xdg-terminal-exec' 'xdg-utils')
+# quickjs-ng is what flea --figure-helper execs for Markdown maths and diagrams, so figures need it installed.
+
+# bat colours code previews and jq formats JSON before the sandbox renders it.
+depends=('bat' 'bubblewrap' 'expect' 'gcc-libs' 'glib2' 'glibc' 'gvfs' 'gvfs-afc' 'gvfs-dnssd' 'gvfs-gphoto2' 'gvfs-mtp' 'gvfs-nfs' 'gvfs-smb' 'hicolor-icon-theme' 'jq' 'kimageformats' 'libheif' 'omarchy' 'python' 'python-gobject' 'qt6-multimedia' 'qt6-webengine' 'quickjs-ng' 'quickshell' 'shared-mime-info' 'udisks2' 'usbmuxd' 'util-linux' 'wl-clipboard' 'xdg-terminal-exec' 'xdg-utils')
 makedepends=('cargo')
 # Both packages own /usr/bin/flea, so pacman refuses the pair rather than leaving one half-installed.
 conflicts=('flea-git')
-optdepends=('libarchive: archive listing and extraction'
+optdepends=('xclip: X11 clipboard support' 'libarchive: archive listing and extraction'
             '7zip: 7z archive support'
             'imagemagick: image conversion'
             'tailscale: Taildrop sharing'
             'ffmpeg: media metadata in the preview column'
             'ffmpegthumbnailer: video thumbnails, made by one pre-linked worker through libffmpegthumbnailer.so.4, or by the ffmpegthumbnailer program per video when that library will not load'
             'dropbox-cli: Dropbox share links'
-            'zoxide: frecent folders in the folder jump of the path bar'
-            'xclip: X11 clipboard support')
+            'libreoffice: office document previews'
+            'zoxide: frecent folders in the folder jump of the path bar')
 # The release profile strips, so a debug package would have nothing to hold.
 options=('!debug')
 # Empty on purpose: with no source array makepkg builds from $startdir, so a clone is the source.
@@ -66,6 +70,7 @@ package() {
   cd "$startdir"
   install -Dm755 "$srcdir/target/release/flea" "$pkgdir/usr/bin/flea"
   install -Dm755 tools/flea-gio-auth "$pkgdir/usr/lib/flea/flea-gio-auth"
+  install -Dm755 tools/flea-udisks "$pkgdir/usr/lib/flea/flea-udisks"
   # The portal backend, its registration and its D-Bus activation: xdg-desktop-portal 1.22 reads
   # portals/ out of every data dir, and this is Flea's own package writing Flea's own files.
   install -Dm755 tools/flea-portal "$pkgdir/usr/lib/flea/flea-portal"
@@ -77,6 +82,7 @@ package() {
   # Name=, so a vendor name is the convention and the only way to avoid a pacman file conflict.
   install -Dm755 tools/flea-filemanager1 "$pkgdir/usr/lib/flea/flea-filemanager1"
   install -Dm644 packaging/com.thisisgm.flea.FileManager1.service -t "$pkgdir/usr/share/dbus-1/services"
+  install -Dm755 tools/flea-mpris "$pkgdir/usr/lib/flea/flea-mpris"
   install -Dm644 packaging/com.thisisgm.flea.desktop -t "$pkgdir/usr/share/applications"
   install -Dm644 packaging/com.thisisgm.flea.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/apps"
   install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
@@ -84,13 +90,18 @@ package() {
   install -Dm644 packaging/flea.hook -t "$pkgdir/usr/share/libalpm/hooks"
 
   # paths.rs looks for /usr/share/flea/ui/boot/shell.qml, so the UI ships as data beside the binary.
-  install -Dm644 ui/qmldir ui/*.qml -t "$pkgdir/usr/share/flea/ui"
-  install -Dm644 ui/js/*.js -t "$pkgdir/usr/share/flea/ui/js"
-  # The two Quickshell entries, in their own directory so ui/qmldir's singletons stay off the startup path.
-  install -Dm644 ui/boot/shell.qml ui/boot/picker.qml -t "$pkgdir/usr/share/flea/ui/boot"
+  install -Dm644 ui/qmldir ui/*.qml ui/*.js -t "$pkgdir/usr/share/flea/ui"
+  install -Dm644 ui/js/*.js ui/js/*.mjs -t "$pkgdir/usr/share/flea/ui/js"
+  install -Dm644 ui/vendor/*.mjs -t "$pkgdir/usr/share/flea/ui/vendor"
+  install -Dm644 ui/vendor/LICENSES/* -t "$pkgdir/usr/share/flea/ui/vendor/LICENSES"
+  # The shell, the picker and the two tab tear-off windows, in their own directory so ui/qmldir's singletons stay off the startup path.
+  install -Dm644 ui/boot/shell.qml ui/boot/picker.qml ui/boot/fleatab.qml ui/boot/tabtearoff.qml -t "$pkgdir/usr/share/flea/ui/boot"
   # B1: the bar plugin ships as data too, and Flea's own Enable shelf switch copies it from here into
   # the user's plugin directory. The folder is flat, which is what src/shelfplugin.rs installs.
   install -Dm644 shelf/manifest.json shelf/README.md shelf/*.qml shelf/*.js -t "$pkgdir/usr/share/flea/shelf"
+  # The package's own version on the copy, so every build and rebuild replaces the user's (docs/release.md).
+  sed -i "s/^  \"version\": \"[^\"]*\",\$/  \"version\": \"$pkgver-$pkgrel\",/" "$pkgdir/usr/share/flea/shelf/manifest.json"
+  grep -qF "  \"version\": \"$pkgver-$pkgrel\"," "$pkgdir/usr/share/flea/shelf/manifest.json" || { echo "$pkgname: /usr/share/flea/shelf/manifest.json does not carry the version $pkgver-$pkgrel" >&2; return 1; }
   # Commons and Ui are Omarchy's own, reached as qs.Commons: the checkout links them and so does the
   # package. Both directories get the pair, because that import resolves against the config root and
   # ui/boot is the config root the entries are launched from.

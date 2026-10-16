@@ -1,5 +1,7 @@
 .import "../../ui/js/Focus.js" as Focus
+.import "../../ui/js/Nav.js" as Nav
 .import "../../ui/js/PathBar.js" as PathBar
+.import "sourcefixture.js" as Source
 
 // The path bar's whole meaning is what a typed line resolves to, and every one of those lines is a
 // navigation the user cannot see before it happens: a wrong tilde or a swallowed ".." opens the
@@ -35,6 +37,12 @@ function names(list) {
     return out
 }
 
+// A stub pane for Nav.pathFailed, which is what backs ChromeBar's pathFailed binding.
+function showingPane(path, state, inFlight, trashOpened, searchMode) {
+    return { path: path, listInFlight: inFlight, searchMode: searchMode || "",
+             trash: { opened: trashOpened === true }, listingState: state }
+}
+
 function run(check) {
     // The fold only runs when nothing matched exactly, so its matches can disagree in case inside
     // the leaf. Before the guard this returned "R" for a typed "re" and said nothing about it.
@@ -42,7 +50,7 @@ function run(check) {
     check("a case-folded completion never hands back less than was typed", folded.text, "~/re")
     check("and it still reports how many share it", folded.matches, 2)
     check("so the sentence names the count rather than staying silent",
-          PathBar.completionMessage("~/re", folded, "/home/gm"), "2 names share that prefix.")
+          PathBar.completionMessage("~/re", folded, "/home/gm"), "2 items start with that")
     // The ordinary fold, where the common prefix is longer than the leaf, still grows the line.
     var grows = PathBar.complete("~/de", ["Desktop"])
     check("a lone case-folded match still completes to the real name", grows.text, "~/Desktop/")
@@ -104,6 +112,47 @@ function run(check) {
     check("and says it was refused rather than empty", PathBar.refused("file://otherbox/etc"), true)
     check("an empty line is not a refusal, so it stays silent", PathBar.refused("   "), false)
     check("an ordinary path is not a refusal either", PathBar.refused("/etc"), false)
+
+    // The re-typed-folder rule, wired as ChromeBar binds it: Nav.pathFailed feeds shouldNavigate.
+    check("an error listing failed", Nav.pathFailed(showingPane(HOME, "error", false)), true)
+    check("a locked listing failed", Nav.pathFailed(showingPane(HOME, "locked", false)), true)
+    check("a ready listing did not fail", Nav.pathFailed(showingPane(HOME, "ready", false)), false)
+    check("an empty listing did not fail", Nav.pathFailed(showingPane(HOME, "empty", false)), false)
+    check("a listing in flight did not fail", Nav.pathFailed(showingPane(HOME, "error", true)), false)
+    check("Trash never retries", Nav.pathFailed(showingPane(HOME, "error", false, true)), false)
+    check("a search never retries", Nav.pathFailed(showingPane(HOME, "error", false, false, "query")), false)
+    check("an error on the same path navigates",
+          PathBar.shouldNavigate(HOME, HOME, Nav.pathFailed(showingPane(HOME, "error", false))), true)
+    check("a locked listing on the same path navigates",
+          PathBar.shouldNavigate(HOME, HOME, Nav.pathFailed(showingPane(HOME, "locked", false))), true)
+    check("a ready listing on the same path is a no-op",
+          PathBar.shouldNavigate(HOME, HOME, Nav.pathFailed(showingPane(HOME, "ready", false))), false)
+    check("an empty listing on the same path is a no-op",
+          PathBar.shouldNavigate("/etc", "/etc", Nav.pathFailed(showingPane("/etc", "empty", false))), false)
+    check("Trash on the same line is a no-op",
+          PathBar.shouldNavigate("Trash", "Trash", Nav.pathFailed(showingPane(HOME, "error", false, true))), false)
+    check("a search on the same path is a no-op",
+          PathBar.shouldNavigate(HOME, HOME, Nav.pathFailed(showingPane(HOME, "error", false, false, "query"))), false)
+    check("the same path in flight is a no-op",
+          PathBar.shouldNavigate(HOME, HOME, Nav.pathFailed(showingPane(HOME, "ready", true))), false)
+    check("another path navigates failed or not",
+          PathBar.shouldNavigate("/etc", HOME, true) && PathBar.shouldNavigate("/etc", HOME, false), true)
+    check("a different path in flight still navigates to Nav.open, which refuses it",
+          PathBar.shouldNavigate("/etc", HOME, Nav.pathFailed(showingPane(HOME, "ready", true))), true)
+    check("an empty line closes only",
+          PathBar.shouldNavigate("", HOME, true) || PathBar.shouldNavigate("", HOME, false), false)
+    check("WindowBody binds the retry to the failed listing",
+          Source.source("ui/WindowBody.qml").indexOf("pathFailed: Nav.pathFailed(view.currentPane)") >= 0, true)
+    check("ChromeBar gates the commit on that flag",
+          Source.source("ui/ChromeBar.qml").indexOf("PathBar.shouldNavigate(target, root.path, root.pathFailed)") >= 0, true)
+    // Nav.open takes a different-path Enter while a listing is in flight as the newest request.
+    var taken = { said: "", opened: false }
+    var flightPane = { listInFlight: true, path: HOME, history: [], forwardHistory: [],
+        message: function (text) { taken.said = text },
+        openWithoutHistory: function (path, options) { taken.opened = path + "|" + (options && options.supersede === true) } }
+    Nav.open(flightPane, "/etc")
+    check("a path entered in flight is not refused", taken.said, "")
+    check("and its listing starts behind the one out", taken.opened, "/etc|true")
 
     // Where a completion reads, which is the head of the line and never the half-typed leaf.
     check("the completion directory is the head of the line",
@@ -174,12 +223,12 @@ function run(check) {
           PathBar.completionMessage("/home/gm/Mu", one, HOME), "")
     check("a line that could not move names the directory it read",
           PathBar.completionMessage("/home/gm/zz", PathBar.complete("/home/gm/zz", dirs), HOME),
-          "Nothing in /home/gm starts with that.")
-    check("a line already at the common prefix says how many share it",
-          PathBar.completionMessage("/home/gm/D", many, HOME), "4 names share that prefix.")
+          "Nothing in /home/gm starts with that")
+    check("a line already at the common start says how many items start with it",
+          PathBar.completionMessage("/home/gm/D", many, HOME), "4 items start with that")
     check("and a four-figure match count groups",
           PathBar.completionMessage("/home/gm/D", { text: "/home/gm/D", matches: 1204 }, HOME),
-          "1,204 names share that prefix.")
+          "1,204 items start with that")
 
     // The key half. The bar is drawn in the chrome above both views, so it is global the way the
     // keymap sheet is: the rail has to reach it rather than dropping the key on the floor.
@@ -196,4 +245,10 @@ function run(check) {
     // a local path under the pane.
     check("a typed smb server is the network address itself", PathBar.resolve("smb://servername.lan", HOME, HOME), "smb://servername.lan")
     check("and a share with a user keeps its user", PathBar.resolve("smb://dan@192.168.1.75/test", HOME, HOME), "smb://dan@192.168.1.75/test")
+
+    // Tab completes dotfiles first, so the completion peek opts out of the listing's hidden-last order.
+    check("Tab completion peeks with hiddenLast false",
+        Source.source("ui/WindowBody.qml").indexOf("backend.peek(dir, view.currentPane.windowSize, hidden, false)") >= 0, true)
+    check("and the peek keeps the listing order for every other caller",
+        Source.source("ui/Backend.qml").indexOf("var last = hiddenLast === undefined ? ViewState.state.hiddenLast === true : hiddenLast === true") >= 0, true)
 }

@@ -3,15 +3,9 @@
 import Quickshell
 import QtQuick
 
-// tests/preview-swap.sh's harness: the real ui/PreviewSwap.qml holds one preview's
-// picture while the next one builds under it on the column surface (burstEnds true),
-// and the real ui/QuickLookSwap.qml does the same on the Quick Look surface
-// (burstEnds false), capturing the eager panes beside it as ui/Preview.qml wires it.
-// Moves run the same call sequence the product runs: ColumnsArea.moveThird plus
-// SelectionPreview.replace/armSettle/load, or Preview.follow/load for Quick Look.
-// Sample input: PREVIEW_SWAP_SURFACE=column PREVIEW_SWAP_DIRECT=1 skips the hold and
-// mutates directly, which is the v0.3.4 shape and the control that proves the harness
-// can see the defect it guards against.
+// File-hold harness: the real PreviewSwap holds one file preview's picture while the next builds under it.
+// Sample input: PREVIEW_SWAP_SURFACE=column PREVIEW_SWAP_DIRECT=1 mutates without a hold, the v0.3.4 defect control.
+// Folder data-hold order is simulated here; tests/columnsfolder.qml drives the real ColumnsArea for it.
 ShellRoot {
     id: shell
 
@@ -29,6 +23,24 @@ ShellRoot {
     property bool simReady: true
     property int pending: 0
     property int seq: 0
+    // A column folder move holds by data: the old color stays until the peek lands.
+    property string pendingFolder: ""
+    // Folder-guard execution: when set, the move plan is skipped and the real swap proves its returns.
+    readonly property bool folderGuard: Quickshell.env("PREVIEW_SWAP_FOLDERGUARD") === "1"
+    // Swap.CAP_MS plus the loading state's Swap.MIN_SHOW_MS ends inside this wait; the positive control proves it.
+    readonly property int guardWaitMs: 600
+    // Interim path: readiness lands with the old picture still up, the way a cache thumbnail
+    // releases the hold before the full decode is whole.
+    readonly property bool early: Quickshell.env("PREVIEW_SWAP_EARLY") === "1"
+    property int earlyReleased: 0
+    // Guard loaders settle a frame after kickoff, so the start retries briefly before failing loud.
+    readonly property int guardRetryLimit: 20
+    readonly property int guardRetryMs: 50
+    property int guardTries: 0
+    property bool guardCapDone: false
+    property bool guardPositiveDone: false
+    property int guardCapFb0: 0
+    property int guardPositiveFb0: 0
 
     function log(line) { console.log("PREVIEWSWAP " + line) }
     function quit() { Quickshell.execDetached(["kill", String(Quickshell.processId)]) }
@@ -83,6 +95,35 @@ ShellRoot {
                 anchors.fill: parent
                 visible: shell.surfaceKind === "quicklook"
             }
+
+            // Folder-guard fixtures: three isolated swaps, so the readiness guard cannot mask the cap.
+            Loader {
+                id: guardCheckLoader
+                x: 0
+                y: 0
+                width: 10
+                height: 10
+                active: shell.folderGuard
+                source: shell.folderGuard ? "file://" + shell.uiDir + "/PreviewSwap.qml" : ""
+            }
+            Loader {
+                id: guardCapLoader
+                x: 10
+                y: 0
+                width: 10
+                height: 10
+                active: shell.folderGuard
+                source: shell.folderGuard ? "file://" + shell.uiDir + "/PreviewSwap.qml" : ""
+            }
+            Loader {
+                id: guardPositiveLoader
+                x: 20
+                y: 0
+                width: 10
+                height: 10
+                active: shell.folderGuard
+                source: shell.folderGuard ? "file://" + shell.uiDir + "/PreviewSwap.qml" : ""
+            }
         }
     }
 
@@ -104,39 +145,62 @@ ShellRoot {
         }
     }
 
-    // One move: hold the old picture, mutate under it, start the cap, land ready.
+    // One move holds the old picture while the next builds under it; a column folder waits by data with no hold.
     function move(kindIndex) {
         var kind = shell.kinds[kindIndex]
         var key = "/previews\n" + kindIndex
         var isPdf = kind === "pdf"
+        // An unheld landing, a folder's rows or the no-hold control's decode, spans at least one 16 ms frame.
+        landTimer.interval = isPdf ? 50 : 30
+        if (!shell.direct && shell.surfaceKind === "column" && kind === "folder") {
+            shell.pendingFolder = kind
+            landTimer.restart()
+            return
+        }
         var apply = function () {
             shell.currentKind = kind
             shell.simReady = false
         }
+        // The swap starts after its mutation, whether that runs at once or waits for the capture.
+        var loaded = function () {
+            shell.currentKind = kind
+            shell.simReady = shell.early ? true : false
+            shell.swap.start(isPdf)
+            // The decode starts with the preview's own work, as ui/SelectionPreview.qml load() asks only then.
+            landTimer.interval = isPdf ? 50 : 10
+            landTimer.restart()
+        }
         if (shell.direct) {
             apply()
+            landTimer.restart()
         } else {
             if (shell.surfaceKind === "column") {
-                // Column: hold the clear on the move, then the load holds again at work.
+                // Column: hold the clear on the move, then the load starts after it mutates.
                 shell.swap.hold(apply, key)
-                shell.swap.hold(function () { shell.simReady = false }, key, true)
+                shell.swap.hold(loaded, key, true)
             } else {
-                // Quick Look: follow holds with no apply, load mutates under the picture.
+                // Quick Look: follow holds with no apply, load mutates under the picture then starts.
                 shell.swap.hold(null, "/previews/" + kind)
-                shell.swap.hold(apply, "/previews/" + kind, true)
+                shell.swap.hold(loaded, "/previews/" + kind, true)
             }
         }
-        if (!shell.direct)
-            shell.swap.start(isPdf)
-        // The decode landing: fast kinds well inside Swap.HOLD_MS, a PDF inside its longer cap.
-        landTimer.interval = isPdf ? 200 : 60
-        landTimer.restart()
     }
 
     Timer {
         id: landTimer
         repeat: false
         onTriggered: {
+            // An early release already let the hold go before the new content landed.
+            if (shell.early && shell.swap && !shell.swap.holding && !shell.swap.capturing)
+                shell.earlyReleased += 1
+            // The data-held folder lands with its rows in one pass, still under no picture.
+            if (shell.pendingFolder !== "") {
+                shell.currentKind = shell.pendingFolder
+                shell.pendingFolder = ""
+                shell.simReady = true
+                settleTimer.restart()
+                return
+            }
             shell.simReady = true
             if (shell.swap)
                 shell.swap.check()
@@ -151,11 +215,102 @@ ShellRoot {
         onTriggered: shell.next()
     }
 
+    // The held check and the held cap stay holding; the unheld positive control must expire.
+    function guardStart() {
+        if (!guardCheckLoader.item || !guardCapLoader.item || !guardPositiveLoader.item) {
+            shell.guardTries += 1
+            if (shell.guardTries > shell.guardRetryLimit) {
+                shell.log("FOLDERGUARD FAIL no guard item to drive")
+                shell.quit()
+                return
+            }
+            guardRetry.restart()
+            return
+        }
+        var checkItem = guardCheckLoader.item
+        checkItem.folderHold = true
+        checkItem.holding = true
+        checkItem.started = true
+        checkItem.ready = true
+        checkItem.check()
+        if (checkItem.holding !== true) {
+            shell.log("FOLDERGUARD FAIL held check released, want holding")
+            shell.quit()
+            return
+        }
+        var capItem = guardCapLoader.item
+        capItem.folderHold = true
+        capItem.holding = true
+        capItem.started = true
+        capItem.ready = true
+        shell.guardCapFb0 = capItem.fallbacks
+        capItem.start(false)
+        var positiveItem = guardPositiveLoader.item
+        positiveItem.folderHold = false
+        positiveItem.holding = true
+        positiveItem.started = true
+        positiveItem.ready = false
+        shell.guardPositiveFb0 = positiveItem.fallbacks
+        positiveItem.start(false)
+        guardCapTimer.restart()
+        guardPositiveTimer.restart()
+    }
+
+    function guardFinish() {
+        if (!shell.guardCapDone || !shell.guardPositiveDone)
+            return
+        shell.log("FOLDERGUARD DONE check=held cap=held positive=expired")
+        shell.quit()
+    }
+
+    Timer {
+        id: guardRetry
+        interval: shell.guardRetryMs
+        repeat: false
+        onTriggered: shell.guardStart()
+    }
+
+    Timer {
+        id: guardCapTimer
+        interval: shell.guardWaitMs
+        repeat: false
+        onTriggered: {
+            var capItem = guardCapLoader.item
+            if (!capItem || capItem.holding !== true || capItem.fallbacks !== shell.guardCapFb0) {
+                shell.log("FOLDERGUARD FAIL held cap expired, want holding with fallbacks unchanged")
+                shell.quit()
+                return
+            }
+            shell.guardCapDone = true
+            shell.guardFinish()
+        }
+    }
+
+    Timer {
+        id: guardPositiveTimer
+        interval: shell.guardWaitMs
+        repeat: false
+        onTriggered: {
+            var positiveItem = guardPositiveLoader.item
+            if (!positiveItem || positiveItem.holding !== false || positiveItem.fallbacks !== shell.guardPositiveFb0 + 1) {
+                shell.log("FOLDERGUARD FAIL positive control saw no expiry, want released with one fallback")
+                shell.quit()
+                return
+            }
+            shell.guardPositiveDone = true
+            shell.guardFinish()
+        }
+    }
+
     Timer {
         id: kickoff
         interval: 400
         repeat: false
         onTriggered: {
+            if (shell.folderGuard) {
+                shell.guardStart()
+                return
+            }
             if (!shell.swap) {
                 shell.log("FAIL no swap item to drive")
                 shell.quit()
@@ -186,7 +341,8 @@ ShellRoot {
     function finish() {
         var s = shell.swap.describe()
         shell.log("DONE holds=" + s.holds + " fallbacks=" + s.fallbacks + " bursts=" + s.bursts
-            + " held=" + s.heldFrames + " mid=" + s.midFrames + " loading=" + s.loadingFrames)
+            + " held=" + s.heldFrames + " mid=" + s.midFrames + " loading=" + s.loadingFrames
+            + " early=" + shell.earlyReleased)
         grabTimer.restart()
     }
 

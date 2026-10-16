@@ -11,23 +11,20 @@ Item {
 
     property string path: ""
     property bool active: false
+    // Forwarded to the page below, so Quick Look assigns like the column does.
+    property var backend: null
+    property bool fetchFirst: false
+    // Forwarded to the page below, so Quick Look cleans up only its own copy.
+    property string viewerSlot: ""
     // Expand fills the window; the overlay that hosts this reads the flag and drops its own inset.
     property bool expanded: false
+    // Quick Look opens on the document with no control picked, as the Markdown strip does; Tab or Shift+Tab enters the strip.
     property int pdfControlIndex: -1
     readonly property var pdfControls: [previous, next, zoomOut, zoomIn, expand, close]
-    // Containers Tier A: a keyboard walk says where it is by brightness, so the control it is on keeps the foreground and the rest of the strip dims.
-    readonly property color controlRest: root.activeFocus && root.pdfControlIndex >= 0
-        ? Theme.color.muted : Theme.color.foreground
-    // The page count signal arrives before the control bindings settle.
-    function focusInitialControl() {
-        if (root.activeFocus && root.pageCount > 0 && root.pdfControlIndex < 0)
-            PreviewKeys.pdfAction("focusNext", root)
-    }
-    onActiveFocusChanged: Qt.callLater(root.focusInitialControl)
-    onPageCountChanged: Qt.callLater(root.focusInitialControl)
     Keys.onPressed: function(event) {
         var action = Keymap.lookup(event.key, event.text, event.modifiers, "pdf")
-        if (action === "escape" || action === "focusPreview") root.closed()
+        // 2026-09-11 ruling: Space closes every kind, Enter still activates the focused control.
+        if (action === "escape" || action === "focusPreview" || action === "preview") root.closed()
         else PreviewKeys.pdfAction(action, root)
         event.accepted = true
     }
@@ -37,13 +34,16 @@ Item {
     readonly property bool failed: pdf.failed
     // The page on screen, -1 before the first render: ui/Preview.qml's swap waits for it.
     readonly property int shownPage: pdf.shownPage
+    // The document the viewer has opened; a path asked for since is not on screen until this names it.
+    readonly property string opened: pdf.opened
+    readonly property real pageAspect: pdf.pageCount > 0 ? pdf.pageAspect : 0
     readonly property real pdfScrollY: pageFlick.contentY
 
     // The canvas draws no scale readout, so the ladder is the whole zoom contract: one step a press,
     // and a bottom rung that always fits the frame, which is what makes the pan below reachable.
-    readonly property real minZoom: 1
-    readonly property real maxZoom: 4
-    readonly property real zoomStep: 0.25
+    readonly property real minZoom: PreviewKeys.PDF_ZOOM_MIN
+    readonly property real maxZoom: PreviewKeys.PDF_ZOOM_MAX
+    readonly property real zoomStep: PreviewKeys.PDF_ZOOM_STEP
     property real zoom: root.minZoom
 
     signal closed()
@@ -102,8 +102,8 @@ Item {
             id: kindMark
             anchors.left: parent.left
             anchors.leftMargin: Theme.spacing.rowPaddingX
-            anchors.verticalCenter: parent.verticalCenter
-            // The chrome mark token, so the leading mark matches the buttons at the other end.
+            y: Math.round((parent.height - Theme.spacing.hairline - height) / 2)
+            // The chrome mark token, centred above the rule as theirs are, so the leading mark matches the buttons at the other end.
             width: Theme.chromeMarkSize
             height: Theme.chromeMarkSize
             name: "file-text"
@@ -138,13 +138,13 @@ Item {
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: previous
                 glyph: "chevron-left"
                 accessName: "Previous page"
                 visible: root.pageCount > 1
                 width: visible ? implicitWidth : 0
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 0
-                restingColor: root.controlRest
                 enabled: root.page > 0
                 onActivated: root.turn(-1)
             }
@@ -162,13 +162,13 @@ Item {
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: next
                 glyph: "chevron-right"
                 accessName: "Next page"
                 visible: root.pageCount > 1
                 width: visible ? implicitWidth : 0
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 1
-                restingColor: root.controlRest
                 enabled: root.page + 1 < root.pageCount
                 onActivated: root.turn(1)
             }
@@ -183,44 +183,44 @@ Item {
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: zoomOut
                 glyph: "minus"
                 accessName: "Zoom out"
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 2
-                restingColor: root.controlRest
                 enabled: root.pageCount > 0 && root.zoom > root.minZoom
                 onActivated: root.zoomBy(-1)
             }
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: zoomIn
                 glyph: "plus"
                 accessName: "Zoom in"
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 3
-                restingColor: root.controlRest
                 enabled: root.pageCount > 0 && root.zoom < root.maxZoom
                 onActivated: root.zoomBy(1)
             }
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: expand
                 glyph: "maximize"
                 accessName: "Expand"
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 4
-                restingColor: root.controlRest
                 active: root.expanded
                 onActivated: root.toggleExpand()
             }
 
             Flea.ChromeButton {
                 gesturePolicy: TapHandler.ReleaseWithinBounds
+                ruleRows: Theme.spacing.hairline
                 id: close
                 glyph: "x"
                 accessName: "Close"
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 5
-                restingColor: root.controlRest
                 onActivated: root.closed()
             }
         }
@@ -260,6 +260,9 @@ Item {
                 viewport: pageFlick
                 path: root.path
                 active: root.active
+                backend: root.backend
+                fetchFirst: root.fetchFirst
+                viewerSlot: root.viewerSlot
             }
         }
     }
@@ -282,7 +285,7 @@ Item {
         Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: "This file could not be read."
+            text: pdf.failSentence
             color: Theme.color.foreground
             font.family: Theme.font.family
             font.pixelSize: Theme.font.caption

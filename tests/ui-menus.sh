@@ -7,6 +7,18 @@ menus_guard() {
     [[ "$canonical" == "$menu_box/"* && "$canonical" != "$menu_box" ]] || fail "menus: target outside owned sandbox: $target"
 }
 
+# What a failed check leaves behind: the menu, the rename editor, the status slot, the focused window and one capture; it never changes the verdict.
+menus_evidence() {
+    local png="$evidence_dir/menus-failure-$$.png"
+    printf 'MENUS_EVIDENCE menu=%s\n' "$(ipc menuState 2>&1 | jq -c '{opened, hasRow, snapshotReady, snapshotId}' 2>&1)"
+    printf 'MENUS_EVIDENCE rename=%s error=%s primary=%q detail=%q last=%q path=%q\n' "$(ipc renameEditorLive 2>&1)" \
+        "$(ipc statusError 2>&1)" "$(ipc statusPrimary 2>&1)" "$(ipc statusDetail 2>&1)" "$(ipc lastMessage 2>&1)" "$(ipc path 2>&1)"
+    printf 'MENUS_EVIDENCE active=%s\n' "$(hyprctl activewindow -j 2>&1 | jq -c '{class, address, title}' 2>&1)"
+    if mkdir -p "$evidence_dir" 2>/dev/null && omarchy-drive shot "$png" flea >/dev/null 2>&1; then printf 'MENUS_EVIDENCE shot=%s\n' "$png"
+    else printf 'MENUS_EVIDENCE shot=failed\n'; fi
+    return 0
+}
+
 menus_expect() {
     local observer="$1" expression="$2" label="$3" observed deadline=$((SECONDS + 15))
     while (( SECONDS < deadline )); do
@@ -18,6 +30,7 @@ menus_expect() {
         fi
         sleep 0.05
     done
+    menus_evidence
     fail "menus: $label: $observed"
 }
 
@@ -39,6 +52,7 @@ menus_error() {
         fi
         sleep 0.05
     done
+    menus_evidence
     fail "menus: $label did not report $text: $observed"
 }
 
@@ -55,6 +69,7 @@ menus_said() {
         fi
         sleep 0.05
     done
+    menus_evidence
     fail "menus: $label did not say $text: $observed"
 }
 
@@ -69,6 +84,7 @@ menus_message() {
         fi
         sleep 0.05
     done
+    menus_evidence
     fail "menus: $label did not report $text: $observed"
 }
 
@@ -92,6 +108,31 @@ menus_visit() {
     key -M ctrl -k l -m ctrl "$path" -k Return >/dev/null
     wait_path "$path"
     wait_listing "$count"
+}
+
+# Registers the trash entry made for ORIGINAL so the EXIT trap removes it from a mount-top trash, where GLib trashes off HOME's device.
+menus_trash_own() {
+    local original="$1" uri trash
+    # Sample list row: "trash:///trash.txt<TAB>/owned/fixture/trash.txt".
+    uri=$(/usr/bin/gio trash --list | awk -F'\t' -v path="$original" '$2 == path { print $1; exit }')
+    [[ "$uri" == trash:///* && "${uri#trash:///}" != */* ]] || fail "menus: no trash entry for $original"
+    trash=$(sandbox_trash_files_dir "$original") || fail "menus: no GLib trash directory for $original"
+    trash_trap_own "$trash" "$menu_box" menus "${uri#trash:///}"
+    menus_trash_files="$trash" menus_trash_name="${uri#trash:///}"
+}
+
+# Proves ORIGINAL sits in the Trash Flea's rule picks for its device, with its bytes and a trashinfo naming the original path.
+menus_trash_lands() {
+    local original="$1" bytes="$2" root="${menus_trash_files%/files}" info recorded
+    info="$root/info/$menus_trash_name.trashinfo"
+    [[ -f "$info" && "$(sed -n 1p "$info")" == '[Trash Info]' ]] || fail "menus: no trashinfo for $original at $info"
+    # Sample input: Path=/home/u/a%20b.txt in a home Trash, Path=d/a%20b.txt in a $topdir/.Trash-1000, relative to $topdir.
+    recorded=$(sed -n 's/^Path=//p' "$info")
+    recorded=$(printf '%b' "${recorded//%/\\x}")
+    [[ "$recorded" == /* ]] || recorded="${root%/.Trash*}/$recorded"
+    grep -Eq '^DeletionDate=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$' "$info" || fail "menus: trashinfo $info has no DeletionDate"
+    menus_equal "$preset Trash records the original path in its trashinfo" "$original" "$recorded"
+    menus_equal "$preset Trash keeps the item bytes in its Trash" "$bytes" "$(cat "$menus_trash_files/$menus_trash_name")"
 }
 
 menus_point() {
@@ -152,7 +193,8 @@ menus_open_with_dialog() {
 menus_file_menu() {
     local name="$1" input="${2:-pointer}" index
     index=$(row_index_of "$name")
-    click_row "$index" left
+    # A left click on the sole selected row under the cursor is a slow click, which opens the rename editor after the double-click interval and takes the menu key.
+    ipc dualState | jq -e --argjson row "$index" '.panes[.focused] | .selected == [$row] and .cursor == $row' >/dev/null || click_row "$index" left
     if [[ "$input" == key ]]; then key -M shift -k F10 -m shift >/dev/null
     elif [[ "$input" == menu-key ]]; then key -k Menu >/dev/null
     elif [[ "$input" == menu-letter ]]; then key m >/dev/null
@@ -200,6 +242,7 @@ menus_confirmation() {
 menus_permissions() {
     local name="$1" preset="$2" actual
     menus_file_menu "$name"
+    menus_expect menuState 'any(.entries[]; .action == "permissions" and (.disabled == false) and (.errored | not))' "regular-file Permissions is enabled without error"
     menus_choose permissions pointer
     menus_expect permissionsState '.opened and .editable and .mode == "0644"' "permissions reads actual file mode"
     menus_shot "$preset-permissions"
@@ -329,10 +372,10 @@ menus_dialog_keys() {
         first=Field
         forward=(Cancel Submit)
         probe=menuDialogState
-        # OpenWith.html rule 8 gives its own card a wider cycle: search, list, always box, buttons.
+        # OpenWith.html rule 8: the card opens on its search and cycles search, list, always box, buttons.
         if [[ "$action" == openWith ]]; then
-            first=Applications
-            forward=(Always Cancel Open Field)
+            first=Field
+            forward=(Applications Always Cancel Open)
             probe=openWithState
         fi
         menus_file_menu a.txt key
@@ -423,8 +466,9 @@ menus_actions() {
     wait_listing 4
     menus_expect trashState ".count == $menus_trashed" "$preset Trash updates private count"
     trash_guard_store "$menus_trashed"
+    menus_trash_own "$directory/trash.txt"
     [[ ! -e "$directory/trash.txt" ]] || fail "menus: $preset Trash left its source"
-    menus_equal "$preset Trash reaches the real private GIO provider" "$directory/trash.txt" "$(tail -n 1 "$menu_box/gio-trash.log")"
+    menus_trash_lands "$directory/trash.txt" "$preset trash"
 
     open_count=$(wc -l < "$menu_box/gio-open.log")
     menus_file_menu source.txt
@@ -452,8 +496,20 @@ menus_replace() {
     [[ "$(stat -c '%d:%i' "$original")" != "$inode" ]] || fail "menus: replacement reused the captured identity"
 }
 
+# The open menu holds the re-read back, so the identity it captured is still current at activation (routes in AGENTS.md).
+menus_rename_after_replacement() {
+    local directory="$1"
+    menus_expect renameState '.index >= 0 and .index == .cursor and .cursorName == "target.txt" and .focused and (.pending | not)' 'rename opens the editor over target.txt at menu activation'
+    menus_guard "$directory/renamed.txt"
+    key -M ctrl -k a -m ctrl renamed.txt -k Return >/dev/null
+    menus_expect renameState '.focused and (.pending | not) and .text == "renamed.txt" and (.error | contains("Selected item changed"))' 'rename refuses the replaced source at commit, in the editor'
+    [[ ! -e "$directory/renamed.txt" ]] || fail "menus: rename committed the replacement"
+    key -k Escape >/dev/null
+    menus_expect renameEditorLive '. == false' 'Escape closes the editor that refused the replaced source'
+}
+
 menus_stale_actions() {
-    local action directory retained token open_count trash_count
+    local action directory retained token open_count trash_count requests
     printf 'MENUS_SHARED_PROOF preset=default; all presets separately exercise native menu delivery and the same ContextMenu.chosen/PaneMenuActions.activate path.\n'
     for action in open cut copy duplicate trash rename; do
         directory="$menu_box/stale-$action"
@@ -475,13 +531,21 @@ menus_stale_actions() {
         token=$(ipc menuState | jq -r .snapshotId)
         open_count=$(wc -l < "$menu_box/gio-open.log")
         trash_count=$(wc -l < "$menu_box/gio-trash.log")
+        requests=$(ipc listRequests)
         menus_replace "$directory/target.txt" "$retained"
         menus_expect menuState ".opened and .snapshotReady and .snapshotId == $token" "$action retains the originally opened snapshot"
+        # Anchor.busy holds the watcher's re-read while the menu is open, so the identity the menu captured is still current at Return.
+        menus_expect dualState '.panes[.focused] | .loading | not' "$action finds no listing in flight before activation"
+        menus_equal "$action replacement is not re-listed behind the open menu" "$requests" "$(ipc listRequests)"
         trash_guard_store "$menus_trashed"
         key -k Return >/dev/null
-        menus_error 'Selected item changed' "$action refuses replacement at native menu activation"
-        menus_expect menuState '.opened | not' "$action refusal closes the menu"
-        menus_expect renameEditorLive '. == false' "$action refusal does not open Rename"
+        if [[ "$action" == rename ]]; then
+            menus_rename_after_replacement "$directory"
+        else
+            menus_error 'Selected item changed' "$action refuses replacement at native menu activation"
+            menus_expect renameEditorLive '. == false' "$action refusal does not open Rename"
+        fi
+        menus_expect menuState '.opened | not' "$action activation closes the menu"
         menus_equal "$action refusal preserves replacement" replacement "$(cat "$directory/target.txt")"
         menus_equal "$action refusal preserves captured original" originalone "$(cat "$retained")"
         menus_equal "$action refusal preserves navigation" "$directory" "$(ipc path)"
@@ -504,8 +568,14 @@ menus_stale_actions() {
     menus_visit "$menu_dir" 4
 }
 
+# The re-read a closed editor or menu releases: its request count rose past the one taken before the change, and the listing settled.
+menus_relisted() {
+    local before="$1" label="$2"
+    menus_expect dualState ".panes[.focused] | (.listRequests > $before) and (.loading | not)" "$label"
+}
+
 menus_stale_rename_commit() {
-    local directory="$menu_box/stale-rename-commit" retained="$menu_box/retained-rename-commit.txt"
+    local directory="$menu_box/stale-rename-commit" retained="$menu_box/retained-rename-commit.txt" requests
     menus_guard "$directory"
     mkdir "$directory" || fail "menus: cannot create Rename commit fixture"
     menus_guard "$directory/target.txt"
@@ -514,6 +584,7 @@ menus_stale_rename_commit() {
     menus_file_menu target.txt
     menus_choose rename
     menus_expect renameEditorLive '. == true' 'Rename captures identity before editing'
+    requests=$(ipc listRequests)
     menus_replace "$directory/target.txt" "$retained"
     menus_guard "$directory/renamed.txt"
     key -M ctrl -k a -m ctrl renamed.txt -k Return >/dev/null
@@ -523,6 +594,8 @@ menus_stale_rename_commit() {
     menus_equal 'Rename refusal preserves captured original' originalone "$(cat "$retained")"
     key -k Escape >/dev/null
     menus_expect renameEditorLive '. == false' 'Escape dismisses retained Rename refusal'
+    # The open editor held the watcher's re-read back, so it runs now; a menu opened mid-read would snapshot a listing about to change.
+    menus_relisted "$requests" 'the replacement is re-listed once the editor closes'
     menus_file_menu target.txt menu-key
     menus_choose rename
     menus_expect renameEditorLive '. == true' 'a fresh Rename recaptures the replacement'
@@ -534,6 +607,49 @@ menus_stale_rename_commit() {
     [[ ! -e "$directory/target.txt" ]] || fail 'menus: fresh Rename left the old path'
     menus_equal 'fresh Rename recovery preserves replacement contents' replacement "$(cat "$directory/renamed.txt")"
     menus_visit "$menu_dir" 4
+}
+
+# A hidden Copy as leaf still reaches wl-copy through the lone flyout.
+menus_hidden_copy_as() {
+    local directory="$menu_box/hidden-copyas"
+    local log="$menu_box/wl-copy.log"
+    local deadline observed
+    menus_guard "$directory"
+    mkdir -p "$directory" || fail "menus: cannot create hidden Copy as fixture"
+    menus_guard "$directory/a.txt"
+    printf 'hidden\n' > "$directory/a.txt"
+    menus_guard "$menu_box/bin/wl-copy"
+    cat > "$menu_box/bin/wl-copy" <<'SH'
+#!/usr/bin/env bash
+set -eu
+log=${FLEA_MENUS_BOX:?}/wl-copy.log
+cat >> "$log"
+SH
+    chmod +x "$menu_box/bin/wl-copy" || fail "menus: cannot make wl-copy stub executable"
+    menus_guard "$log"
+    : > "$log"
+    "$flea_bin" --ui-state '{"view":"list","keys":"default","menu":{"hidden":["copyAs"]}}' >/dev/null || fail "menus: hidden Copy as fixture settings failed"
+    launch "$directory"
+    wait_listing 1
+    key c >/dev/null
+    menus_expect menuState '.opened and .submenu' "hidden Copy as opens its lone flyout"
+    menus_expect menuState 'any(.submenuEntries[]; .label == "Path")' "lone flyout offers Path"
+    menus_expect menuState '.snapshotReady' "hidden Copy as snapshot is ready"
+    key p >/dev/null
+    menus_expect menuState '.opened | not' "hidden Copy as leaf closes the menu"
+    deadline=$((SECONDS + 15))
+    while (( SECONDS < deadline ))
+    do
+        observed=$(cat -- "$log") || fail "menus: cannot read wl-copy log"
+        if [[ "$observed" == *"$directory/a.txt"* ]]
+        then
+            menus_checks=$((menus_checks + 1))
+            printf 'MENUS_CHECK %s %s\n' "$menus_checks" "hidden Copy as leaf reaches wl-copy"
+            return
+        fi
+        sleep 0.05
+    done
+    fail "menus: hidden Copy as leaf never reached wl-copy: $observed"
 }
 
 case_menuscoverage() (
@@ -564,7 +680,7 @@ case_menuscoverage() (
         wait_listing 4
         trash_guard_store "$menus_trashed"
         menus_file_menu a.txt menu-key
-        menus_expect menuState '.entries as $entries | ["open","cut","copy","paste","duplicate","rename","trash","deletePermanently","openWith","openTerminal","moveTo","copyTo","properties","permissions","copypath","toggleHidden"] | all(.[]; . as $action | any($entries[]; .action == $action))' "full applicable plain-file inventory"
+        menus_expect menuState '.entries as $entries | ["open","cut","copy","paste","pasteAs","duplicate","rename","trash","deletePermanently","openWith","openTerminal","moveTo","copyTo","properties","permissions","copyAs","toggleHidden"] | all(.[]; . as $action | any($entries[]; .action == $action))' "full applicable plain-file inventory"
         menus_expect menuState 'any(.entries[]; .action == "paste" and .disabled)' "Paste remains visible with empty clipboard"
         before=$(ipc listContentY)
         menus_seek properties
@@ -578,8 +694,11 @@ case_menuscoverage() (
         menus_confirmation a.txt "$preset"
         menus_permissions a.txt "$preset"
         menus_dialog_keys "$preset"
+        menus_file_menu folder
+        menus_expect menuState 'any(.entries[]; .action == "permissions" and (.disabled == false) and (.errored | not))' "directory Permissions is enabled without error"
+        key -k Escape >/dev/null
         menus_file_menu link
-        menus_expect menuState 'any(.entries[]; .action == "permissions" and .disabled and .errored and .hint == null)' "symlink permissions reads red with no sentence"
+        menus_expect menuState 'any(.entries[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' "symlink permissions reads red with the word symlink"
         key -k Escape >/dev/null
         local first_index second_index
         first_index=$(row_index_of a.txt)
@@ -590,8 +709,28 @@ case_menuscoverage() (
         menus_expect selectionCount '. == 2' "Ctrl-click creates two selected items before menu eligibility"
         menus_expect dualState ".panes[.focused].selected == [$first_index,$second_index]" "selected identities are a.txt and b.txt"
         click_row "$(row_index_of a.txt)" right
-        menus_expect menuState '.entries as $entries | ["rename","duplicate","openWith","properties","permissions"] | all(.[]; . as $action | any($entries[]; .action == $action and .disabled))' "multi-selection eligibility"
+        # Permissions (board Permissions040) and bulk rename take the whole selection, so two regular files enable both; the three single-item rows stay disabled.
+        menus_expect menuState '.opened and .hasRow and .snapshotReady and (.snapshotId > 0) and (.entries as $entries | ["duplicate","openWith","properties"] | all(.[]; . as $action | any($entries[]; .action == $action and .disabled)))' "multi-selection single-item rows stay disabled"
+        menus_expect menuState 'any(.entries[]; .action == "rename" and (.disabled == false) and .label == "Rename 2 items\u2026")' "two files offer bulk rename by count"
+        menus_expect menuState 'any(.entries[]; .action == "permissions" and (.disabled == false) and (.errored | not))' "two regular files keep Permissions enabled without error"
         key -k Escape >/dev/null
+        # permissionsEntry refuses the whole selection for one row that is neither a regular file nor a directory.
+        for target in folder link; do
+            first_index=$(row_index_of a.txt)
+            second_index=$(row_index_of "$target")
+            click_row "$first_index" left
+            menus_expect dualState ".panes[.focused].selected == [$first_index]" "Permissions pair starts with a.txt alone"
+            click_row "$second_index" left --mods ctrl
+            menus_expect selectionCount '. == 2' "Permissions pair selects a.txt and $target"
+            menus_expect dualState "(.panes[.focused].selected | sort) == ([$first_index,$second_index] | sort)" "Permissions pair holds the a.txt and $target identities"
+            click_row "$first_index" right
+            if [[ "$target" == folder ]]; then
+                menus_expect menuState '.opened and .hasRow and .snapshotReady and (.snapshotId > 0) and (.entries as $entries | ["duplicate","openWith","properties"] | all(.[]; . as $action | any($entries[]; .action == $action and .disabled))) and any(.entries[]; .action == "rename" and (.disabled == false) and .label == "Rename 2 items\u2026") and any(.entries[]; .action == "permissions" and (.disabled == false) and (.errored | not))' "a file and a directory keep Permissions enabled without error in the several-items menu"
+            else
+                menus_expect menuState '.opened and .hasRow and .snapshotReady and (.snapshotId > 0) and any(.entries[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' "one symlink disables and errors Permissions for the whole selection"
+            fi
+            key -k Escape >/dev/null
+        done
         key -k Escape >/dev/null
         menus_actions "$preset"
         kill_flea
@@ -615,7 +754,61 @@ case_menuscoverage() (
     [[ ! -e "$menu_dir/folder" ]] || fail "menus: freshly confirmed directory was not deleted"
     [[ "$(cat "$menu_dir/a.txt")" == alpha && "$(cat "$menu_dir/b.txt")" == beta ]] || fail "menus: deletion widened outside its confirmation"
     menus_shot deletion-completed
+    menus_hidden_copy_as
     printf 'MENUS_NATIVE_CHECKS=%s\n' "$menus_checks"
     printf 'MENUS_UNVERIFIED new-file/new-folder, archive/convert, provider states, hidden-row persistence, work-area/scale matrix, partial deletion failure, directory Permissions scope, concurrent windows\n'
-    trash_cleanup 0
+    # trash_cleanup clears the EXIT trap first, so exiting lets the trap remove the registered entries and then run it.
+    exit 0
+)
+
+# Qt 6.12 throttles frame-synchronous hover to 100 ms, so a list step (j, k) lands the late hover before c opens the menu with its Copy as flyout.
+case_menurest() (
+    local dir="$fixture_root/menurest" name rest_row rest_x rest_y wx wy ww wh first state attempt cursor flyout probe escape taken=0 landed=0
+    local uinput="$XDG_RUNTIME_DIR/.ydotool_socket"
+    sandbox_scratch "$dir"
+    for name in a b c d e f g h; do : > "$dir/$name.txt"; done
+    seed_ui_state "$fixture_root/menurest-state" '{"view":"list","keys":"default"}'
+    launch "$dir"
+    wait_listing 8
+    key m >/dev/null
+    settle
+    [[ "$(ipc contextMenuVisible)" == "true" ]] || fail "menurest: the m key did not open the menu"
+    first=$(ipc contextMenuCursor)
+    rest_row=$(menu_row_index "Rename") || fail "menurest: no Rename row in $(ipc contextMenuEntries)"
+    [[ "$rest_row" != "$first" ]] || fail "menurest: Rename is the first row, so a taken cursor cannot be told apart"
+    read -r rest_x rest_y <<< "$(ipc contextMenuRowCentre "$rest_row")"
+    [[ -n "$rest_y" ]] || fail "menurest: Rename has no on-screen centre"
+    key -k Escape >/dev/null
+    settle
+    read -r wx wy ww wh < <(window_box) || fail "native window coordinates unavailable"
+    # A warp alone reaches Qt as no motion at all, so the one uinput pixel is what makes the pointer rest there.
+    omarchy-drive move "$((wx + rest_x))" "$((wy + rest_y))" >/dev/null
+    YDOTOOL_SOCKET="$uinput" ydotool mousemove -x 1 -y 0 >/dev/null 2>&1 || fail "menurest: ydotool could not move the pointer onto Rename"
+    settle
+    for attempt in 1 2 3 4 5; do
+        assert_focus
+        # j, k, c as uinput keys (evdev 36 37 46), so no focus call warps the pointer between them.
+        YDOTOOL_SOCKET="$uinput" ydotool key 36:1 36:0 37:1 37:0 46:1 46:0 >/dev/null 2>&1 \
+            || fail "menurest: ydotool could not send j, k and c on attempt $attempt"
+        settle
+        state=$(ipc menuState) || fail "menurest: no menu state"
+        cursor=$(jq -r .cursor <<< "$state")
+        flyout=$(jq -r .submenu <<< "$state")
+        probe=$(ipc contextMenuRowProbe "$rest_row")
+        printf 'MENUREST attempt=%s opened=%s cursor=%s first=%s flyout=%s rest_row=%s probe=%s\n' \
+            "$attempt" "$(jq -r .opened <<< "$state")" "$cursor" "$first" "$flyout" "$rest_row" "$probe"
+        [[ "$attempt" != 1 ]] || shot menurest-attempt1
+        [[ "$(jq -r .opened <<< "$state")" == true ]] || fail "menurest: j, k and c opened no menu on attempt $attempt: $state"
+        [[ "$cursor" == "$first" && "$flyout" == true ]] || taken=$((taken + 1))
+        [[ "$probe" != true* ]] || landed=$((landed + 1))
+        for escape in 1 2 3; do
+            [[ "$(ipc contextMenuVisible)" == "true" ]] || break
+            YDOTOOL_SOCKET="$uinput" ydotool key 1:1 1:0 >/dev/null 2>&1 || fail "menurest: ydotool could not send Escape after attempt $attempt"
+            settle
+        done
+        [[ "$(ipc contextMenuVisible)" == "false" ]] || fail "menurest: Escape did not close the menu after attempt $attempt"
+    done
+    printf 'MENUREST taken=%s landed=%s of 5\n' "$taken" "$landed"
+    (( landed > 0 )) || fail "menurest: the resting pointer never hovered Rename, so no late hover was tested"
+    (( taken == 0 )) || fail "menurest: a menu and flyout opened by key under a resting pointer lost the cursor or the flyout $taken of 5 times"
 )

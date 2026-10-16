@@ -1,7 +1,22 @@
 .pragma library
 
 .import "Mounts.js" as Mounts
+.import "Format.js" as Format
 .import "Protocols.js" as Protocols
+.import "NetFs.js" as NetFs
+
+// Whole sentences with "%1" for the drive and "%2" for the drives still mounted under it, filled by Format.fill; the first three are what Ctrl+E answers with when it releases nothing.
+var WORDS = {
+    systemDrive: "%1 is the system drive, which Flea never unmounts",
+    systemVolume: "This folder is on a system volume, which Flea never unmounts",
+    noVolume: "This folder is not on a volume Flea can unmount",
+    safe: "Ejected %1. It is safe to unplug.",
+    safeImage: "Ejected %1.",
+    stillMounted: "%1 is still mounted; close what is using it.",
+    blockedOne: "%1 could not be ejected because %2 on the same drive is still mounted. Eject that instead.",
+    blockedMany: "%1 could not be ejected because %2 on the same drive are still mounted. Eject those instead.",
+    unconfirmed: "Could not confirm %1 was ejected; do not unplug it yet."
+}
 
 // Sample input: the lsblk --json body ui/js/Mounts.js "parseDevices" reads, taken again after
 // gio mount -e returned for /dev/sda1:
@@ -112,50 +127,50 @@ function collectMounted(node, out) {
         collectMounted(kids[i], out)
 }
 
-// "Safe to unplug" is a safety claim, so only the "safe" verdict earns it; every other line tells
-// the user to leave the stick in, and says what to press next only when pressing it does something.
-function sentence(v, label, others) {
+// Only a real drive's safe verdict may claim it is safe to unplug; an image has nothing to unplug.
+// Other verdicts keep their warnings and name a next step only when pressing it does something.
+function sentence(v, label, others, loop) {
     if (v === "safe")
-        return { text: "Ejected " + label + ", it is safe to unplug.", isError: false }
+        return { text: Format.fill(loop === true ? WORDS.safeImage : WORDS.safe, label), isError: false }
+    if (v === "attached") // A loop row unmounted, but its loop device could not be detached.
+        return { text: "Unmounted " + label + ", but its loop device is still attached.", isError: true }
     if (v === "mounted") {
         var rest = others || []
         if (rest.length === 0)
-            return { text: label + " is still mounted; close what is using it.", isError: true }
-        var tail = rest.length > 1 ? " are still mounted, eject those instead." : " is still mounted, eject that instead."
-        return { text: label + " could not be ejected; " + rest.join(", ") + " on the same drive" + tail, isError: true }
+            return { text: Format.fill(WORDS.stillMounted, label), isError: true }
+        return { text: Format.fill(rest.length > 1 ? WORDS.blockedMany : WORDS.blockedOne, label, rest.join(", ")), isError: true }
     }
-    return { text: "Could not confirm " + label + " was ejected; do not unplug it yet.", isError: true }
+    return { text: Format.fill(WORDS.unconfirmed, label), isError: true }
 }
 
-// Which rail rows draw the 15 px eject mark in the status square's 12 px trailing slot.
-// Sample input: rail entries as ui/NetworkMounts.qml and ui/DeviceMounts.qml build them,
-// {label:"NAS", group:"network", kind:"share", uri:"smb://h/data/", mounted:true}.
-// A mounted drive the operator can pull out and a mounted share gio can unmount draw the
-// mark in place of the square, so the label keeps its column. NFS needs root to unmount,
-// a phone keeps its square, a cloud row keeps its own, and anything unmounted keeps its
-// half-strength square.
+// Only a releasable mounted row draws the mark in place of the square.
+// Sample input: {label:"NAS", group:"network", kind:"share", uri:"smb://h/data/", mounted:true}.
 function releasable(entry) {
     if (!entry || entry.mounted !== true)
         return false
     if (entry.group === "device" && entry.kind === "volume")
-        return entry.removable === true
-    if (entry.group === "network" && entry.kind === "share")
+        return entry.removable === true || entry.loop === true
+    if (entry.group === "device" && entry.kind === "phone")
+        return true
+    if (entry.group === "network" && entry.kind === "share") {
+        // A kernel row names its fstype for the mark split; a gvfs share's scheme decides it.
+        if (entry.fstype)
+            return NetFs.isCifsFstype(entry.fstype)
         return Protocols.schemeOf(entry.uri) !== "nfs"
+    }
     return false
 }
 
-// The one-click release the mark fires: Eject for a drive, Unmount for a share, the same
-// rows Mounts.railMenu offers and release below reaches from Ctrl+E.
+// The one-click release mirrors the rows Mounts.railMenu offers.
 function releaseAction(entry) {
     if (!releasable(entry))
         return ""
+    if (entry.group === "device" && entry.kind === "phone")
+        return "unmountPhone"
     return entry.group === "device" ? "eject" : "unmount"
 }
 
-// The release is picked by name, never by position. With showUnmounted on (the default
-// since 0.3.3) a volume row offers Open, Unmount, Eject, so rows[0] is the open and taking it
-// opens the stick instead of ejecting it; a phone row leads with Open the same way. Eject where
-// one is offered, otherwise the row's own unmount, "" when the rows hold no release at all.
+// Picked by name, never position (a volume or phone row leads with Open): Eject, else the row's unmount, else "".
 function releaseFromRows(rows) {
     var list = rows || []
     for (var i = 0; i < list.length; i++) {
@@ -170,7 +185,7 @@ function releaseFromRows(rows) {
 }
 
 // Finder's Cmd+E with Cmd read as Ctrl: from the rail it releases the cursor row, from a listing the
-// removable volume the directory is inside, so the key can never release a volume the operator is
+// mounted volume the directory is inside, so the key can never release a volume the operator is
 // not looking at. The verdict is Mounts.railMenu's either way, off the lsblk poll, and the release
 // goes through the same releaseChosen a chosen menu row takes, carrying the row's key. A hidden rail
 // unloads the Sidebar with its poll, verdict state and releaseChosen, so there is nothing to read
@@ -183,14 +198,19 @@ function release(root, rail, fromRail) {
         return
     }
     var entry = fromRail ? rail.entries[rail.cursorIndex] : Mounts.holding(rail.entries, root.path)
+    if (fromRail && entry && entry.group === "device" && entry.kind === "disk") {
+        root.message(Format.fill(WORDS.systemDrive, entry.label), false)
+        return
+    }
     if (!entry) {
-        root.message("This is not inside a removable volume.", false)
+        // The backend alone names a system volume, off the listing's own device; a Recent history spans mounts, so it names none.
+        root.message(root.systemVolume === true && root.recentMode === "" ? WORDS.systemVolume : WORDS.noVolume, false)
         return
     }
     var rows = Mounts.railMenu(entry)
     var pick = releaseFromRows(rows)
     if (pick === "") {
-        root.message(entry.label + " has nothing to eject or unmount.", false)
+        root.message(Format.fill(Mounts.WORDS.nothingToRelease, entry.label), false)
         return
     }
     rail.releaseChosen(pick, Mounts.railKey(entry))

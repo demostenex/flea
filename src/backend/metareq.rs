@@ -7,26 +7,29 @@ use crate::backend::linecount::count_lines;
 use crate::backend::mediaprobe;
 use crate::backend::opsreq::OpMsg;
 use crate::backend::owner;
+use crate::backend::rawembed::{self, is_raw_name, RawFacts};
+use crate::backend::rawpreview::{self, Extracted};
+use crate::backend::rawtiff;
+use crate::backend::regfile::open_regular;
 use crate::backend::sandbox;
 use crate::json::escape;
+use std::io::Read;
 use std::path::Path;
-use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-// std offers no way to kill a child from another thread without owning it, so the signal is declared
-// here rather than taking a crate, the same call ops.rs makes for renameat2.
-extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
 const SIGKILL: i32 = 9;
+
+// A JPEG's Exif APP1 follows its first segment or two, so the photo facts never read past this.
+pub(crate) const JPEG_EXIF_READ: u64 = 65_536;
 
 pub struct Meta {
     pub width: u32,
     pub height: u32,
     // EXIF orientation 1 to 8 from the same header read, 1 for anything that names none; 5 to 8 swap the sides.
     pub orientation: u8,
+    // Image descriptors in a GIF, counted without decoding; 0 for any other file, a malformed GIF or one past the walk.
+    pub frames: u32,
     // Milliseconds, and the sample rate in hertz; both zero for anything that is not media.
     pub duration_ms: u64,
     pub sample_rate: u32,
@@ -48,11 +51,15 @@ pub struct Meta {
     pub target_is_dir: bool,
     // The owning user's login name, or empty when no local account has that uid; see owner.rs.
     pub owner: String,
+    // The copy of a camera RAW's embedded JPEG that Quick Look draws, with its pixels; None for any other file and for a RAW holding none.
+    pub raw: Option<Extracted>,
+    // The camera, lens and exposure facts of a RAW; all absent for everything else.
+    pub photo: RawFacts,
 }
 
 impl Meta {
     fn empty() -> Meta {
-        Meta { width: 0, height: 0, orientation: 1, duration_ms: 0, sample_rate: 0, entries: 0, unpacked: 0, names: Vec::new(), archive_failed: false, lines: 0, lines_partial: false, lines_failed: false, target: String::new(), target_is_dir: false, owner: String::new() }
+        Meta { width: 0, height: 0, orientation: 1, frames: 0, duration_ms: 0, sample_rate: 0, entries: 0, unpacked: 0, names: Vec::new(), archive_failed: false, lines: 0, lines_partial: false, lines_failed: false, target: String::new(), target_is_dir: false, owner: String::new(), raw: None, photo: RawFacts::default() }
     }
 }
 
@@ -60,8 +67,14 @@ impl Meta {
 // re-classify a row it has already classified once. media costs a subprocess, so it is only ever
 // asked for a row whose kind actually names a duration.
 pub fn read(path: &Path, text: bool, media: bool, archive: Option<&Formats>) -> Meta {
+    read_in(path, text, media, archive, &rawpreview::cache_dir())
+}
+
+// A camera RAW's copy goes in raw_dir, which a test points at its sandbox instead of the user's cache.
+pub(crate) fn read_in(path: &Path, text: bool, media: bool, archive: Option<&Formats>, raw_dir: &Path) -> Meta {
     let mut m = Meta::empty();
     m.owner = owner::of(path);
+    m.photo = photo(path, false);
     if let Ok(link) = std::fs::read_link(path) {
         m.target = link.to_string_lossy().to_string();
         m.target_is_dir = path.metadata().map(|t| t.is_dir()).unwrap_or(false);
@@ -70,6 +83,10 @@ pub fn read(path: &Path, text: bool, media: bool, archive: Option<&Formats>) -> 
         m.width = image.width;
         m.height = image.height;
         m.orientation = image.orientation;
+        m.frames = imagesize::gif_frames(path);
+    }
+    if is_raw_name(&path.to_string_lossy()) {
+        m.raw = rawpreview::ensure_in(raw_dir, path);
     }
     if let Some(formats) = archive {
         let listed = list_archive(path, formats);
@@ -99,6 +116,69 @@ pub fn read(path: &Path, text: bool, media: bool, archive: Option<&Formats>) -> 
     m
 }
 
+// The photo facts of a camera file: a RAW through the RAW walk, and a JPEG (only when jpeg is set) through its first Exif APP1 and the same reader.
+pub fn photo(path: &Path, jpeg: bool) -> RawFacts {
+    let name = path.to_string_lossy();
+    if rawembed::is_raw_name(&name) {
+        return rawembed::inspect(path).map(|(_, facts)| facts).unwrap_or_default();
+    }
+    let lower = name.to_ascii_lowercase();
+    if !jpeg || !(lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+        return RawFacts::default();
+    }
+    let mut head = Vec::new();
+    let Some(file) = open_regular(path) else {
+        return RawFacts::default();
+    };
+    if file.take(JPEG_EXIF_READ).read_to_end(&mut head).is_err() {
+        return RawFacts::default();
+    }
+    exif_segment(&head).map(|tiff| rawtiff::facts_from_slice(tiff, false)).unwrap_or_default()
+}
+
+// Sample input: FF D8 | FF E0 len(2) JFIF... | FF E1 len(2) "Exif\0\0" TIFF...; answers the TIFF, cut at the end of the bytes in hand.
+fn exif_segment(b: &[u8]) -> Option<&[u8]> {
+    let mut at = 2;
+    while b.starts_with(&[0xFF, 0xD8]) && b.get(at) == Some(&0xFF) {
+        let marker = *b.get(at + 1)?;
+        // Fill bytes and the markers that carry no length step by less than a segment.
+        if marker == 0xFF || marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
+            at += if marker == 0xFF { 1 } else { 2 };
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            return None;
+        }
+        let len = u16::from_be_bytes([*b.get(at + 2)?, *b.get(at + 3)?]) as usize;
+        if len < 2 {
+            return None;
+        }
+        let body = b.get(at + 4..(at + 2 + len).min(b.len()))?;
+        if marker == 0xE1 {
+            if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
+                return Some(tiff);
+            }
+        }
+        at += 2 + len;
+    }
+    None
+}
+
+// Sample output: {"make":"Canon","model":"Canon EOS R6","exp":[1,250],"fnum":[28,10],"iso":400,"focal":[35,1],"taken":"2026:09:12 18:31:00","w":6000,"h":4000}; null when the file names none of them.
+pub fn photo_json(f: &RawFacts) -> String {
+    let text = |key: &str, v: &Option<String>| v.as_ref().map(|s| format!(r#""{}":"{}""#, key, escape(s)));
+    let ratio = |key: &str, v: Option<(u32, u32)>| v.map(|(n, d)| format!(r#""{}":[{},{}]"#, key, n, d));
+    let fields: Vec<String> = [
+        text("make", &f.make), text("model", &f.model), text("lens", &f.lens), ratio("exp", f.exposure),
+        ratio("fnum", f.f_number), f.iso.map(|v| format!(r#""iso":{}"#, v)), ratio("focal", f.focal_mm), text("taken", &f.taken),
+        f.width.zip(f.height).map(|(w, h)| format!(r#""w":{},"h":{}"#, w, h)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if fields.is_empty() { "null".to_string() } else { format!("{{{}}}", fields.join(",")) }
+}
+
 // Listing an archive reads its index and extracts nothing, in the same jail every other delegated
 // tool here runs in.
 fn list_archive(path: &Path, formats: &Formats) -> Contents {
@@ -110,17 +190,14 @@ fn list_archive(path: &Path, formats: &Formats) -> Contents {
     if !sandbox::available() {
         return failed;
     }
-    let full = sandbox::wrap_readonly(&inner, path);
-    let mut child = match std::process::Command::new(&full[0])
-        .args(&full[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        // Its own group, so the watchdog can end the whole tree in one signal.
-        .process_group(0)
-        .spawn()
-    {
-        Ok(c) => c,
+    let mut full = sandbox::wrap_readonly(&inner, path);
+    sandbox::add_status(&mut full, inner.len());
+    let mut jailed = match crate::backend::jail::spawn_jailed(&full, |cmd| {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+    }) {
+        Ok(j) => j,
         Err(_) => return failed,
     };
     // The parser's own deadline cannot fire while it is blocked inside a read, so a tool that stops
@@ -129,7 +206,8 @@ fn list_archive(path: &Path, formats: &Formats) -> Contents {
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = {
         let done = Arc::clone(&done);
-        let pid = child.id() as i32;
+        let pid = jailed.child.id() as i32;
+        let sandbox_pid = Arc::clone(&jailed.sandbox_pid);
         std::thread::spawn(move || {
             let step = std::time::Duration::from_millis(50);
             let mut waited = std::time::Duration::ZERO;
@@ -142,15 +220,13 @@ fn list_archive(path: &Path, formats: &Formats) -> Contents {
                 waited += step;
             }
             if !done.load(Ordering::Relaxed) {
-                // The GROUP, not the pid: the listing tool runs under bwrap and prlimit, so killing
-                // the direct child leaves a grandchild holding the pipe open and the read still
-                // blocks. Measured: pid alone left a stalled tool running and the request unbounded.
-                // Safe: the child is still ours until wait() reaps it, and done gates that.
-                unsafe { kill(-pid, SIGKILL) };
+                // The group ends bwrap and the sandbox pid ends the tool --new-session hid; the child is still ours until wait() reaps it.
+                crate::backend::jail::kill_sandbox(&sandbox_pid, pid);
+                let _ = crate::procsignal::signal_group(pid, SIGKILL);
             }
         })
     };
-    let mut contents = match child.stdout.take() {
+    let mut contents = match jailed.child.stdout.take() {
         Some(out) => parse_reader(std::io::BufReader::new(out), &spec),
         None => {
             done.store(true, Ordering::Relaxed);
@@ -158,18 +234,16 @@ fn list_archive(path: &Path, formats: &Formats) -> Contents {
             return failed;
         }
     };
-    // A read cut short at its deadline is the one path where the tool is still alive, so the group
-    // kill has to happen BEFORE the watchdog is stood down. Storing done first disarmed it exactly
-    // there and left only child.kill(), which this file's own comment says is not enough: the tool
-    // runs under prlimit and bwrap and a grandchild survives it.
+    // A read cut short at its deadline leaves the tool alive, so the kills happen BEFORE done stands the watchdog down.
     if contents.failed {
-        unsafe { kill(-(child.id() as i32), SIGKILL) };
+        crate::backend::jail::kill_sandbox(&jailed.sandbox_pid, jailed.child.id() as i32);
+        let _ = crate::procsignal::signal_group(jailed.child.id() as i32, SIGKILL);
     }
     done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
     // The tool's own verdict, because an unreadable archive otherwise answers zero entries and the
     // tile cannot tell that apart from a read that has not happened yet.
-    match child.wait() {
+    match jailed.child.wait() {
         Ok(status) if status.success() => {}
         _ => contents.failed = true,
     }
@@ -181,7 +255,7 @@ fn list_archive(path: &Path, formats: &Formats) -> Contents {
     contents
 }
 
-// Sample output: {"t":"meta","row":4,"w":0,"h":0,"orient":1,"ms":0,"rate":0,"entries":214,"unpacked":3400,"afailed":false,"names":[{"n":"ui","d":true}],"lines":0,"partial":false,"lfailed":false,"target":"","targetdir":false,"owner":"gm"}
+// Sample output: {"t":"meta","row":4,"w":0,"h":0,"orient":1,"ms":0,"rate":0,"entries":214,"unpacked":3400,"afailed":false,"names":[{"n":"ui","d":true}],"lines":0,"partial":false,"lfailed":false,"frames":0,"photo":null,"target":"","targetdir":false,"raw":null,"owner":"gm"}
 pub fn meta_line(row: usize, m: &Meta) -> String {
     let names: Vec<String> = m
         .names
@@ -189,11 +263,19 @@ pub fn meta_line(row: usize, m: &Meta) -> String {
         .map(|e| format!(r#"{{"n":"{}","d":{}}}"#, escape(&e.name), e.is_dir))
         .collect();
     format!(
-        r#"{{"t":"meta","row":{},"w":{},"h":{},"orient":{},"ms":{},"rate":{},"entries":{},"unpacked":{},"afailed":{},"names":[{}],"lines":{},"partial":{},"lfailed":{},"target":"{}","targetdir":{},"owner":"{}"}}"#,
+        r#"{{"t":"meta","row":{},"w":{},"h":{},"orient":{},"ms":{},"rate":{},"entries":{},"unpacked":{},"afailed":{},"names":[{}],"lines":{},"partial":{},"lfailed":{},"frames":{},"photo":{},"target":"{}","targetdir":{},"raw":{},"owner":"{}"}}"#,
         row, m.width, m.height, m.orientation, m.duration_ms, m.sample_rate, m.entries, m.unpacked,
-        m.archive_failed, names.join(","), m.lines, m.lines_partial, m.lines_failed,
-        escape(&m.target), m.target_is_dir, escape(&m.owner)
+        m.archive_failed, names.join(","), m.lines, m.lines_partial, m.lines_failed, m.frames, photo_json(&m.photo),
+        escape(&m.target), m.target_is_dir, raw_json(&m.raw), escape(&m.owner)
     )
+}
+
+// Sample output: {"file":"/home/gm/.cache/flea/raw/b98fa4.jpg","w":1620,"h":1080,"orient":1}, or null.
+fn raw_json(raw: &Option<Extracted>) -> String {
+    match raw {
+        Some(e) => format!(r#"{{"file":"{}","w":{},"h":{},"orient":{}}}"#, escape(&e.file.to_string_lossy()), e.width, e.height, e.orientation),
+        None => "null".to_string(),
+    }
 }
 
 // The caller token identifies the exact request even when a new listing reuses the row index.
@@ -214,6 +296,10 @@ pub fn spawn(row: usize, path: std::path::PathBuf, text: bool, media: bool,
 }
 
 #[cfg(test)]
+#[path = "metareq_photo_tests.rs"]
+mod photo_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -223,6 +309,16 @@ mod tests {
         assert!(line.ends_with(",\"token\":27}"));
         assert!(crate::jsondoc::parse(&line).is_ok());
     }
+    #[test]
+    fn a_raw_copy_rides_the_meta_line_as_an_object_and_anything_else_as_null() {
+        assert!(meta_line(3, &Meta::empty()).contains(r#""targetdir":false,"raw":null,"owner""#));
+        let mut m = Meta::empty();
+        m.raw = Some(Extracted { file: "/c/a \"b\".jpg".into(), width: 1620, height: 1080, orientation: 6 });
+        let line = meta_line(3, &m);
+        assert!(line.contains(r#""raw":{"file":"/c/a \"b\".jpg","w":1620,"h":1080,"orient":6},"owner""#), "{}", line);
+        assert!(crate::jsondoc::parse(&line).is_ok());
+    }
+
     use crate::backend::fifotest::{mkfifo, peek, FifoWriter, BOUND};
     use crate::backend::linecount::LINE_BUDGET;
     use crate::backend::testdir::TestDir;
@@ -246,6 +342,28 @@ mod tests {
         let m = read(&p, false, false, None);
         assert_eq!((m.width, m.height), (2560, 1440));
         assert_eq!(m.lines, 0, "an image is never counted for lines");
+    }
+
+    #[test]
+    fn a_gif_reports_its_frames_beside_its_pixels_and_a_png_reports_none() {
+        let d = TestDir::new("metagifframes");
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[4, 0, 4, 0, 0, 0, 0]);
+        for _ in 0..3 {
+            gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 4, 0, 4, 0, 0, 2, 1, 7, 0]);
+        }
+        gif.push(0x3B);
+        std::fs::write(d.join("clip.gif"), &gif).unwrap();
+        let m = read(&d.join("clip.gif"), false, false, None);
+        assert_eq!((m.width, m.height, m.frames), (4, 4, 3));
+        assert!(meta_line(0, &m).contains(r#""lfailed":false,"frames":3,"photo":null,"target":"#));
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&8u32.to_be_bytes());
+        png.extend_from_slice(&8u32.to_be_bytes());
+        std::fs::write(d.join("shot.png"), png).unwrap();
+        assert_eq!(read(&d.join("shot.png"), false, false, None).frames, 0);
     }
 
     #[test]

@@ -8,13 +8,25 @@ cd "$(dirname "$0")/.." || exit 1
 BIN=./target/debug/flea
 # Without this every case below drives a missing binary and reports the result as a product failure.
 [ -x "$BIN" ] || { echo "ops.sh: $BIN is missing, run cargo build" >&2; exit 1; }
-D="$FIXTURE_ROOT/flea-ops-test-$$"
+# Trash runs on this run's own session bus, whose daemons take the sandbox's home, so no earlier suite's gvfsd answers and no real trash is touched.
+if [ "${FLEA_OPS_BUS:-}" != 1 ]; then
+  command -v dbus-run-session >/dev/null || { echo 'ops.sh: dbus-run-session is required for isolated Trash' >&2; exit 1; }
+  FLEA_OPS_BASE="$FIXTURE_ROOT/flea-ops-bus-$$"
+  sandbox_make "$FLEA_OPS_BASE"
+  # This outer pass owns the sandbox and removes it once the bus and its daemons have gone, however the cases ended.
+  trap 'sandbox_remove "$FLEA_OPS_BASE"' EXIT
+  mkdir -p "$FLEA_OPS_BASE/home" "$FLEA_OPS_BASE/data" || exit 1
+  # The cases keep the real HOME, which the sandbox guard checks, and run from the repository root this script already entered.
+  env HOME="$FLEA_OPS_BASE/home" XDG_DATA_HOME="$FLEA_OPS_BASE/data" dbus-run-session -- \
+    env FLEA_OPS_BUS=1 FLEA_OPS_BASE="$FLEA_OPS_BASE" HOME="$HOME" bash "tests/$(basename "$0")" "$@"
+  exit $?
+fi
+D="$FLEA_OPS_BASE/run"
 fail=0
 
 cleanup() {
   exec 3>&- 2>/dev/null
   [ -n "${BACKEND_PID:-}" ] && kill "$BACKEND_PID" 2>/dev/null
-  sandbox_remove "$D"
 }
 trap cleanup EXIT
 
@@ -30,12 +42,13 @@ check() {
   fi
 }
 
-# One backend process per scenario, because the undo journal is process-lifetime by design.
+# One backend and one session journal per scenario, each in a scratch runtime dir.
 start_backend() {
   sandbox_make "$D"
   rm -f "$D/out"; : > "$D/out"
   mkfifo "$D/in"
-  $BIN --backend < "$D/in" > "$D/out" 2>/dev/null &
+  sandbox_remove "$D/rt"; mkdir -p "$D/rt"
+  HOME="$FLEA_OPS_BASE/home" XDG_DATA_HOME="$FLEA_OPS_BASE/data" XDG_RUNTIME_DIR="$D/rt" $BIN --backend < "$D/in" > "$D/out" 2>/dev/null &
   BACKEND_PID=$!
   exec 3> "$D/in"
 }
@@ -143,6 +156,32 @@ send '{"c":"undo"}'
 await '"t":"undone"' || fail=1
 check "undo removed both copies" "no" "$([ -e "$D/dest/c1.txt" ] || [ -e "$D/dest/c2.txt" ] && echo yes || echo no)"
 check "undo left the sources alone" "one" "$(cat "$D/c1.txt")"
+stop_backend
+
+echo "--- a thousand small files share one progress window, and every item still answers ---"
+start_backend
+mkdir -p "$D/many" "$D/many-dest"
+items=1000
+for i in $(seq 1 "$items"); do printf 'f%s' "$i" > "$D/many/f$i.txt"; done
+paths=$(seq 1 "$items" | sed "s|.*|\"$D/many/f&.txt\"|" | paste -sd, -)
+began=$(date +%s%3N)
+send "{\"c\":\"transfer\",\"op\":\"copy\",\"paths\":[$paths],\"dest\":\"$D/many-dest\"}"
+await '"t":"transferdone"' || fail=1
+# No duration on the wire, so the stopwatch above is the bound.
+elapsed=$(( $(date +%s%3N) - began ))
+progress=$(grep '"t":"transferprogress"' "$D/out" | grep -vc '"phase":"writing"')
+# One window, from PROGRESS_EVERY in src/backend/opsreq.rs.
+progress_every_ms=150
+# A window sends the item's own line and at most one owed line beside it.
+progress_per_window=2
+# The first window has no owed line and the closing line takes its place, so the edge adds two.
+progress_edge_lines=2
+bound=$(( elapsed / progress_every_ms * progress_per_window + progress_edge_lines ))
+echo "ops.sh: many-file copy sent $progress progress lines in $elapsed ms, bound $bound"
+check "progress lines stay within the owed line and the item's own per window of the copy plus the edge lines" "yes" "$([ "$progress" -le "$bound" ] && echo yes || echo "no: $progress lines in $elapsed ms, bound $bound")"
+check "every item still answers its own terminal line" "$items" "$(seen '"t":"transferitem"')"
+check "done counts every item ok" "1" "$(seen "\"t\":\"transferdone\",\"id\":1,\"ok\":$items,\"failed\":0")"
+check "every copy landed" "$items" "$(find "$D/many-dest" -type f | wc -l | tr -d ' ')"
 stop_backend
 
 echo "--- move transfer, and undo moves it back ---"

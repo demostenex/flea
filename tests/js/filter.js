@@ -99,6 +99,12 @@ function run(check) {
     check("a filter matching nothing spans nothing, so no row is ever asked for",
           JSON.stringify(Filter.span([], 0, 5)), JSON.stringify({ first: 0, last: -1 }))
 
+    var keyLine = Fixture.pane()
+    Filter.typeKey({ key: Qt.Key_Delete, text: "\u007f" }, keyLine)
+    check("DEL types nothing into the filter", keyLine.filterQuery, "")
+    Filter.typeKey({ key: Qt.Key_E, text: "e" }, keyLine)
+    check("a letter still types into the filter", keyLine.filterQuery, "e")
+
     var p = Fixture.pane()
     Filter.start(p)
     check("slash gives the query line the keyboard", p.filterTyping, true)
@@ -199,6 +205,52 @@ function run(check) {
     check("and directories still lead the filtered view after a reverse",
           sortFirst.map(function (i) { return Fixture.reversed()[i].d }).join(","), "true,true,false,false")
     // States' no-match tile: the query named back, and the count of rows the filter tested.
-    check("a filter that matches none says how many rows it tested", Filter.noMatch(11), "11 rows here, none of them")
-    check("and a single row keeps the sentence readable", Filter.noMatch(1), "1 row here, and not it")
+    check("a filter that matches none says how many rows it tested", Filter.noMatch(11), "No match among 11 items")
+    check("and a single item keeps the sentence readable", Filter.noMatch(1), "No match among 1 item")
+
+    var pointed = Fixture.pane()
+    Filter.setCursor(pointed, 4, 0)
+    check("a pointer setCursor hands context 0 to the view", pointed.contexts.join(","), "0")
+
+    // Issue 287: Ctrl+V and Shift+Insert paste the clipboard text into the query as if typed.
+    function pasteEvent(key, mods) {
+        return { key: key, text: "", modifiers: mods }
+    }
+    function clipped(clip) {
+        var p = Fixture.pane()
+        p.clipboardText = function () { return clip }
+        return p
+    }
+    var pasted = clipped("repo\nsecond line")
+    Filter.start(pasted)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), pasted)
+    pasted.refresh()
+    check("ctrl+v pastes the clipboard's first line into the filter", pasted.filterQuery, "repo")
+    check("and the paste narrows, so it stands an empty match list instead of no filter",
+          pasted.shown === null, false)
+    check("and that narrowed list holds no row", (pasted.shown || []).length, 0)
+    var shifted = clipped("repo\nsecond line")
+    Filter.start(shifted)
+    Filter.typeKey(pasteEvent(Qt.Key_Insert, Qt.ShiftModifier), shifted)
+    check("shift+insert pastes the same way", shifted.filterQuery, "repo")
+    var dirty = clipped("a\tb\u0001c")
+    Filter.start(dirty)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), dirty)
+    check("a tab or control character in the clipboard types nothing", dirty.filterQuery, "abc")
+    var blank = clipped("")
+    Filter.start(blank)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), blank)
+    check("an empty clipboard leaves the query as it was", blank.filterQuery, "")
+    var missing = clipped(undefined)
+    Filter.start(missing)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), missing)
+    check("and a clipboard holding no text does too", missing.filterQuery, "")
+    var paired = clipped("a\ud83d\ude00b")
+    Filter.start(paired)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), paired)
+    check("a whole surrogate pair in the clipboard is kept", paired.filterQuery, "a\ud83d\ude00b")
+    var halved = clipped("a\ud83db\ude00c")
+    Filter.start(halved)
+    Filter.typeKey(pasteEvent(Qt.Key_V, Qt.ControlModifier), halved)
+    check("and a lone half of one is dropped", halved.filterQuery, "abc")
 }

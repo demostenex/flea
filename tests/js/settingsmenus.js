@@ -13,22 +13,40 @@ function runInventory(check) {
     var built = {}
     var builtMark = {}
     var shapes = [
-        { rowInDropbox: false, rowIsArchive: true, rowIsImage: true },
-        { rowInDropbox: true, rowIsArchive: false, rowIsImage: false }
+        { rowInDropbox: false, rowIsArchive: true, rowIsImage: true, rowIsSymlink: true,
+          selectionCount: 1, selectionModes: undefined, hasShebang: true, cursorIsTarget: true,
+          tagSubmenu: [{ id: "Red", label: "Red" }] },
+        { rowInDropbox: true, rowIsArchive: false, rowIsImage: false, rowIsSymlink: false,
+          selectionCount: 1, selectionModes: undefined, hasShebang: false,
+          tagSubmenu: [{ id: "Red", label: "Red" }] },
+        // Permissions040: Permissions takes the whole selection, so one shape
+        // selects three files and the row still builds.
+        { rowInDropbox: false, rowIsArchive: false, rowIsImage: false, rowIsSymlink: false,
+          selectionCount: 3, selectionModes: [0o100644, 0o100644, 0o040755], hasShebang: false,
+          tagSubmenu: [{ id: "Red", label: "Red" }] }
     ]
     for (var s = 0; s < shapes.length; s++) {
-        var rows = Menu.listingEntries({
+        // Compare state-toggle wording while off, matching the customization labels.
+        var rows = Menu.listingEntries({ langMarks: false,
             showHidden: false, hasRow: true, dropboxPath: "/home/jw/Dropbox",
             taildropPeers: [{ id: "x", label: "Box" }], taildropInstalled: true, dropboxInstalled: true,
-            localSendInstalled: true,
-            archiveFormats: ["zip"], canConvert: true, canExtract: true, selectionCount: 1, rowMode: 0o100644,
+            localSendInstalled: true, clipboardAvailable: true,
+            archiveFormats: ["zip"], canConvert: true, canExtract: true, selectionCount: shapes[s].selectionCount,
+            selectionModes: shapes[s].selectionModes, rowMode: 0o100644, rowIsSymlink: shapes[s].rowIsSymlink,
+            rowName: "debian-13.iso", flashZipMember: "",
             rowInDropbox: shapes[s].rowInDropbox, rowIsArchive: shapes[s].rowIsArchive,
-            rowIsImage: shapes[s].rowIsImage, hiddenActions: [],
+            rowIsImage: shapes[s].rowIsImage, hiddenActions: [], hasShebang: shapes[s].hasShebang,
+            cursorIsTarget: shapes[s].cursorIsTarget,
+            // The Tags row builds only where a tag flyout exists, the way a folder with tags in use builds it.
+            tagSubmenu: shapes[s].tagSubmenu,
             // One script, so the Run script row is built here the way a box with a scripts directory builds it.
             scripts: [{ id: "one.sh", label: "one" }]
         })
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].separator === true)
+                continue
+            // The rename row names its count over several rows (pinned in menu.js); the switch carries the one-row wording.
+            if (shapes[s].selectionCount > 1 && rows[i].action === "rename")
                 continue
             built[rows[i].id || rows[i].action] = rows[i].label
             builtMark[rows[i].id || rows[i].action] = rows[i].glyph !== undefined ? rows[i].glyph : rows[i].mark
@@ -39,7 +57,7 @@ function runInventory(check) {
         switched = switched.concat(Settings.MENU_GROUPS[g].ids)
     // The background menu's rows count too where a switch governs them, as Update Flea's does once an update is known.
     // storageClass "usb" builds the ExtThumbs row the way a removable drive does, so its switch is covered too.
-    var background = Menu.listingEntries({ hasRow: false, showHidden: false, hiddenActions: [], updateVersion: "0.3.4", storageClass: "usb", thumbPreview: {} })
+    var background = Menu.listingEntries({ hasRow: false, showHidden: false, langMarks: false, hiddenActions: [], updateVersion: "0.3.4", storageClass: "usb", thumbPreview: {} })
     for (var b = 0; b < background.length; b++) {
         if (switched.indexOf(background[b].id) >= 0) {
             built[background[b].id] = background[b].label
@@ -75,7 +93,7 @@ function runInventory(check) {
           Object.keys(built).filter(function (id) { return reachable.indexOf(id) < 0 }).join(","), "")
 }
 
-// GM's ruling, and it is easy to get backwards: menu.hidden stores what is HIDDEN, and a master's count is of ENABLED actions, so one id in the set reads "5 of 6".
+// The rule, and it is easy to get backwards: menu.hidden stores what is HIDDEN, and a master's count is of ENABLED actions, so one id in the set reads "5 of 6".
 function runMaster(check) {
     var BASIC = Settings.BASIC
     check("nothing hidden is all six enabled", Settings.basicEnabled([], BASIC), 6)
@@ -86,7 +104,7 @@ function runMaster(check) {
     check("and the master is unchecked", Settings.masterState(BASIC, BASIC), "none")
     // An unrelated id in the set must not be counted as one of the six, in either direction.
     check("an unrelated hidden id does not change the count",
-          Settings.basicEnabled(["copypath", "compress"], BASIC), 6)
+          Settings.basicEnabled(["showOriginal", "compress"], BASIC), 6)
 
     check("activating a checked master switches all six off",
           Settings.toggleMaster([], BASIC).sort().join(","), BASIC.slice().sort().join(","))
@@ -95,14 +113,14 @@ function runMaster(check) {
     check("activating an unchecked master switches all six on too",
           Settings.toggleMaster(BASIC, BASIC).length, 0)
     check("switching all six on preserves an unrelated hidden id",
-          Settings.toggleMaster(["paste", "copypath"], BASIC).join(","), "copypath")
+          Settings.toggleMaster(["paste", "showOriginal"], BASIC).join(","), "showOriginal")
     check("and switching all six off preserves it as well",
-          Settings.toggleMaster(["copypath"], BASIC).indexOf("copypath") >= 0, true)
+          Settings.toggleMaster(["showOriginal"], BASIC).indexOf("showOriginal") >= 0, true)
 
     check("an individual toggle adds its own id and nothing else",
           Settings.toggleId([], "paste").join(","), "paste")
     check("and toggling it again takes only that id back out",
-          Settings.toggleId(["paste", "copypath"], "paste").join(","), "copypath")
+          Settings.toggleId(["paste", "showOriginal"], "paste").join(","), "showOriginal")
     check("the master recomputes off the individual toggle at once",
           Settings.masterState(Settings.toggleId([], "cut"), BASIC) + " "
           + Settings.basicEnabled(Settings.toggleId([], "cut"), BASIC), "some 5")
@@ -119,8 +137,8 @@ function runMaster(check) {
         .filter(function (row) { return row.kind === "group" })
     check("every heading reports the group it governs, and a group of one row has no master at all",
           groups.map(function (row) { return row.label + "|" + (row.master ? row.value + "|" + row.state : "no master") }).join(", "),
-          "Basic file actions|6 of 6|all, Destructive|no master, Open and inspect|3 of 7|some, "
-          + "Extras|12 of 12|all, Shortcuts|no master, Always shown|no master")
+          "Basic file actions|6 of 6|all, Destructive|no master, Open and inspect|8 of 12|some, "
+          + "Extras|16 of 16|all, Shortcuts|no master, Always shown|no master")
     var inspect = groups[2]
     check("a heading with a master is a focus stop and one without is not",
           Settings.focusable(inspect) + "|" + Settings.focusable(groups[1]), "true|false")

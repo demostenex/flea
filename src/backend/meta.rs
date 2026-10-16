@@ -49,15 +49,26 @@ fn stat_range_with(
     slow_ms: f64,
     stat: impl Fn(&Path, &str) -> Meta + Sync,
 ) -> (Vec<Meta>, f64) {
-    let t = Instant::now();
     let end = start.saturating_add(count).min(l.len());
     let start = start.min(end);
+    stat_pass(start, end, slow_ms, || l.threaded_cached(base), |i| cached_or(base, l, i, &stat))
+}
+
+// Rows run serially until the pass spends slow_ms, then the rest go to threads if the gate allows; the gate is asked only past the threshold.
+fn stat_pass(
+    start: usize,
+    end: usize,
+    slow_ms: f64,
+    threaded: impl Fn() -> bool,
+    row: impl Fn(usize) -> Meta + Sync,
+) -> (Vec<Meta>, f64) {
+    let t = Instant::now();
     let mut out = Vec::with_capacity(end - start);
     for i in start..end {
-        out.push(cached_or(base, l, i, &stat));
+        out.push(row(i));
         let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms >= slow_ms && end - (i + 1) > 1 && l.threaded_cached(base) {
-            out.extend(stat_parallel_with(base, l, i + 1, end, &stat));
+        if elapsed_ms >= slow_ms && end - (i + 1) > 1 && threaded() {
+            out.extend(stat_parallel(i + 1, end, &row));
             break;
         }
     }
@@ -66,23 +77,21 @@ fn stat_range_with(
 
 // A prefetched gio row answers from its store, a symlink paying one follow-stat; anything else runs the injected stat.
 fn cached_or(base: &Path, l: &Listing, i: usize, stat: &(impl Fn(&Path, &str) -> Meta + Sync)) -> Meta {
+    let name = l.name(i);
     if let Some(g) = l.gio_for(i) {
-        // corner: a cached symlink pays meta_one's one follow-stat so a linked folder draws as one.
-        let target_is_dir = l.spans.get(i).is_some_and(|s| s.is_symlink)
-            && base.join(l.name(i)).metadata().map(|t| t.is_dir()).unwrap_or(false);
+        let target_is_dir = linked_dir(base, name, l.spans.get(i).is_some_and(|s| s.is_symlink));
         return Meta { size: g.size, mtime: g.mtime, mode: g.mode, target_is_dir, target: l.gio_target(g.name_off).to_string(), dev: l.base_dev };
     }
-    stat(base, l.name(i))
+    stat(base, name)
+}
+
+// corner: a cached symlink pays meta_one's one follow-stat so a linked folder draws as one; no other kind stats.
+fn linked_dir(base: &Path, name: &str, is_symlink: bool) -> bool {
+    is_symlink && base.join(name).metadata().map(|t| t.is_dir()).unwrap_or(false)
 }
 
 // Contiguous chunks, joined in order, so the rows come back exactly as the serial walk returns them.
-fn stat_parallel_with(
-    base: &Path,
-    l: &Listing,
-    start: usize,
-    end: usize,
-    stat: &(impl Fn(&Path, &str) -> Meta + Sync),
-) -> Vec<Meta> {
+fn stat_parallel(start: usize, end: usize, row: &(impl Fn(usize) -> Meta + Sync)) -> Vec<Meta> {
     let threads = STAT_THREADS.min(end - start);
     let chunk = (end - start).div_ceil(threads);
     std::thread::scope(|s| {
@@ -90,7 +99,7 @@ fn stat_parallel_with(
             .map(|k| {
                 let from = (start + k * chunk).min(end);
                 let to = (from + chunk).min(end);
-                (from, to, s.spawn(move || (from..to).map(|i| cached_or(base, l, i, stat)).collect::<Vec<Meta>>()))
+                (from, to, s.spawn(move || (from..to).map(row).collect::<Vec<Meta>>()))
             })
             .collect();
         let mut out = Vec::with_capacity(end - start);
@@ -127,6 +136,52 @@ fn zeroes() -> Meta {
     Meta { size: 0, mtime: 0, mode: 0, target_is_dir: false, target: String::new(), dev: 0 }
 }
 
+// One window row's cached gio facts, owned so a remote worker answers from the store with no arena clone.
+pub struct WindowRow {
+    pub name: String,
+    pub cached: Option<CachedRow>,
+}
+// The store's answer for one row, owned with it: size, mtime and mode ride along, the link target too.
+pub struct CachedRow {
+    pub size: u64,
+    pub mtime: i64,
+    pub mode: u32,
+    pub target: String,
+    pub is_symlink: bool,
+    pub base_dev: u64,
+}
+// The window's own rows and nothing else: a remote worker stats these with no listing clone.
+pub fn window_rows(l: &Listing, start: usize, count: usize) -> Vec<WindowRow> {
+    let end = start.saturating_add(count).min(l.len());
+    let start = start.min(end);
+    (start..end).map(|i| WindowRow {
+        name: l.name(i).to_string(),
+        cached: l.gio_for(i).map(|g| CachedRow {
+            size: g.size,
+            mtime: g.mtime,
+            mode: g.mode,
+            target: l.gio_target(g.name_off).to_string(),
+            is_symlink: l.spans.get(i).is_some_and(|s| s.is_symlink),
+            base_dev: l.base_dev,
+        }),
+    }).collect()
+}
+// Stats only the rows handed over, serial then threaded past SLOW_PASS_MS, so many slow stats overlap while one hung stat still holds the window to the call's deadline.
+pub fn stat_window_rows(base: &Path, rows: &[WindowRow], threaded: bool) -> (Vec<Meta>, f64) {
+    stat_window_rows_with(base, rows, SLOW_PASS_MS, threaded, window_meta_one)
+}
+// slow_ms and the serial gate ride along, so vfat and exfat stay serial; tests pass 0 or infinity.
+fn stat_window_rows_with(base: &Path, rows: &[WindowRow], slow_ms: f64, threaded: bool, stat: impl Fn(&Path, &WindowRow) -> Meta + Sync) -> (Vec<Meta>, f64) {
+    stat_pass(0, rows.len(), slow_ms, || threaded, |i| stat(base, &rows[i]))
+}
+// One row's answer: a cached row from its snapshot, any other by stat, a cached symlink paying one follow-stat.
+fn window_meta_one(base: &Path, row: &WindowRow) -> Meta {
+    match &row.cached {
+        Some(g) => Meta { size: g.size, mtime: g.mtime, mode: g.mode, target_is_dir: linked_dir(base, &row.name, g.is_symlink), target: g.target.clone(), dev: g.base_dev },
+        None => meta_one(base, &row.name),
+    }
+}
+
 // What a sort by size or date reads for every row: the same lstat stat_range makes, without the
 // symlink's second stat, because an order needs no icon.
 #[derive(Clone, Copy)]
@@ -136,7 +191,7 @@ pub struct Stat {
 }
 
 // The metadata pass: every row once, in listing order, so the caller's index i is row i. Split
-// across the cores because the pass is IO-bound cold, where the KB measured 1005 ms serial against
+// across the cores because the pass is IO-bound cold, measured at 1005 ms serial against
 // 282 ms on twelve threads at 100k rows; available_parallelism follows the affinity mask, so
 // `taskset -c 0` is how the serial figure is taken from the same binary.
 pub fn stat_all(base: &Path, l: &Listing) -> (Vec<Stat>, f64) {
@@ -401,7 +456,7 @@ mod tests {
         assert_eq!(stats.iter().map(|s| (s.size, s.mtime)).collect::<Vec<_>>(), [(30, 300), (10, 100), (20, 200)]);
         for by in [crate::backend::sort::SortBy::Size, crate::backend::sort::SortBy::Mtime] {
             let mut l = build();
-            crate::backend::metasort::sort_by_stat(&mut l, d.path(), by, false);
+            crate::backend::metasort::sort_by_stat(&mut l, d.path(), by, false, false);
             assert_eq!((0..l.len()).map(|i| l.name(i)).collect::<Vec<_>>(), ["a.txt", "c.txt", "b.txt"]);
             // The spans moved, so each row's figures must still be its own name's.
             let figures: Vec<(u64, i64)> = (0..l.len()).map(|i| l.gio_for(i).map(|g| (g.size, g.mtime)).unwrap_or_default()).collect();
@@ -432,5 +487,64 @@ mod tests {
         });
         assert_eq!(all_calls.load(Ordering::SeqCst), 0, "the size/date pass must read the cache too");
         assert_eq!((stats.len(), stats[0].size, stats[1].size), (3, 10, 4096));
+    }
+
+    #[test]
+    fn window_rows_move_only_the_window_and_stat_the_same() {
+        let d = TestDir::new("windowrows");
+        d.file("a.txt", "a");
+        std::fs::write(d.join("b.txt"), "bb").unwrap();
+        let mut l = Listing::new();
+        l.push("a.txt", false);
+        l.push("b.txt", false);
+        l.push("c.txt", false);
+        let rows = window_rows(&l, 1, 1);
+        assert_eq!(rows.len(), 1, "a remote worker moves one window, never the arena");
+        assert_eq!(rows[0].name, "b.txt");
+        assert!(rows[0].cached.is_none(), "a readdir row carries no cache");
+        let (range, _) = stat_range(d.path(), &l, 0, 3);
+        let (moved, _) = stat_window_rows(d.path(), &window_rows(&l, 0, 3), true);
+        assert_eq!(moved.len(), range.len());
+        for (m, r) in moved.iter().zip(range.iter()) {
+            assert_eq!((m.size, m.mtime, m.mode), (r.size, r.mtime, r.mode), "the moved rows stat the same");
+        }
+        assert_eq!((moved[0].size, moved[1].size), (1, 2));
+        assert_eq!((moved[2].size, moved[2].mode), (0, 0), "a vanished row still reports zeroes");
+    }
+
+    // A slow window goes to threads past SLOW_PASS_MS, a fast one stays serial, and a gated-off one never threads.
+    #[test]
+    fn a_slow_window_threads_while_a_fast_one_and_a_gated_one_stay_serial() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        let d = TestDir::new("windowelapsed");
+        let rows: Vec<WindowRow> = (0..16).map(|n| WindowRow { name: format!("f{:02}", n), cached: None }).collect();
+        let run = |threaded: bool, sleep_ms: u64| {
+            let holds: Arc<Mutex<HashSet<std::thread::ThreadId>>> = Arc::new(Mutex::new(HashSet::new()));
+            let seen = Arc::clone(&holds);
+            let stub = move |_: &Path, row: &WindowRow| {
+                seen.lock().unwrap().insert(std::thread::current().id());
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                Meta { size: row.name[1..].parse().unwrap_or(0), mtime: 1, mode: 0o100644, target_is_dir: false, target: String::new(), dev: 0 }
+            };
+            let (metas, _) = stat_window_rows_with(d.path(), &rows, SLOW_PASS_MS, threaded, stub);
+            assert_eq!((metas.len(), metas[0].size, metas[15].size), (16, 0, 15));
+            let threads = holds.lock().unwrap().len();
+            threads
+        };
+        assert_eq!(run(true, 0), 1, "a fast window must not pay for threads");
+        assert!(run(true, 25) > 1, "a slow window must share the remainder across threads");
+        assert_eq!(run(false, 25), 1, "a gated-off window stays serial however slow");
+    }
+
+    #[test]
+    fn window_rows_answer_a_cached_row_from_its_snapshot() {
+        let d = TestDir::new("windowcached");
+        let text = "smb://h/share/a.txt\t10\t(regular)\ttime::modified=300 unix::mode=33188\n";
+        let l = crate::backend::gvfslist::build_listing(text, false, d.path().to_str().unwrap()).unwrap();
+        let rows = window_rows(&l, 0, 1);
+        assert!(rows[0].cached.is_some(), "a gio row rides to the worker in the snapshot");
+        let (metas, _) = stat_window_rows(d.path(), &rows, true);
+        assert_eq!((metas[0].size, metas[0].mtime, metas[0].mode), (10, 300, 33188));
     }
 }

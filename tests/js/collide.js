@@ -53,19 +53,25 @@ function run(check) {
     // Focus: Keep both first, h and l stop at the ends, Tab and Backtab come round.
     check("the card opens on Keep both", Collide.START, "keep")
     check("the buttons read left to right", Collide.BUTTONS.map(function (b) { return Collide.LABELS[b] }).join("|"),
-          "Cancel|Skip|Keep both|Replace")
-    check("l steps right", Collide.moved("keep", Qt.Key_L), "replace")
-    check("Right is l", Collide.moved("skip", Qt.Key_Right), "keep")
-    check("l stops at Replace", Collide.moved("replace", Qt.Key_L), "replace")
-    check("h steps left", Collide.moved("keep", Qt.Key_H), "skip")
-    check("Left is h", Collide.moved("skip", Qt.Key_Left), "cancel")
-    check("h stops at Cancel", Collide.moved("cancel", Qt.Key_H), "cancel")
-    check("Tab comes round from Replace", Collide.moved("replace", Qt.Key_Tab), "cancel")
-    check("Backtab comes round from Cancel", Collide.moved("cancel", Qt.Key_Backtab), "replace")
-    check("Tab walks every button left to right", ["cancel", "skip", "keep"].map(function (b) { return Collide.moved(b, Qt.Key_Tab) }).join("|"),
-          "skip|keep|replace")
-    check("and Backtab walks them back", ["skip", "keep", "replace"].map(function (b) { return Collide.moved(b, Qt.Key_Backtab) }).join("|"),
-          "cancel|skip|keep")
+          "Cancel|Skip|Keep both|Merge|Replace")
+    check("l steps right onto Merge", Collide.moved("keep", Qt.Key_L, true), "merge")
+    check("and Merge steps right onto Replace", Collide.moved("merge", Qt.Key_L, true), "replace")
+    check("Right is l", Collide.moved("skip", Qt.Key_Right, true), "keep")
+    check("l stops at Replace", Collide.moved("replace", Qt.Key_L, true), "replace")
+    check("h steps left", Collide.moved("merge", Qt.Key_H, true), "keep")
+    check("h stops at Cancel", Collide.moved("cancel", Qt.Key_H, true), "cancel")
+    check("Left is h", Collide.moved("skip", Qt.Key_Left, true), "cancel")
+    check("Tab comes round from Replace", Collide.moved("replace", Qt.Key_Tab, true), "cancel")
+    check("Backtab comes round from Cancel", Collide.moved("cancel", Qt.Key_Backtab, true), "replace")
+    check("and so does Tab with Shift held", Collide.moved("cancel", Qt.Key_Tab, true, Qt.ShiftModifier), "replace")
+    var fat = ["cancel", "skip", "rename"]
+    check("the FAT card: Backtab and Shift+Tab come round from Cancel, Tab from Rename, h and l stop at the ends",
+          [[Qt.Key_Backtab, 0, "cancel"], [Qt.Key_Tab, Qt.ShiftModifier, "cancel"], [Qt.Key_Tab, 0, "rename"], [Qt.Key_H, 0, "cancel"],
+           [Qt.Key_L, 0, "rename"]].map(function (k) { return Collide.walk(fat, k[2], k[0], k[1], "cancel") }).join("|"), "rename|rename|cancel|cancel|rename")
+    check("Tab walks every button left to right", ["cancel", "skip", "keep", "merge"].map(function (b) { return Collide.moved(b, Qt.Key_Tab, true) }).join("|"),
+          "skip|keep|merge|replace")
+    check("and Backtab walks them back", ["skip", "keep", "merge", "replace"].map(function (b) { return Collide.moved(b, Qt.Key_Backtab, true) }).join("|"),
+          "cancel|skip|keep|merge")
     check("any other key leaves the focus", Collide.moved("skip", Qt.Key_J), "skip")
     check("Enter takes the focused choice", Collide.activates(Qt.Key_Return) && Collide.activates(Qt.Key_Enter), true)
     check("and so does Space", Collide.activates(Qt.Key_Space), true)
@@ -119,7 +125,7 @@ function run(check) {
     // A paste asks rather than sends, and leaves a cut on the clipboard until the transfer goes out.
     var asked = []
     var pane = { path: "/dest", clipboard: { paths: ["/src/a.txt"], moving: true },
-                 collide: { ask: function (request, probe, cut) { asked.push([request, probe, cut]) } } }
+                 collide: { ask: function (request, probe, cut) { asked.push([request, probe, cut]) } }, asks: function () { return this.collide } }
     Ops.paste(pane)
     check("a paste asks the question first", asked.length === 1 ? asked[0][0].c + " " + asked[0][0].op + " " + asked[0][0].dest : "none",
           "transfer move /dest")
@@ -135,14 +141,14 @@ function run(check) {
     asked = []
     var drops = { path: "/d", rowFor: function () { return { n: "omarchy", d: true } }, join: function (a, b) { return a + "/" + b },
                   backend: { send: function (msg) { sent.push(msg) } },
-                  collide: { ask: function (request, probe) { asked.push([request, probe]); return answer } } }
-    check("a row drop answers the card's refusal", Drag.drop(drops, [2], 0, false), false)
+                  collide: { ask: function (request, probe) { asked.push([request, probe]); return answer } }, asks: function () { return this.collide } }
+    check("a row drop answers the card's refusal", Drag.dropByIndex(drops, [2], 0, "move"), false)
     check("a path drop does too", Drag.dropInto(drops, "", ["file:///x/a.txt"], "/e", 0), false)
     check("a shelf drop asks with the paths its drag carries",
           Drag.dropInto(drops, "", ["file:///s/a.txt"], "/e", 0, "tok\nmove") + " " + (asked[2] ? JSON.stringify(asked[2][1]) : "not asked"), "false [\"/s/a.txt\"]")
     answer = true
     check("and each answers the card's acceptance, not a false of its own",
-          Drag.drop(drops, [2], 0, false, 7) + " " + Drag.dropInto(drops, "", ["file:///x/a.txt"], "/e", 0), "true true")
+          Drag.dropByIndex(drops, [2], 0, "move", 7) + " " + Drag.dropInto(drops, "", ["file:///x/a.txt"], "/e", 0), "true true")
     check("a row drop names the listing it is handed rather than none", asked[3][0].listing, 7)
     check("every drop asked and none went straight to the backend", asked.length + " " + sent.length, "5 0")
     var lifted = { c: "transfer", op: "move", rows: [2], dest: "/d/omarchy", listing: 7 }
@@ -151,6 +157,111 @@ function run(check) {
 
     wired(check)
     failedClears(check)
+    busyMenu(check)
+    refusedRow(check)
+    reusedRowAfterHoverOpen(check)
+    cannotLeaveEnds(check)
+    pasteLinks(check)
+}
+
+// Paste as links goes through the same card; the link line keeps paths with only named rows and listing.
+function pasteLinks(check) {
+    var at = Fixture.scene(7)
+    var backend = at.backend, p = at.pane
+    p.collide.ask({ c: "link", op: "relative", paths: ["/s/a.txt"], dest: "/d" }, null, false)
+    check("a links question asks about its paths", JSON.stringify(backend.sent[0]),
+          JSON.stringify({ c: "collisions", id: 1, dest: "/d", paths: ["/s/a.txt"] }))
+    p.collide.decide("keep")
+    check("a paths-only Paste as links sends a link line with no rows and no listing", JSON.stringify(backend.sent[1]),
+          JSON.stringify({ c: "link", op: "relative", paths: ["/s/a.txt"], dest: "/d", collide: "keep", collideId: 1 }))
+    p.collide.ask({ c: "link", op: "relative", paths: ["/s/a.txt"], rows: [2], dest: "/d" }, null, false)
+    p.collide.decide("replace")
+    check("a rows Paste as links keeps its rows in the numbering they were read in", JSON.stringify(backend.sent[3]),
+          JSON.stringify({ c: "link", op: "relative", paths: ["/s/a.txt"], dest: "/d", collide: "replace", collideId: 2, rows: [2], listing: 7 }))
+    at.parent.destroy()
+}
+
+// Too wide to leave carries no uri-list, so cannotLeave ends the gesture instead of stranding it.
+function cannotLeaveEnds(check) {
+    var said = []
+    var at = Fixture.scene(7, said)
+    var session = at.session
+    session.dragRows = [0, 9]
+    session.dragListing = 7
+    session.dragCopy = true
+    session.dragMime = { "text/plain": "/d/a.txt" }
+    session.feedback = { own: true, copy: true, shift: false, dev: 56, deletable: true, count: 2, canLeave: false }
+    session.cannotLeave()
+    check("cannotLeave clears the rows it could not carry out", session.dragRows.length + "|" + session.dragListing, "0|0")
+    check("and the mime, feedback and modifiers go with them",
+          JSON.stringify(session.dragMime) + "|" + session.feedback + "|" + session.dragCopy, "{}|null|false")
+    check("and the too-wide refusal reads as a pane message", said.join("|"),
+          "Copy 2 items to a folder · too wide to drag out")
+    at.parent.destroy()
+}
+
+// The real RowDrag over a stub pane: a refused row stays dark and names its refusal, darkening like dropped().
+function refusedRow(check) {
+    var said = []
+    var at = Fixture.scene(7, said)
+    var p = at.pane, session = at.session, target = at.target
+    var marker = Drag.markerPayload([2], false, "/d", 56)
+    var selfUrls = ["file:///d/omarchy"]
+    check("a refused folder row is not entered", target.enter(marker, selfUrls, "", "", Qt.CopyAction), false)
+    check("and it never lights as a target", session.dropIndex, -1)
+    check("and it says the refusal instead of a verb", said.join("|"), "That folder is inside the drag.")
+    check("with no verb armed and no feedback", session.dragCopy + "|" + session.dragLink + "|" + session.feedback, "false|false|null")
+    check("an eligible folder row still lights", target.enter("", ["file:///x/a.txt"], "", "", Qt.CopyAction), true)
+    check("on the hovered row with the offered verb", session.dropIndex + "|" + session.dragCopy, "2|true")
+    session.dropIndex = 2
+    session.dragCopy = true
+    check("a refused drop says the sentence",
+          target.refuseDrop(marker, selfUrls, "", ""), "That folder is inside the drag.")
+    check("and darkens the row it had lit", session.dropIndex, -1)
+    check("and disarms the verb", session.dragCopy + "|" + session.dragLink, "false|false")
+    session.dropIndex = 2
+    check("an eligible drop refuses nothing and keeps the row lit",
+          target.refuseDrop("", ["file:///x/a.txt"], "", "") + "|" + session.dropIndex, "|2")
+    check("a refused drop takes nothing",
+          target.dropped(marker, selfUrls, "", "", Qt.CopyAction), false)
+    check("and leaves the row dark", session.dropIndex, -1)
+    at.parent.destroy()
+}
+
+// A hover-open swaps the lit delegate onto another row: the drop uses the recorded folder, never the reused row's path.
+function reusedRowAfterHoverOpen(check) {
+    var reused = [{ n: "p2.txt", d: false }, { n: "2024", d: true }]
+    for (var i = 0; i < reused.length; i++) {
+        var at = Fixture.scene(7)
+        var tag = reused[i].d ? "reused folder row" : "reused file row"
+        at.target.row = { n: "Photos", d: true }
+        check("hovering a folder takes the drop", at.target.enter("", ["file:///x/a.txt"], "", "", Qt.CopyAction), true)
+        check("and records the hovered folder", at.session.dropDest, "/d/Photos")
+        at.pane.path = "/d/Photos"
+        at.target.row = reused[i]
+        var before = at.backend.sent.length
+        check("a drop on the " + tag + " still takes", at.target.dropped("", ["file:///x/a.txt"], "", "", Qt.CopyAction), true)
+        var sent = at.backend.sent.slice(before)
+        check("and sends one question from the " + tag, sent.length, 1)
+        check("into the hovered folder from the " + tag, sent.length > 0 ? sent[0].dest : "", "/d/Photos")
+        at.parent.destroy()
+    }
+}
+
+// A watcher re-read landing while a menu action waits loses the rename: the
+// reply is refused when menuSelectionIdentity flips. busy must hold it back.
+function busyMenu(check) {
+    var at = Fixture.scene(7)
+    var p = at.pane
+    check("a pane at rest holds no watched re-read back for a menu either", Anchor.busy(p), false)
+    p.menuActions.pendingAction = "rename"
+    check("a pending menu action holds the watched re-read", Anchor.busy(p), true)
+    p.menuActions.pendingAction = ""
+    p.menuActions.pendingActivation = true
+    check("a pending menu activation holds the watched re-read", Anchor.busy(p), true)
+    p.menuActions.pendingActivation = false
+    check("a settled menu frees the watched re-read", Anchor.busy(p), false)
+    at.parent.destroy()
 }
 
 // ui/CollideHost.qml onFailed clears the wait only for the production refusal shape: the Backend

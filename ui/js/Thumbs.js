@@ -57,6 +57,15 @@ function forget(state, row) {
     }
 }
 
+// A miss on a generating class returns to unasked; on a cache-only class it stays a miss.
+function miss(state, row, generating, cap) {
+    if (generating === true) {
+        forget(state, row)
+        return { file: state.file, order: state.order }
+    }
+    return remember(state, row, "", cap)
+}
+
 // The wrapper is new so a QML binding on it re-evaluates; the map inside is mutated in place.
 function applied(state, work) {
     for (var i = 0; i < work.drop.length; i++) {
@@ -68,6 +77,26 @@ function applied(state, work) {
         state.order.push(work.ask[j])
     }
     return { file: state.file, order: state.order }
+}
+
+// A live answer re-lists some rows: each finished thumbnail follows its row, by name, to that row's new index. Asked and missed rows do not follow.
+function carried(state, oldRows, oldHeld, newRows, newHeld) {
+    var at = Object.create(null)
+    for (var j = 0; j < newRows.length; j++) {
+        if (newRows[j].t) {
+            at[newRows[j].n] = newHeld + j
+        }
+    }
+    var next = empty()
+    for (var k = 0; k < state.order.length; k++) {
+        var file = state.file[state.order[k]]
+        var row = oldRows[state.order[k] - oldHeld]
+        if (file && file !== CACHE_ASKED && file !== CACHE_MISS && row && at[row.n] !== undefined) {
+            next.file[at[row.n]] = file
+            next.order.push(at[row.n])
+        }
+    }
+    return next
 }
 
 // The cap bounds a policy bug, not normal use: only the rows a viewport held are ever recorded.
@@ -99,7 +128,7 @@ function refused(state, row) {
 var CACHE_SIZE = 256
 
 // How much a picture may be enlarged to fit its box, and never past limit: 1 for an original, which
-// draws at its own size when it is smaller than the box (GM, 2026-09-24). Sample input: (754, 471, 120, 68, 1) is 1.
+// draws at its own size when it is smaller than the box (decided 2026-09-24). Sample input: (754, 471, 120, 68, 1) is 1.
 function fitScale(boxWidth, boxHeight, width, height, limit) {
     return Math.min(limit, boxWidth / Math.max(1, width), boxHeight / Math.max(1, height))
 }
@@ -115,8 +144,15 @@ function thumbLimit(thumbWidth, thumbHeight, originalWidth, originalHeight) {
     return thumbLongest < CACHE_SIZE ? 1 : Infinity
 }
 
-// Backend icon identity distinguishes image thumbnails from video without opening any extra file.
+// A video poster fills the frame; an image keeps the never-enlarge cap.
+function posterLimit(isVideo, thumbWidth, thumbHeight, originalWidth, originalHeight) {
+    if (isVideo)
+        return Infinity
+    return thumbLimit(thumbWidth, thumbHeight, originalWidth, originalHeight)
+}
+
+// Backend icon identity distinguishes image thumbnails from video without opening any extra file; an AppImage's own icon is its identity, so Images draws a row the backend flagged a.
 function allowed(row, mode) {
     if (!row || !row.t || mode === "off") return false
-    return mode !== "images" || row.i === "image-x-generic"
+    return mode !== "images" || row.i === "image-x-generic" || row.a === true
 }

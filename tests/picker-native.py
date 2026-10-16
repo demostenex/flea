@@ -25,6 +25,11 @@ OBJECT = "/org/freedesktop/portal/desktop"
 DEADLINE = 20
 # A refused sort draws nothing to wait for, and a key that lands later still changes the order the next Back checks.
 NO_EVENT_WAIT_S = 0.5
+# Hyprland reports a window's goal geometry while it still animates there, so a capture shoots until a shot repeats.
+SETTLE_SHOT_INTERVAL_S = 0.1
+SETTLE_MAX_SHOTS = 10
+# A moving window never repeats a shot and a caret only alternates two, so a still window matches by its third shot whatever a shot costs.
+SETTLE_MEMORY_SHOTS = 2
 checks = 0
 processes = []
 current = None
@@ -121,7 +126,7 @@ def check_build_inputs():
         check("dep-info from a checkout nested in the tree is a foreign binary", build_inputs(binary, repo)[1] == "another tree")
 
 def run(args, env=None):
-    return subprocess.run([str(arg) for arg in args], env=env, text=True, capture_output=True, check=True, timeout=30).stdout.strip()
+    return subprocess.run([str(arg) for arg in args], env=env, text=True, capture_output=True, check=True, timeout=30, close_fds=True).stdout.strip()
 
 
 def check(label, condition, observed=None):
@@ -156,6 +161,17 @@ def drive(*args):
     return run(["omarchy-drive", *args], drive_env)
 
 
+def settled_picture(name, shoot, sleep=time.sleep):
+    recent = []
+    for _ in range(SETTLE_MAX_SHOTS):
+        picture = shoot()
+        if picture in recent:
+            return picture
+        recent = (recent + [picture])[-SETTLE_MEMORY_SHOTS:]
+        sleep(SETTLE_SHOT_INTERVAL_S)
+    raise AssertionError(f"{name}: the picture kept changing across {SETTLE_MAX_SHOTS} shots")
+
+
 def windows():
     # The normalized driver payload omits PID; Hyprland supplies the process identity used before every mutation.
     result = json.loads(run(["hyprctl", "clients", "-j"], drive_env))
@@ -183,7 +199,7 @@ def move(source, target):
 
 def start(args, name, environment):
     log = guard(root / f"{name}.log").open("w")
-    child = subprocess.Popen([str(arg) for arg in args], env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    child = subprocess.Popen([str(arg) for arg in args], env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     log.close()
     processes.append(child)
     return child
@@ -253,12 +269,13 @@ class Request:
             raise AssertionError("cannot identify owned picker for resize")
         if not found[0]["floating"]:
             drive("window", "float", self.title)
-        answer = run(["hyprctl", "dispatch", f'hl.dsp.window.resize({{ x = {width}, y = {height}, exact = true, window = "address:{found[0]["address"]}" }})'], drive_env)
+        answer = run(["bash", REPO / "tests/lib/hypr-dispatch.sh", "window_resize", found[0]["address"], width, height], drive_env)
         check(f"{self.name}: compositor accepted resize", answer.strip() == "ok", answer)
         drive("window", "center", self.title)
         self.until(f"viewport {width}x{height}", lambda state: state["width"] == width and state["height"] == height)
 
     def state(self):
+        # One reader answers path, field flag and Jump together, so a poll reads one instant.
         return json.loads(run(["qs", "ipc", "--pid", self.pid, "call", "fleapicker", "snapshot"], picker_env))
 
     def window(self):
@@ -343,10 +360,19 @@ class Request:
 
     def capture(self, label):
         self.window()
+        # An empty folder draws its hero beats after the listing is ready, so the shot waits for the rest first.
+        if self.state()["emptyHero"]:
+            self.until("empty hero is at rest", lambda state: state["emptyRest"])
         output = guard(root / f"{self.name}-{label}.png")
         if output.exists():
             raise AssertionError(f"screenshot would reuse {output}")
-        drive("shot", output, self.title)
+        scratch = guard(root / f"{self.name}-{label}.settling.png")
+        def shoot():
+            scratch.unlink(missing_ok=True)
+            drive("shot", scratch, self.title)
+            return scratch.read_bytes()
+        settled_picture(f"{self.name}-{label}", shoot)
+        move(scratch, output)
         check(f"{self.name}: fresh native screenshot", output.is_file() and output.stat().st_size > 0, str(output))
         write(root / f"{self.name}-{label}.json", json.dumps(self.state()))
 
@@ -370,23 +396,27 @@ class Request:
 
 def test_single():
     single = Request("SP01-single").opened()
-    check("SP01 zero checked Open disabled", not single.state()["canAccept"], single.state())
-    single.row("alpha.txt")
-    single.key("-k", "Return")
-    check("SP01 zero checked Enter stays open", single.result is None and single.state()["marks"] == [])
-    single.mark("alpha.txt")
-    single.mark("beta.txt")
-    single.until("single mark replaced", lambda state: [mark["path"] for mark in state["marks"]] == [str(fixture / "beta.txt")])
     single.row("folder")
+    state = single.state()
+    check("SP01 folder cursor disables Open", not state["canAccept"] and not single.control("Open")["enabled"], state)
+    check("SP01 one-file hints advertise cursor choice", state["hints"] == "Enter open · Esc cancel", state["hints"])
     single.key("-k", "Return")
-    single.until("Enter navigated", lambda state: state["path"] == str(fixture / "folder"))
+    single.until("Enter navigated", lambda state: state["path"] == str(fixture / "folder") and state["state"] != "loading")
     single.click("Back")
-    single.until("Back retained mark and restored listing focus", lambda state: state["path"] == str(fixture)
-                 and len(state["marks"]) == 1 and state["listFocus"])
-    single.capture("checked")
+    single.until("Back restored listing focus without marks", lambda state: state["path"] == str(fixture)
+                 and state["state"] == "ready" and state["marks"] == [] and state["listFocus"])
     single.row("alpha.txt")
+    state = single.state()
+    check("SP01 file cursor enables Open without marks", state["canAccept"] and state["marks"] == []
+          and single.control("Open")["enabled"], state)
+    single.key("-k", "space")
+    time.sleep(NO_EVENT_WAIT_S)
+    state = single.state()
+    check("SP01 Space leaves cursor choice unmarked", state["marks"] == [] and not state["marksBusy"]
+          and state["cursorName"] == "alpha.txt" and state["canAccept"] and single.result is None, state)
+    single.capture("cursor-choice")
     single.key("-k", "Return")
-    single.answered(0, [(fixture / "beta.txt").as_uri()])
+    single.answered(0, [(fixture / "alpha.txt").as_uri()])
 
 
 def test_multiple():
@@ -407,7 +437,7 @@ def test_multiple():
 
 
 def test_directory():
-    directory = Request("SP03-directory", directory=GLib.Variant("b", True)).opened()
+    directory = Request("SP03-directory", directory=GLib.Variant("b", True), multiple=GLib.Variant("b", True)).opened()
     directory.mark("folder")
     directory.key("-k", "Return")
     directory.until("marked directory navigated", lambda state: state["path"] == str(fixture / "folder"))
@@ -422,19 +452,26 @@ def test_filters():
     filters = [("Images", [(0, "*.png")]), ("Text", [(1, "text/plain")])]
     filtered = Request("SP04-filters", folder=large, filters=GLib.Variant("a(sa(us))", filters), current_filter=GLib.Variant("(sa(us))", filters[0])).opened()
     filtered.until("glob reaches beyond original window", lambda state: state["total"] == 1 and state["cursorName"] == "zz-last.png")
-    filtered.click("Text")
-    filtered.until("MIME filter applies", lambda state: state["total"] == 150)
-    filtered.click("All files")
-    filtered.until("All files restores listing", lambda state: state["total"] == 151)
-    check("SP04 filter chip owns focus", filtered.control("All files")["focused"])
+    # The filter is a dropdown in the answer row: Return opens its menu on the current filter, Down moves, Return chooses.
+    filtered.focus_control("Filter")
+    for step, total in (("MIME filter applies", 150), ("All files restores listing", 151)):
+        filtered.key("-k", "Return")
+        filtered.key("-k", "Down")
+        filtered.key("-k", "Return")
+        filtered.until(step, lambda state, total=total: state["total"] == total)
+    check("SP04 filter trigger owns focus", filtered.control("Filter")["focused"])
+    # Tab runs top to bottom, left to right: chrome, rail, listing, then the answer row's Filter, Cancel, Open, and round to the chrome again.
+    live = {item["name"]: item["enabled"] for item in filtered.state()["controls"]}
+    for name in [name for name in ("Cancel", "Open", "Back", "Parent folder") if live[name]]:
+        filtered.key("-k", "Tab")
+        filtered.until(f"Tab reaches {name}", lambda state, name=name: any(item["name"] == name and item["focused"] for item in state["controls"]))
     filtered.key("-k", "Tab")
-    filtered.until("Tab leaves filters for rail", lambda state: state["railFocus"])
+    filtered.until("Tab reaches the rail", lambda state: state["railFocus"])
     filtered.key("-k", "Tab")
     filtered.until("Tab enters listing", lambda state: state["listFocus"])
     filtered.key("-k", "End")
     filtered.until("last window loads", lambda state: state["cursor"] == 150 and state["held"] > 0 and state["cursorName"] == "zz-last.png")
-    filtered.key("-k", "space")
-    filtered.until("last window checked", lambda state: not state["marksBusy"] and len(state["marks"]) == 1)
+    filtered.until("last window cursor choice enables Open without marks", lambda state: state["canAccept"] and state["marks"] == [])
     filtered.click("Open")
     result = filtered.answered(0, [(large / "zz-last.png").as_uri()])
     check("SP04 selected filter returned", result["results"].get("current_filter") == ("All files", [(0, "*")]), result)
@@ -452,7 +489,7 @@ def test_changed():
     changed.capture("changed-identity")
     changed.cancel()
 
-    missing = Request("SP05-missing").opened()
+    missing = Request("SP05-missing", multiple=GLib.Variant("b", True)).opened()
     missing.mark("beta.txt")
     move(fixture / "beta.txt", fixture / "beta-retained")
     missing.click("Open")
@@ -461,7 +498,7 @@ def test_changed():
     move(fixture / "beta-retained", fixture / "beta.txt")
 
     guard(fixture / "linked-folder").symlink_to(fixture / "folder")
-    linked = Request("SP05-directory-link", directory=GLib.Variant("b", True)).opened()
+    linked = Request("SP05-directory-link", directory=GLib.Variant("b", True), multiple=GLib.Variant("b", True)).opened()
     linked.mark("linked-folder")
     linked.click("Choose folder")
     linked.answered(0, [(fixture / "linked-folder").as_uri()])
@@ -475,7 +512,7 @@ def test_changed():
 
 def test_save():
     directory = Request("SP06-save-directory", "SaveFile", current_name=GLib.Variant("s", "folder")).opened()
-    directory.until("directory is not offered as a replaceable file", lambda state: not state["canAccept"] and not state["collision"] and "is a directory" in state["saveError"])
+    directory.until("directory is not offered as a replaceable file", lambda state: not state["canAccept"] and not state["collision"] and "A folder has this name; choose another name." in state["saveError"])
     directory.cancel()
     save = Request("SP06-save", "SaveFile", current_file=GLib.Variant("ay", os.fsencode(large / "zz-last.png") + b"\0")).opened()
     save.until("current_file collision outside initial window", lambda state: state["saveReady"] and state["collision"] and state["saveName"] == "zz-last.png")
@@ -485,9 +522,11 @@ def test_save():
     save.key("-M", "ctrl", "-k", "a", "-m", "ctrl", "zz-last.png")
     save.until("collision review restored", lambda state: state["saveReady"] and state["collision"])
     save.key("-k", "Return")
-    save.until("collision Enter focuses Cancel", lambda state: any(control["name"] == "Cancel" and control["focused"] for control in state["controls"]))
+    save.until("collision Enter returns to Filename and the answer reads Replace", lambda state: state["collisionReview"]
+                and any(control["name"] == "Filename" and control["focused"] for control in state["controls"])
+                and any(control["name"] == "Replace" for control in state["controls"]))
     save.capture("collision")
-    save.click("Use this location")
+    save.click("Replace")
     save.answered(0, [(large / "zz-last.png").as_uri()])
     check("SP07 picker did not overwrite", (large / "zz-last.png").read_text() == "image")
     write(large / "zz-last.png", "caller write")
@@ -498,6 +537,29 @@ def test_save():
     absent.click("Save")
     absent.answered(0, [(fixture / "new.txt").as_uri()])
     check("SP07 SaveFile created nothing", not (fixture / "new.txt").exists())
+
+
+def test_savefocus():
+    saving = Request("SP07-save-focus", "SaveFile", current_name=GLib.Variant("s", "report.pdf")).opened()
+    before = saving.until("fresh save ready with a folder first", lambda state: state["saveReady"]
+                          and state["rows"] and state["rows"][0]["n"] == "folder")
+    check("fresh save focuses Filename and leaves the listing unfocused",
+          any(item["name"] == "Filename" and item["focused"] for item in before["controls"])
+          and not before["listFocus"] and not before["gridFocus"], before)
+    saving.capture("fresh")
+    saving.key("-k", "Return")
+    saving.answered(0, [(fixture / "report.pdf").as_uri()])
+    check("fresh Enter records the caller reply without creating a file",
+          (root / "response-SP07-save-focus.json").is_file() and not (fixture / "report.pdf").exists())
+
+    moved = Request("SP07-save-focus-up", "SaveFile", folder=fixture / "folder",
+                    current_name=GLib.Variant("s", "report.pdf")).opened()
+    moved.until("initial save destination ready", lambda state: state["saveReady"])
+    moved.click("Parent folder")
+    moved.until("pointer Up returns Filename focus in the shown folder", lambda state: state["path"] == str(fixture)
+                and state["saveReady"] and any(item["name"] == "Filename" and item["focused"] for item in state["controls"]))
+    moved.key("-k", "Return")
+    moved.answered(0, [(fixture / "report.pdf").as_uri()])
 
 
 def test_cancel():
@@ -520,23 +582,23 @@ def test_failure():
     denied.row(target.name)
     guard(parent).chmod(0)
     try:
-        denied.key("-k", "space")
-        expected = f"Could not inspect {target}: permission denied"
+        denied.key("-k", "Return")
+        expected = f"Could not inspect {target}: permission denied."
         refused = denied.until("kernel permission refusal is plain and retains the picker", lambda state:
                                not state["marksBusy"] and state["messageError"] and state["message"] == expected)
-        check("refused selection has no accepted URI", not refused["marks"] and not refused["canAccept"], refused["marks"])
+        check("refused cursor choice has no accepted URI", not refused["marks"] and denied.result is None, refused["marks"])
         denied.capture("permission-denied")
     finally:
         guard(parent).chmod(0o700)
-    denied.mark(target.name)
-    denied.until("restored permissions allow the same item", lambda state: state["canAccept"] and len(state["marks"]) == 1)
-    denied.click("Open")
+    denied.row(target.name)
+    denied.until("restored cursor choice enables Open without marks", lambda state: state["canAccept"] and state["marks"] == [])
+    denied.key("-k", "Return")
     denied.answered(0, [target.as_uri()])
     check("permission recovery keeps the original file contents", target.read_text() == "retained picker contents")
 
     for mode in ["open", "save"]:
         lost = Request(f"SP09-backend-{mode}", "SaveFile" if mode == "save" else "OpenFile",
-                       **({"current_name": GLib.Variant("s", "draft.txt")} if mode == "save" else {})).opened()
+                       **({"current_name": GLib.Variant("s", "draft.txt")} if mode == "save" else {"multiple": GLib.Variant("b", True)})).opened()
         if mode == "open": lost.mark("alpha.txt")
         else: lost.until("draft reviewed before backend loss", lambda state: state["saveReady"])
         before = lost.state()
@@ -563,6 +625,8 @@ def test_failure():
         check("backend loss advertises only cancellation", after["hints"] == "Esc cancel", after["hints"])
         check("backend loss keeps enabled Cancel focused", any(
             control["name"] == "Cancel" and control["focused"] and control["enabled"] for control in after["controls"]), after["controls"])
+        held = lost.until("a lost listing worker keeps the rows and draws no empty hero", lambda state: state["listingFailed"] and state["total"] > 0 and not state["emptyHero"])
+        check("backend loss draws no empty hero over retained rows", held["rows"] and not held["emptyHero"], held["emptyHero"])
         lost.capture("unavailable")
         if mode == "open": lost.key("-k", "Escape")
         else: lost.click("Cancel")
@@ -607,49 +671,27 @@ def test_keys():
     for size in [9, 10, 11, 12, 14, 16, 20]:
         write(state_file, json.dumps({"display": {"textSize": {"mode": size}}}))
         small = Request(f"SP10-size-{size}", "SaveFile", current_name=GLib.Variant("s", "beta.txt")).opened()
-        small.until("collision review ready", lambda state: state["saveReady"] and state["collision"])
+        small.until("save ready", lambda state: state["saveReady"] and state["collision"])
         small.resize(420, 280)
         state = small.state()
         check(f"SP10 size {size} listing remains inside viewport", state["geometry"]["list"] >= 0 and state["geometry"]["save"] >= 0, state["geometry"])
         small.capture("small")
-        initial_scroll = state["geometry"]["saveScroll"]
-        use_bounds = small.control("Use this location")["bounds"]
-        viewport = state["geometry"]["saveViewport"]
-        lower_clipped = use_bounds[1] + use_bounds[3] > viewport[1] + viewport[3]
         small.focus_control("Filename")
         small.revealed("Filename")
-        small.focus_control("Output URI")
-        small.revealed("Output URI")
-        small.key("-k", "End")
-        uri = small.until("End reveals the Output URI tail", lambda state: state["outputUri"]["offset"] == state["outputUri"]["maximum"])
-        check(f"SP10 size {size} Output URI identity unchanged", uri["outputUri"]["text"] == (fixture / "beta.txt").as_uri(), uri["outputUri"])
-        small.capture("uri-end")
-        small.key("-k", "Home")
-        small.until("Home restores the Output URI prefix", lambda state: state["outputUri"]["offset"] == 0)
-        if uri["outputUri"]["maximum"] > 0:
-            small.key("-k", "Right")
-            small.until("Right pans the Output URI", lambda state: 0 < state["outputUri"]["offset"] <= state["outputUri"]["maximum"])
-            small.key("-k", "Left")
-            small.until("Left restores the Output URI prefix", lambda state: state["outputUri"]["offset"] == 0)
-            small.click("Output URI")
-            small.until("pointer focuses Output URI", lambda state: small.control("Output URI")["focused"])
-            small.window()
-            drive("scroll", "right", "1")
-            small.until("horizontal wheel pans Output URI", lambda state: state["outputUri"]["offset"] > 0)
-            small.key("-k", "Home")
-            small.until("Home restores URI after wheel input", lambda state: state["outputUri"]["offset"] == 0)
-        small.focus_control("Cancel")
-        small.revealed("Cancel")
-        small.focus_control("Use this location")
-        revealed = small.revealed("Use this location")
-        if lower_clipped:
-            check(f"SP10 size {size} native focus scrolls clipped collision controls into view",
-                  revealed["geometry"]["saveScroll"] > initial_scroll, [initial_scroll, revealed["geometry"]["saveScroll"]])
+        small.key("-k", "Return")
+        small.until("collision review ready", lambda state: state["collisionReview"] and any(control["name"] == "Replace" for control in state["controls"]))
+        small.revealed("Filename")
         small.capture("collision-focus")
-        for target in ["Cancel", "Output URI", "Filename"]:
+        for target in ["Cancel", "Replace"]:
+            state = small.focus_control(target)
+            x, y, width, height = small.control(target)["bounds"]
+            check(f"SP10 size {size} focused {target} is fully inside the window above the footer",
+                  0 <= x and 0 <= y and x + width <= state["width"]
+                  and y + height <= state["height"] - state["geometry"]["footer"], state["geometry"])
+        for target in ["Cancel", "Filename"]:
             small.key("-M", "shift", "-k", "Tab", "-m", "shift")
             small.until(f"Shift Tab restores {target}", lambda state: small.control(target)["focused"])
-            small.revealed(target)
+        small.revealed("Filename")
         small.cancel()
 
 
@@ -657,7 +699,31 @@ def names(state):
     return [row["n"] for row in state["rows"]]
 
 
+# None while the window has not written ui.json yet, or while the write is half done.
+def ui_json():
+    try:
+        return json.loads(state_file.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+# SCHEMA's top-level keys as src/uischema.rs spells them; a parse that finds no entries or an unknown constant raises.
+# Sample input: 'pub const SCHEMA: &[(&str, Rule)] = &[', then '    ("view", Rule::Word(&["list", "columns", "grid", "dual"])),' and '    (STATE_VERSION, Rule::Version),', with 'pub const STATE_VERSION: &str = "stateVersion";'
+def schema_top_keys(source=REPO / "src/uischema.rs"):
+    text = source.read_text()
+    block = re.search(r"pub const SCHEMA: &\[\(&str, Rule\)\] = &\[\n(.*?)\n\];", text, re.S)
+    if block is None:
+        raise AssertionError(f"SCHEMA block not found in {source}")
+    body = block.group(1)
+    constants = dict(re.findall(r'pub const (\w+): &str = "([^"]*)";', text))
+    entries = re.findall(r'^    \((?:"([^"]+)"|([A-Z_]+)),', body, re.M)
+    if not entries or len(entries) != len(re.findall(r"^    \(", body, re.M)):
+        raise AssertionError(f"SCHEMA entry not parsed in {source}")
+    return {literal or constants[name] for literal, name in entries}
+
+
 def test_sorting():
+    schema_keys = schema_top_keys()
     # The fixture's name, size, modified and kind orders all differ, so a marked order over other rows is caught by names.
     ordered = guard(root / "ordered")
     for directory in [ordered, ordered / "folder", ordered / "refused"]:
@@ -672,7 +738,8 @@ def test_sorting():
     by_modified = ["folder", "refused", "photo.png", "bravo.txt", "charlie.txt", "alpha.txt"]
     by_modified_shown = by_modified + [".dot.txt"]
     by_kind = ["folder", "refused", "photo.png", "alpha.txt", "bravo.txt", "charlie.txt"]
-    saved = json.dumps({"sort": {"key": "kind", "reverse": False}})
+    # updates.autoCheck is seeded off, a nested value the picker never writes, so the first write must keep it.
+    saved = json.dumps({"sort": {"key": "kind", "reverse": False}, "updates": {"autoCheck": False}})
     write(state_file, saved)
     # Recent's newest-first order matches none of the fixture's sort orders, so a Recent that sorts is caught.
     recent_order = ["bravo.txt", "alpha.txt", "photo.png", "charlie.txt"]
@@ -690,6 +757,19 @@ def test_sorting():
     reverse_kind = ["refused", "folder", "charlie.txt", "bravo.txt", "alpha.txt", "photo.png"]
     sorting.until("S reverses an inherited kind order", lambda state: state["sortBy"] == "kind" and state["sortDesc"]
                   and state["state"] == "ready" and names(state) == reverse_kind)
+    # The first sort fills every shipped default into ui.json (src/uistate.rs patched), so the expectation starts from that whole file.
+    def first_sort_written():
+        saved_file = ui_json()
+        if saved_file is not None and saved_file.get("sort") == {"key": "kind", "reverse": True} and "folderSorts" in saved_file:
+            return saved_file
+        return None
+    first_write = wait("SP11 the first sort lands in ui.json", first_sort_written)
+    # Wrong default values are pinned by src/uistate.rs unit tests on patched, so this checks the seeded value and the key set.
+    check("SP11 the first write keeps the seeded nested value", first_write.get("updates", {}).get("autoCheck") is False, first_write)
+    check("SP11 the first write's sort is kind, descending", first_write.get("sort") == {"key": "kind", "reverse": True}, first_write)
+    check("SP11 the first write's folderSorts is exactly this folder's kind order",
+          first_write.get("folderSorts") == {str(ordered): {"key": "kind", "reverse": True}}, first_write)
+    check("SP11 the first write holds exactly SCHEMA's top-level keys", set(first_write) == schema_keys, first_write)
     sorting.key("s")
     sorting.until("s leaves kind for name", lambda state: state["sortBy"] == "name" and not state["sortDesc"] and names(state) == by_name)
     sorting.key("s")
@@ -753,9 +833,11 @@ def test_sorting():
     sorting.capture("recent")
     sorting.click("Back")
     sorting.until("leaving Recent restores the chosen order", lambda state: state["path"] == str(ordered) and names(state) == by_modified)
-    check("SP11 ui.json is byte for byte what the window saved", state_file.read_text() == saved, state_file.read_text())
+    # a3c7508f6: every sort writes the sort leaf and its folder's entry over the first write's whole file, and nothing else.
+    expected = {**first_write, "sort": {"key": "date", "reverse": False}, "folderSorts": {str(ordered): {"key": "date", "reverse": False}}}
+    check("SP11 ui.json holds the last sort and the folder's remembered order, nothing else", json.loads(state_file.read_text()) == expected, state_file.read_text())
     guard(root / "data/recently-used.xbel").unlink()
-    # The two requests below start from name, the order a box with nothing saved opens in.
+    # SP12 below starts from name, the order a box with nothing saved opens in.
     guard(state_file).unlink()
     sorting.row("alpha.txt")
     sorting.key("-k", "Return")
@@ -781,9 +863,13 @@ def test_sorting():
 
     write(ordered / "report.txt", "taken")
     saving = Request("SP13-sorting-save", method="SaveFile", folder=ordered, current_name=GLib.Variant("s", "report.txt")).opened()
-    saving.until("the collision is reviewed", lambda state: state["saveReady"] and state["collision"])
+    # a3c7508f6: SP12's last sort is the default now, so the save opens on size descending and s steps to modified.
+    saving.until("the collision is reviewed", lambda state: state["saveReady"] and state["collision"] and state["state"] == "ready"
+                 and state["sortBy"] == "size" and state["sortDesc"])
+    saving.key("-M", "shift", "-k", "Tab", "-m", "shift")
+    saving.until("deliberate list focus before sorting", lambda state: state["listFocus"])
     saving.key("s")
-    saving.until("a sort keeps the filename and its collision answer", lambda state: state["sortBy"] == "size"
+    saving.until("a sort keeps the filename and its collision answer", lambda state: state["sortBy"] == "mtime" and not state["sortDesc"]
                  and state["state"] == "ready" and state["saveName"] == "report.txt" and state["saveReady"] and state["collision"])
     saving.focus_control("Filename")
     saving.key("-k", "End")
@@ -791,17 +877,257 @@ def test_sorting():
     saving.key("s")
     saving.key("S")
     typed = saving.until("s and S typed into Filename are text", lambda state: state["saveName"] == "report.txtsS")
-    check("SP13 typing in Filename sorts nothing", typed["sortBy"] == "size" and not typed["sortDesc"], typed)
+    check("SP13 typing in Filename sorts nothing", typed["sortBy"] == "mtime" and not typed["sortDesc"], typed)
     saving.cancel()
     guard(ordered / "report.txt").unlink()
+    # The groups after this one start from nothing saved, as they did before a picker sort was remembered.
+    guard(state_file).unlink(missing_ok=True)
+
+
+# Sample input: var MISSING_SENTENCE = "%1 does not exist or cannot be reached."
+def pathbar_sentence(constant):
+    text = (REPO / "ui/js/PathBar.js").read_text()
+    found = re.search(r'^var ' + constant + r' = "(.*)";?$', text, re.M)
+    if not found:
+        raise AssertionError(f"pathbar constant {constant} missing")
+    return found.group(1)
+
+
+def test_path():
+    siblings = guard(fixture / "sibs")
+    siblings.mkdir()
+    for name in ["proj-alpha", "proj-beta"]:
+        guard(siblings / name).mkdir()
+    write(siblings / "note.txt", "note")
+    leaf = guard(fixture / "deep")
+    for name in ["this-is-a-long-folder-name-1", "this-is-a-long-folder-name-2", "this-is-a-long-folder-name-3",
+                 "this-is-a-long-folder-name-4", "this-is-a-long-folder-name-5", "this-is-a-long-folder-name-6"]:
+        leaf = leaf / name
+    guard(leaf).mkdir(parents=True, exist_ok=True)
+    guard(root / "data/recently-used.xbel").unlink(missing_ok=True)
+    missing_sentence = pathbar_sentence("MISSING_SENTENCE")
+    filtered_sentence = pathbar_sentence("FILTERED_SENTENCE")
+    refused_sentence = pathbar_sentence("REFUSED_SENTENCE")
+
+    overflow = Request("SP14-overflow", folder=leaf).opened()
+    overflow.resize(840, 513)
+    overflow.until("deep path at the shipped window",
+                  lambda state: state["path"] == str(leaf) and state["width"] == 840 and state["height"] == 513)
+    overflow.capture("path-overflow")
+    overflow.cancel()
+
+    entry = Request("SP14-entry", folder=siblings).opened()
+    entry.resize(840, 513)
+    entry.key(":")
+    entry.until("colon opens the path field", lambda state: state["pathBarOpen"])
+    entry.key(str(siblings / "note.txt"))
+    entry.until("a typed file path stands in the open field and keeps the listing",
+                lambda state: state["pathBarOpen"] and state["pathFieldText"] == str(siblings / "note.txt") and state["path"] == str(siblings))
+    entry.capture("path-file")
+    entry.key("-k", "Escape")
+    entry.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+
+    entry.key(":")
+    entry.until("colon reopens the path field", lambda state: state["pathBarOpen"])
+    entry.key(str(siblings) + "/proj-")
+    entry.key("-k", "Tab")
+    completed = entry.until("Tab answers the shared prefix",
+                            lambda state: state["message"] == "2 items start with that" and not state["messageError"])
+    check("SP14 Tab completion says its line", completed["message"] == "2 items start with that", completed["message"])
+    entry.capture("path-tab-complete")
+    entry.key("-k", "Escape")
+    entry.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+
+    absent = fixture / "does-not-exist"
+    entry.key(":")
+    entry.until("colon reopens the path field", lambda state: state["pathBarOpen"])
+    entry.key(str(absent))
+    entry.key("-k", "Return")
+    missing = entry.until("a missing path is refused in the footer",
+                          lambda state: state["message"] == missing_sentence.replace("%1", str(absent)) and state["messageError"])
+    check("SP14 MISSING_SENTENCE refusal", missing["message"] == missing_sentence.replace("%1", str(absent)), missing["message"])
+    entry.capture("path-missing")
+    entry.key("-k", "Escape")
+    entry.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+
+    other = "file://another-host.example/shared/doc.txt"
+    entry.key(":")
+    entry.until("colon reopens the path field", lambda state: state["pathBarOpen"])
+    entry.key(other)
+    entry.key("-k", "Return")
+    refused = entry.until("another host is refused without error",
+                          lambda state: state["message"] == refused_sentence and not state["messageError"])
+    check("SP14 REFUSED_SENTENCE refusal", refused["message"] == refused_sentence, refused["message"])
+    entry.capture("path-other-host")
+    entry.key("-k", "Escape")
+    entry.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+    entry.cancel()
+
+    submit = Request("SP14-entry-submit", folder=siblings).opened()
+    # The cursor parks on a folder row, so only the typed path can answer the file URI.
+    submit.row("proj-alpha")
+    parked = submit.state()
+    check("SP14 entry-submit parks the cursor off the typed file", parked["cursorName"] == "proj-alpha", parked["cursorName"])
+    submit.key(":")
+    submit.until("colon opens the path field", lambda state: state["pathBarOpen"])
+    submit.key(str(siblings / "note.txt"))
+    submit.until("the typed file path stands in the open field",
+                lambda state: state["pathBarOpen"] and state["pathFieldText"] == str(siblings / "note.txt"))
+    submit.key("-k", "Return")
+    submit.answered(0, [(siblings / "note.txt").as_uri()])
+
+    pictures = [("Images", [(0, "*.png")])]
+    filtered = Request("SP14-filtered", folder=large, filters=GLib.Variant("a(sa(us))", pictures),
+                       current_filter=GLib.Variant("(sa(us))", pictures[0])).opened()
+    filtered.until("Images filter hides the text files", lambda state: state["total"] == 1)
+    filtered.resize(840, 513)
+    hidden = large / "file-007.txt"
+    filtered.key(":")
+    filtered.until("colon opens the path field", lambda state: state["pathBarOpen"])
+    filtered.key(str(hidden))
+    filtered.key("-k", "Return")
+    told = filtered.until("a filtered file is told apart in the footer",
+                          lambda state: state["message"] == filtered_sentence.replace("%1", hidden.name) and state["messageError"])
+    check("SP14 FILTERED_SENTENCE refusal", told["message"] == filtered_sentence.replace("%1", hidden.name), told["message"])
+    filtered.capture("path-filtered")
+    filtered.key("-k", "Escape")
+    filtered.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+    filtered.cancel()
+
+    recent = Request("SP14-recent").opened()
+    recent.click("Recent")
+    fresh = recent.until("Recent opens from the folder", lambda state: state["path"] == "flea:recent" and state["state"] != "loading")
+    back = [item for item in fresh["controls"] if item["name"] == "Back"]
+    up = [item for item in fresh["controls"] if item["name"].startswith("Parent folder")]
+    # Back returns to the folder the dialog opened on; only Up has nowhere to go in Recent.
+    check("SP14 Recent opened from a folder keeps Back live", len(back) == 1 and back[0]["enabled"], back)
+    check("SP14 Recent leaves Up dead", len(up) == 1 and not up[0]["enabled"], up)
+    recent.capture("path-recent-fresh")
+    recent.click("Back")
+    recent.until("Back from Recent returns to the folder the dialog opened on",
+                 lambda state: state["path"] == str(fixture) and state["state"] != "loading")
+    recent.cancel()
+
+    focus = Request("SP14-focus", folder=siblings).opened()
+    focus.key("-M", "ctrl", "-k", "l", "-m", "ctrl")
+    focus.until("Ctrl+L opens the path field", lambda state: state["pathBarOpen"])
+    centre = run(["qs", "ipc", "--pid", focus.pid, "call", "fleapicker", "rowCentre", 0], picker_env)
+    focus.point(centre)
+    focus.until("a row tap moves focus out and closes the field", lambda state: not state["pathBarOpen"] and state["listFocus"])
+    focus.capture("path-focus-left")
+    focus.cancel()
+
+    jump_base = guard(fixture / "jump")
+    fav_names = [f"jump-fav-{index:02d}" for index in range(5)]
+    recent_names = [f"jump-recent-{index:02d}" for index in range(5)]
+    for name in fav_names + recent_names:
+        guard(jump_base / name).mkdir(parents=True, exist_ok=True)
+        write(jump_base / name / "note.txt", "note")
+    state_file = root / "state/flea/ui.json"
+    saved_state = state_file.read_text() if state_file.exists() else None
+    try:
+        try:
+            state_doc = json.loads(state_file.read_text())
+        except (OSError, ValueError):
+            state_doc = {}
+        if not isinstance(state_doc, dict):
+            state_doc = {}
+        places = dict(state_doc.get("places") or {})
+        places["favourites"] = [{"label": name, "path": str(jump_base / name)} for name in fav_names]
+        state_doc["places"] = places
+        write(state_file, json.dumps(state_doc))
+        bookmarks = "\n".join(
+            f'  <bookmark href="file://{jump_base / name}/note.txt" added="2026-09-22T10:00:0{index}Z"'
+            f' modified="2026-09-22T10:00:0{index}Z" visited="2026-09-22T10:00:0{index}Z"/>'
+            for index, name in enumerate(recent_names))
+        write(root / "data/recently-used.xbel",
+              f'<?xml version="1.0" encoding="UTF-8"?>\n<xbel version="1.0">\n{bookmarks}\n</xbel>\n')
+
+        jumper = Request("SP14-jump", folder=siblings).opened()
+        jumper.resize(840, 513)
+        jumper.key(":")
+        jumper.until("colon opens the path field", lambda state: state["pathBarOpen"])
+        jumper.key("jump")
+        jumper.until("Jump lists the seeded folders",
+                    lambda state: state["jump"]["open"] and state["jump"]["rows"] == 10
+                    and any("jump-fav-" in path for path in state["jump"]["paths"])
+                    and any("jump-recent-" in path for path in state["jump"]["paths"]))
+        jumper.capture("path-folder-jump")
+        jumper.resize(800, 280)
+        jumper.until("Jump overflows the short window",
+                    lambda state: state["jump"]["open"] and state["jump"]["rows"] > state["jump"]["visibleRows"])
+        scrolled = jumper.state()
+        for _ in range(scrolled["jump"]["rows"]):
+            jumper.key("-k", "Down")
+        jumper.until("a scrolled Jump leaves the top",
+                    lambda state: state["jump"]["open"] and state["jump"]["rows"] > state["jump"]["visibleRows"]
+                    and state["jump"]["contentY"] > 0)
+        jumper.capture("path-jump-scroll")
+        jumper.key("-k", "Escape")
+        jumper.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+        jumper.cancel()
+
+        grid = Request("SP14-grid", folder=siblings).opened()
+        grid.resize(840, 513)
+        grid.key("-M", "ctrl", "-k", "3", "-m", "ctrl")
+        grid.until("Ctrl+3 shows the grid", lambda state: state["view"] == "grid")
+        grid.key(":")
+        grid.until("colon opens the path field", lambda state: state["pathBarOpen"])
+        grid.key("jump")
+        grid.until("Jump lists in grid view",
+                  lambda state: state["view"] == "grid" and state["jump"]["open"] and state["jump"]["rows"] == 10
+                  and any("jump-fav-" in path for path in state["jump"]["paths"])
+                  and any("jump-recent-" in path for path in state["jump"]["paths"]))
+        grid.capture("path-jump-grid")
+        grid.key("-k", "Escape")
+        grid.until("Escape closes the path field", lambda state: not state["pathBarOpen"])
+        grid.cancel()
+    finally:
+        # The seeded places and Recent are this group's alone, so a group run after it opens on what it found, a failure included.
+        guard(root / "data/recently-used.xbel").unlink(missing_ok=True)
+        if saved_state is None:
+            guard(state_file).unlink(missing_ok=True)
+        else:
+            write(state_file, saved_state)
+
+
+# Sample input: FLEA_DISPLAY_LOCK_FD=9 names the runner's already locked open descriptor.
+def take_display_lock(runtime_dir):
+    raw = os.environ.get("FLEA_DISPLAY_LOCK_FD")
+    expected = Path(runtime_dir) / "flea-display.lock"
+    try:
+        if raw is None:
+            held = open(expected, "a")
+        else:
+            if re.fullmatch(r"[0-9]+", raw) is None:
+                raise ValueError("expected a decimal open fd")
+            held = os.fdopen(os.dup(int(raw)), "a")
+        try:
+            if raw is not None:
+                inherited = os.fstat(held.fileno())
+                runtime = expected.stat()
+                if (inherited.st_dev, inherited.st_ino) != (runtime.st_dev, runtime.st_ino):
+                    actual = os.readlink("/proc/self/fd/" + str(held.fileno()))
+                    raise ValueError("inherited descriptor " + raw + " (" + actual + ") is not " + str(expected))
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            held.close()
+            raise
+        return held
+    except (OSError, ValueError, OverflowError) as error:
+        message = "FAIL display lock FLEA_DISPLAY_LOCK_FD=" + repr(raw) + " expected " + str(expected) + ": " + str(error)
+        print(message, flush=True)
+        raise AssertionError(message) from error
 
 
 def main():
+    from picker_issue313_native import test_issue313
     groups = {"single": test_single, "multiple": test_multiple, "directory": test_directory,
               "filters": test_filters, "changed": test_changed, "save": test_save,
-              "cancel": test_cancel, "failure": test_failure, "keys": test_keys,
-              "sorting": test_sorting}
-    selected = sys.argv[1:] or list(groups)
+              "savefocus": test_savefocus, "cancel": test_cancel, "failure": test_failure, "keys": test_keys,
+              "sorting": test_sorting, "path": test_path}
+    groups["issue313"] = lambda: test_issue313(globals())
+    selected = sys.argv[1:] or [name for name in groups if name != "issue313"]
     for name in selected:
         if name not in groups:
             raise AssertionError("unknown picker group: " + name)
@@ -832,8 +1158,7 @@ try:
     check("strict input socket", drive_env["YDOTOOL_SOCKET"] == drive_env["XDG_RUNTIME_DIR"] + "/.ydotool_socket")
     check("strict OEM path", drive_env["OMARCHY_PATH"] == "/usr/share/omarchy")
     check("native accessibility enabled", drive_env["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] == "1")
-    display_lock = open(Path(drive_env["XDG_RUNTIME_DIR"]) / "flea-display.lock", "a")
-    fcntl.flock(display_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    display_lock = take_display_lock(drive_env["XDG_RUNTIME_DIR"])
     if not drive_env.get("QT_QPA_PLATFORMTHEME"):
         session = run(["systemctl", "--user", "show-environment"], drive_env)
         for line in session.splitlines():
@@ -871,7 +1196,7 @@ try:
     write(root / "portals/flea.portal", "[portal]\nDBusName=org.freedesktop.impl.portal.desktop.flea\nInterfaces=org.freedesktop.impl.portal.FileChooser;\n")
     write(root / "portals/portals.conf", "[preferred]\norg.freedesktop.impl.portal.FileChooser=flea\n")
     picker_env["XDG_DESKTOP_PORTAL_DIR"] = str(root / "portals")
-    daemon = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"], env=picker_env, stdout=subprocess.PIPE, stderr=guard(root / "bus.log").open("w"), text=True, start_new_session=True)
+    daemon = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"], env=picker_env, stdout=subprocess.PIPE, stderr=guard(root / "bus.log").open("w"), text=True, start_new_session=True, close_fds=True)
     processes.append(daemon)
     address = daemon.stdout.readline().strip()
     check("private bus address", address.startswith("unix:"), address)
@@ -899,4 +1224,4 @@ finally:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-    # Evidence and its marker deliberately remain for controller inspection and candidate attribution.
+    # Evidence and its marker deliberately remain for maintainer inspection and candidate attribution.

@@ -2,6 +2,8 @@ import QtQuick
 import Quickshell.Io
 import qs.Commons
 import "js/Tabs.js" as Tabs
+import "js/Search.js" as Search
+// ControlReader.js loads with IpcControls.qml on the first cohesionControls call, never with the first frame.
 
 // The seam the tests drive, see AGENTS.md "Testing". Read-only: it reports, never acts.
 QtObject {
@@ -21,19 +23,58 @@ QtObject {
     property var shareBrowser: null
     property var emptyState: null
     property var permissionsDialog: null
+    property var archiveCards: null
+    property var unlockHost: null
+    property IpcMenuState menuProbe: IpcMenuState { pane: root.pane; fleaWindow: root.fleaWindow }
+    property IpcPreviewState previewReaders: IpcPreviewState {
+        fleaWindow: root.fleaWindow
+        pane: root.pane
+    }
+    property var bulkRenameDialog: null
     // Overlays and the columns view are built by their first open, see ui/shell.qml, so until then
     // each reader below answers the empty value its type has: "", false or -1, never a throw.
     readonly property var columns: root.pane ? root.pane.columnsArea : null
     function controlState(name, item) {
         return {name: name, visible: !!item && item.visible, enabled: !!item && item.enabled
-            && (item.available === undefined || item.available), focused: !!item && item.activeFocus,
-            centre: item ? root.fleaWindow.centreOf(item) : "", rect: item ? root.fleaWindow.rectOf(item) : ""}
+            && (item.available === undefined || item.available), focused: !!item && item.activeFocus, hovered: !!item && !!item.hovered,
+            pressed: !!item && !!item.pressed, centre: item ? root.fleaWindow.centreOf(item) : "", rect: item ? root.fleaWindow.rectOf(item) : ""}
+    }
+    // Which role a frame draws in, so a capture asserts the frame's colour without knowing the theme.
+    function roleOf(color) {
+        return Qt.colorEqual(color, Theme.color.error) ? "error" : Qt.colorEqual(color, Theme.color.accent) ? "accent" : Qt.colorEqual(color, Theme.color.mutedFrame) ? "mutedFrame" : Qt.colorEqual(color, Theme.color.muted) ? "muted" : "other"
+    }
+    // A dialog's rect at rest: the open fade lifts its card by a Translate for 180 ms, so a read in that window adds the rise back out.
+    function cardRectOf(item) {
+        var rect = root.fleaWindow.rectOf(item), rise = 0
+        for (var up = item; up; up = up.parent)
+            if (up.transform.length > 0) rise += up.transform[0].y
+        if (rect === "" || rise === 0) return rect
+        var edges = rect.split(" ")
+        edges[1] = String(Number(edges[1]) - Math.round(rise))
+        return edges.join(" ")
+    }
+    // The Trash row as the rail draws it: current is the lit place, not the keyboard cursor.
+    function trashRail() {
+        for (var index = 0; index < root.pane.railCount; index++) {
+            var row = root.pane.sidebar.railItemFor(index)
+            if (row && row.modelData.kind === "trash") return {current: row.lit, countText: row.detail}
+        }
+        return null
     }
     function confirmationState(item) {
         return item ? {opened: item.opened, token: item.snapshot.token || 0, count: item.snapshot.count || 0,
-            all: item.snapshot.all === true, destructiveFocus: item.destructiveFocus, title: item.titleText,
-            rect: root.fleaWindow.rectOf(item.cardItem), cancel: root.controlState("Cancel", item.cancelItem),
+            all: item.snapshot.all === true, destructiveFocus: item.destructiveFocus, title: item.titleText, body: item.bodyText,
+            rect: root.cardRectOf(item.cardItem), cancel: root.controlState("Cancel", item.cancelItem),
             danger: root.controlState("Delete", item.dangerItem)} : {opened: false}
+    }
+    function firstVisibleText(item) {
+        if (!item || !item.visible) return ""
+        if (typeof item.text === "string" && item.text.length > 0) return item.text
+        for (var i = 0; i < item.children.length; i++) {
+            var text = root.firstVisibleText(item.children[i])
+            if (text.length > 0) return text
+        }
+        return ""
     }
 
     // The wrapper holds the references because an IpcHandler marshals every property it owns.
@@ -41,11 +82,15 @@ QtObject {
         target: "flea"
         function ready(): bool { return true }
         function themeLoaded(): bool { return Theme.ready }
-        function themeForeground(): string { return String(Theme.color.foreground) }
+        // Sample output: 1100 800; the content the dialogs centre in, which ui-permissions.sh waits to equal hyprctl's size.
+        function windowSize(): string { var c = root.fleaWindow.contentItem; return Math.round(c.width) + " " + Math.round(c.height) }
+        function themeForeground(): string { return String(Theme.color.opaquePalette.foreground) }
+        // Sample output: {"clear":true,"alpha":0.3411764705882353,"window":"#00000000","early":true}; tests/glass-boot.sh reads the window the entry made.
+        function glass(): string { return JSON.stringify({ clear: Glass.clear, mode: Glass.mode, focused: Glass.focused, automatic: Glass.usesDefault, alpha: Glass.alpha, listAlpha: Glass.listAlpha, foreground: String(Theme.color.foreground), muted: String(Theme.color.muted), metadata: String(Theme.color.metadata), window: String(root.fleaWindow.color), early: root.fleaWindow.clearedEarly }) }
         function selectedFill(): string { return String(Style.selectedFill) }
         function palette(): string {
             var c = Theme.color;
-            return [c.background, c.surface, c.foreground, c.muted, c.accent, c.error, c.symlink, c.executable, c.accentFrame].join(" ");
+            return [c.background, c.surface, c.foreground, c.muted, c.accent, c.error, c.symlink, c.executable, c.accentFrame, c.mutedFrame].join(" ");
         }
         // The size running text really draws at, and a row name's own: the settings case pins both to the stop.
         function bodyPx(): int { return Theme.font.body }
@@ -61,7 +106,7 @@ QtObject {
             var item = root.pane.visibleItemFor(i)
             if (!item || !item.captionItem) return "{}"
             var caption = item.captionItem
-            return JSON.stringify({name: caption.text, lines: caption.lineCount, truncated: caption.truncated,
+            return JSON.stringify({name: caption.text, wrapAt: caption.text.indexOf("\n"), broken: !caption.truncated && caption.lineCount === caption.text.split("\n").length, lines: caption.lineCount, truncated: caption.truncated,
                 textHeight: caption.contentHeight, slotHeight: caption.height,
                 bottom: caption.y + caption.height, tileHeight: item.height})
         }
@@ -70,7 +115,10 @@ QtObject {
         function selectionCount(): int { return root.pane.selectionCount() }
         function favouritesSaving(): bool { return Favourites.busy || Favourites.operationActive }
         function selectedIndices(): string { return root.pane.selectedIndices().join(",") }
+        function fileClipboard(): string { return JSON.stringify(root.pane.clipboard) }
+        function rowClipMark(i: int): string { var row = root.pane.itemFor(i); return row ? row.clipMark : "unavailable" }
         function focusView(): string { return root.pane.focusView }
+        function focusStop(): string { var p = root.pane; return p.focusView === "chrome" ? "chrome:" + p.chromeBar.focusedGlyph : p.focusView === "strip" ? "strip:" + p.tabStrip.focusedIndex : p.focusView }
         function keyDeliveryState(): string {
             var pane = root.pane
             var window = pane.Window.window
@@ -82,15 +130,20 @@ QtObject {
                 paneFocus: pane.activeFocus, listFocus: pane.listArea.activeFocus,
                 activeFocusItem: window ? String(window.activeFocusItem) : "",
                 preview: {index: pane.previewIndex, focused: !!pane.previewColumnItem && pane.previewColumnItem.activeFocus},
-                history: {back: pane.history, forward: pane.forwardHistory}})
+                history: {back: pane.history.map(e => typeof e === "string" ? e : e.path), forward: pane.forwardHistory.map(e => typeof e === "string" ? e : e.path)}})
         }
         function visibleRowName(i: int): string {
             var item = root.pane.visibleItemFor(i)
             return item && item.visible && item.row ? item.row.n : ""
         }
+        // Sample output: 33252, the st_mode the held row carries, -1 for a row that is not drawn.
+        function visibleRowMode(i: int): int {
+            var item = root.pane.visibleItemFor(i)
+            return item && item.visible && item.row ? Number(item.row.p) : -1
+        }
         function railCursor(): int { return root.pane.railCursor }
         function railCount(): int { return root.pane.railCount }
-        function railState(): string { return JSON.stringify({hidden: root.pane.railHidden, width: root.pane.sidebarWidth, inset: root.pane.railInset, pane: root.pane.width}) }
+        function railState(): string { return JSON.stringify({hidden: root.pane.railHidden, width: root.pane.sidebarWidth, inset: root.pane.railInset, pane: root.pane.width, revealed: root.pane.railRevealed, x: root.pane.railX}) }
         function path(): string { return root.pane.path }
         function dualState(): string {
             return JSON.stringify({active: ViewState.state.view === "dual",
@@ -110,13 +163,13 @@ QtObject {
         function statusActivityState(): string {
             var card = root.bar.transferCard
             return JSON.stringify({activities: root.bar.activities.map(function(activity) {
-                var owner = activity.owner === root.bar.dragFeedbackOwner ? activity.owner.pane : activity.owner
+                var owner = activity.owner === root.bar.dragFeedbackOwner ? activity.owner.host : activity.owner
                 return {id: activity.transfer.id, text: activity.text, running: activity.transfer.running,
                     cancelling: activity.cancelling, ownerPath: owner.path, ownerFocused: owner.paneFocused}
             }), errors: root.bar.errors.length, notice: root.bar.notice,
                 undoAvailable: root.bar.hasUndo,
                 transferCard: {visible: !!card && card.visible, cancelling: !!card && card.cancelling, byteLine: card ? card.byteText : "", headline: card ? card.headlineText : "", writing: !!card && !!card.shown && card.shown.writing === true,
-                    rect: root.fleaWindow.rectOf(card), cancel: root.controlState("Cancel", card ? card.cancelItem : null), undo: root.controlState("z undoes", root.bar.undoItem)}})
+                    rect: root.cardRectOf(card), cancel: root.controlState("Cancel", card ? card.cancelItem : null), undo: root.controlState("z undoes", root.bar.undoItem)}})
         }
         function statusFooterState(): string {
             // Every zone's x in the strip's own coordinates: the centre pair sits in a Row inside the middle slot, so its own x is relative to that Row and says nothing about zone order.
@@ -144,14 +197,7 @@ QtObject {
             return JSON.stringify({held: root.pane.held, loaded: root.pane.rows.length,
                 windowSize: root.pane.windowSize, total: root.pane.total, shownTotal: root.pane.shownTotal})
         }
-        function menuState(): string {
-            var menu = root.pane.contextMenu()
-            return JSON.stringify({opened: menu.visible, entries: menu.entries, cursor: menu.cursor,
-                snapshotReady: root.pane.menuActions.ready, snapshotId: root.pane.menuActions.requestId,
-                submenu: menu.submenuOpen, submenuCursor: menu.submenuCursor, submenuEntries: menu.submenuEntries,
-                frame: root.fleaWindow.rectOf(menu.frameItem), flyout: root.fleaWindow.rectOf(menu.submenuFrameItem),
-                workArea: menu.workArea, forHeader: menu.forHeader, forRail: menu.forRail, hasRow: menu.hasRow})
-        }
+        function menuState(): string { return root.menuProbe.state() }
         function contextMenuModel(): string { return JSON.stringify(root.pane.contextMenu().entries) }
         function providerState(): string {
             var pane = root.pane, actions = pane.menuActions, taildrop = pane.taildropService, dropbox = pane.dropboxService
@@ -159,10 +205,10 @@ QtObject {
                 refreshing: actions.providersRefreshing,
                 pendingActivation: actions.pendingActivation, menuFocus: pane.contextMenu().keyboardFocused,
                 listFocus: pane.listArea.activeFocus, path: pane.path, cursor: pane.cursorIndex,
-                cursorPath: pane.cursorRow ? pane.join(pane.path, pane.cursorRow.n) : "",
+                cursorPath: pane.cursorRow ? pane.join(Search.baseOf(pane), pane.cursorRow.n) : "",
                 selected: pane.selectedIndices(), selectedPaths: pane.selectedIndices().map(function(index) {
                     var row = pane.rowFor(index)
-                    return row ? pane.join(pane.path, row.n) : null
+                    return row ? pane.join(Search.baseOf(pane), row.n) : null
                 }),
                 taildrop: {checking: taildrop.checking, reason: taildrop.reason, peers: taildrop.peers,
                     timeoutSeconds: taildrop.statusTimeoutSeconds},
@@ -175,24 +221,33 @@ QtObject {
         function menuDialogState(): string {
             var dialog = root.pane.menuActions.item
             if (!dialog) return JSON.stringify({opened: false})
-            // Two dialogs load into that one Loader, and the application rows belong to Open with alone.
+            // Two dialogs load into that one Loader: the application rows belong to Open with alone, the live count lines to the other.
             var applications = dialog.applications !== undefined ? dialog.applications : []
+            var liveLines = dialog.liveLines !== undefined ? dialog.liveLines : {}
             var cursor = dialog.cursor !== undefined ? dialog.cursor : 0
             return JSON.stringify({opened: dialog.opened, action: dialog.action, busy: dialog.busy,
-                committing: dialog.committing, error: dialog.errorText, facts: dialog.facts,
-                applications: applications, cursor: cursor, rect: root.fleaWindow.rectOf(dialog.cardItem),
-                controls: [Object.assign(root.controlState("Cancel", dialog.closeItem), {enabled: dialog.closeItem.activeFocusOnTab}),
+                committing: dialog.committing, error: dialog.errorText, facts: dialog.facts, liveLines: liveLines,
+                applications: applications, cursor: cursor, rect: root.cardRectOf(dialog.cardItem),
+                controls: [root.controlState("Cancel", dialog.closeItem),
                     Object.assign(root.controlState("Submit", dialog.submitItem), {enabled: dialog.canSubmit}),
                     root.controlState("Field", dialog.fieldItem), root.controlState("Applications", dialog.applicationsItem)],
                 confirmation: root.confirmationState(dialog.confirmationItem)})
         }
         // The paste-collision card: what it asks, the names it lists, which button Enter takes, and that no label wrapped.
         function collideState(): string {
-            var card = root.pane.collide.item
+            var card = root.pane.collide ? root.pane.collide.item : null
             return JSON.stringify(card ? {opened: card.opened, title: card.titleText, titleTruncated: card.titleTruncated,
                 names: card.names.map(function (n) { return n.n }), more: card.moreText, explain: card.explainText, focus: card.focusName,
-                buttonsFit: card.buttonsFit, explainLines: card.explainLines, rect: root.fleaWindow.rectOf(card.cardItem),
-                buttons: ["cancel", "skip", "keep", "replace"].map(function (b) { return root.controlState(b, card.buttonItem(b)) })} : {opened: false})
+                buttonsFit: card.buttonsFit, explainLines: card.explainLines, rect: root.cardRectOf(card.cardItem),
+                buttons: ["cancel", "skip", "keep", "merge", "replace"].map(function (b) { return root.controlState(b, card.buttonItem(b)) })} : {opened: false})
+        }
+        // The run card: whether it asks, what it names, which buttons it draws and where the ring sits.
+        function runCardState(): string {
+            var card = root.pane && root.pane.overlayParent ? root.pane.overlayParent.runCard : null
+            if (!card || !card.opened) return JSON.stringify({opened: false})
+            return JSON.stringify({opened: true, title: card.titleText, kind: card.kind, buttons: card.buttons, focus: card.focusName, default: card.defaultName,
+                rect: root.cardRectOf(card.cardItem),
+                controls: card.buttons.map(function (b) { var it = card.buttonItem(b); return {name: b, label: it.label, primary: !!it.primary, focused: !!it.focused, hovered: !!it.hovered, pressed: !!it.pressed, centre: root.fleaWindow.centreOf(it)} })})
         }
         // OpenWith.html's own card: the two groups it draws, the seat the cursor holds, and the
         // geometry a matched-size check measures against the board.
@@ -206,8 +261,10 @@ QtObject {
                     return row.eyebrow !== undefined ? {eyebrow: row.eyebrow, rule: row.rule === true}
                          : {id: row.id, label: row.label, icon: row.icon, isDefault: row.default === true}
                 }),
-                rect: root.fleaWindow.rectOf(dialog.cardItem),
+                rect: root.cardRectOf(dialog.cardItem),
                 rowHeight: Theme.rowHeight, eyebrowHeight: dialog.eyebrowHeight,
+                titleRuleRect: root.fleaWindow.rectOf(dialog.titleRuleItem), searchRect: root.fleaWindow.rectOf(dialog.searchItem),
+                gap: Theme.spacing.gap, searchTrail: dialog.searchTrail,
                 listRect: root.fleaWindow.rectOf(dialog.applicationsItem),
                 rowRect: root.fleaWindow.rectOf(dialog.applicationItem(dialog.cursor)),
                 controls: [root.controlState("Field", dialog.fieldItem), root.controlState("Applications", dialog.applicationsItem),
@@ -215,24 +272,23 @@ QtObject {
                     Object.assign(root.controlState("Open", dialog.submitItem), {enabled: dialog.canSubmit})]})
         }
         function permissionsState(): string {
-            var dialog = root.permissionsDialog
-            if (!dialog) return JSON.stringify({opened: false})
-            return JSON.stringify({opened: dialog.opened, facts: dialog.facts, path: dialog.path, mode: dialog.modeText,
+            var probe = root, dialog = probe.permissionsDialog, inputReady = probe.pane.listArea.activeFocus && !probe.pane.listInFlight
+            if (!dialog) return JSON.stringify({opened: false, inputReady: inputReady})
+            return JSON.stringify({opened: dialog.opened, inputReady: !dialog.opened && !dialog.visible && inputReady, facts: dialog.facts, path: dialog.path, mode: dialog.modeText,
+                title: root.firstVisibleText(dialog.cardItem), paths: dialog.multiPaths,
                 displayedError: dialog.displayedError, displayedSummary: dialog.displayedSummary,
-                bodyRect: root.fleaWindow.rectOf(dialog.bodyItem),
-                editable: dialog.editable, busy: dialog.busy, error: dialog.errorText, rect: root.fleaWindow.rectOf(dialog.cardItem),
+                bodyRect: root.cardRectOf(dialog.bodyItem), octalFrame: root.roleOf(dialog.octalFrame.border.color),
+                editable: dialog.editable, busy: dialog.busy, error: dialog.errorText, rect: root.cardRectOf(dialog.cardItem),
                 controls: dialog.controls().map(function(control) {
+                    var box = control.item.children.find(function(child) { return typeof child.value === "string" }), point = typeof control.item.hovered === "boolean" ? control.item : control.item.children.find(function(child) { return typeof child.hovered === "boolean" })
                     return Object.assign(root.controlState(control.name, control.item), {checked: control.checked, bit: control.bit,
-                        enabled: control.enabled === undefined ? control.item.enabled : control.enabled})
+                        value: box ? box.value : undefined, hovered: !!point && point.hovered, pressed: !!point && point.pressed,
+                        ring: !!control.item.ringItem && control.item.ringItem.visible})
                 })})
         }
         function trashState(): string {
             var view = root.pane.trash.item
-            var rail = null
-            for (var index = 0; index < root.pane.railCount; index++) {
-                var row = root.pane.sidebar.railItemFor(index)
-                if (row && row.modelData.kind === "trash") { rail = {current: row.cursor, countText: row.detail}; break }
-            }
+            var rail = root.trashRail()
             if (!view) return JSON.stringify({opened: false, count: root.pane.sidebar.trashCount, rail: rail})
             return JSON.stringify({opened: view.opened, total: view.total, count: root.pane.sidebar.trashCount, countText: view.countText, busy: view.busy,
                 operationActive: view.operationActive, cursor: view.cursor, first: view.first,
@@ -245,15 +301,23 @@ QtObject {
         function trashControlCentre(name: string): string {
             var view = root.pane.trash.item
             if (!view) return ""
-            var item = ({back: view.backItem, up: view.upItem, cancel: view.confirmationItem.cancelItem, danger: view.confirmationItem.dangerItem})[name]
+            var item = ({back: view.backItem, up: view.upItem, empty: view.emptyItem, cancel: view.confirmationItem.cancelItem, danger: view.confirmationItem.dangerItem})[name]
             return item ? root.fleaWindow.centreOf(item) : ""
         }
 
         // The sticky slot an operation holds while it runs, so a test can name the verb in flight.
         function stickyMessage(): string { return root.bar.sticky }
+        // Whether the busy mark walks while the GVFS bridge's Starting line stands; tests/js/status.js pins that the sentence alone does not light it.
+        function statusBusy(): string { return String(root.bar.busy) }
         function firstRowsAt(): string { return String(root.backend.firstRowsAt) }
+        // Per-keystroke stopwatch for the newest search gen, read-only after a run.
+        function searchStamps(): string { return JSON.stringify(Search.stamps(root.pane)) }
         // Both instants in one read, so no IPC call of a harness ever lands inside the interval it is timing.
         function inputToRows(): string { return String(root.pane.inputAt) + " " + String(root.pane.rowsAt) }
+        // The filter stopwatch: the newest keystroke's view and when its narrowing reached the shown model.
+        function filterStamps(): string {
+            return JSON.stringify({view: root.pane.viewMode, keyAt: root.pane.filterKeyAt, narrowedAt: root.pane.filterNarrowedAt})
+        }
         function mode(): string { return "browse" }
         function state(): string { return root.pane.listingState }
         function listInFlight(): bool { return root.pane.listInFlight }
@@ -328,7 +392,7 @@ QtObject {
                 var point = item.mapToItem(null, 0, 0)
                 return {x: point.x, y: point.y, width: item.width, height: item.height}
             }
-            return JSON.stringify({headers: sidebar.headingItems().map(function(item) {
+            return JSON.stringify({rowGap: Style.spacing.rowGap, headers: sidebar.headingItems().map(function(item) {
                 return {text: item.text, visible: item.visible, rect: box(item),
                     topPadding: item.topPadding, fontSize: item.font.pixelSize}
             }), rows: sidebar.entries.map(function(entry, index) {
@@ -336,11 +400,23 @@ QtObject {
                 if (!row) return {index: index, missing: true}
                 var detail = row.detailItem
                 return {index: index, label: entry.label, kind: entry.kind, group: entry.group,
-                    size: entry.size, detail: detail.text, detailColor: String(detail.color), labelWidth: Math.round(row.labelItem.width), labelNeeds: Math.round(row.labelItem.implicitWidth),
+                    size: entry.size, detail: detail.text, detailColor: String(detail.color), labelWidth: Math.round(row.labelItem.width), labelNeeds: Math.round(row.labelItem.implicitWidth), elided: row.labelItem.truncated, elide: row.labelItem.elide,
                     fontSize: detail.font.pixelSize, tabular: detail.font.features.tnum === 1,
-                    rect: box(row), detailRect: box(detail),
+                    rect: box(row), detailRect: box(detail), labelRect: box(row.labelItem),
                     indicatorRect: box(row.indicatorSlot), indicatorVisible: row.indicatorVisible}
             })})
+        }
+
+        // The release mark's own hover state, so the hover leg fails when the pointer misses its mark.
+        function railMarkHovered(i: int): bool {
+            var row = root.pane.sidebar.railItemFor(i)
+            if (!row || !row.indicatorSlot) return false
+            var kids = row.indicatorSlot.children
+            for (var k = 0; k < kids.length; k++) {
+                var it = kids[k].item
+                if (it && it.hovered === true) return true
+            }
+            return false
         }
 
         // The panel's own title, a spot on the card with no control under it: a click there must leave the panel open.
@@ -351,13 +427,13 @@ QtObject {
         function settingsScroll(): string { return root.settingsPanel ? root.settingsPanel.paneScroll() : "" }
         function settingsScrollState(): string { return root.settingsPanel ? root.settingsPanel.scrollState() : "{}" }
         // Each card's rectangle, so the window-size battery asserts every overlay stays on screen.
-        function settingsCardRect(): string { return root.settingsPanel ? root.fleaWindow.rectOf(root.settingsPanel.cardItem) : "" }
-        function networkCardRect(): string { return root.networkDialog ? root.fleaWindow.rectOf(root.networkDialog.cardItem) : "" }
+        function settingsCardRect(): string { return root.settingsPanel ? root.cardRectOf(root.settingsPanel.cardItem) : "" }
+        function networkCardRect(): string { return root.networkDialog ? root.cardRectOf(root.networkDialog.cardItem) : "" }
         function networkScroll(): string { return root.networkDialog ? root.networkDialog.bodyScroll() : "" }
         // The clipping viewport inside the card, so a field's on-screen check is against what the body shows.
-        function networkBodyRect(): string { return root.networkDialog ? root.fleaWindow.rectOf(root.networkDialog.bodyItem) : "" }
-        function keymapCardRect(): string { return root.keymapSheet ? root.fleaWindow.rectOf(root.keymapSheet.cardItem) : "" }
-        function convertCardRect(): string { return root.convertDialog ? root.fleaWindow.rectOf(root.convertDialog.cardItem) : "" }
+        function networkBodyRect(): string { return root.networkDialog ? root.cardRectOf(root.networkDialog.bodyItem) : "" }
+        function keymapCardRect(): string { return root.keymapSheet ? root.cardRectOf(root.keymapSheet.cardItem) : "" }
+        function convertCardRect(): string { return root.convertDialog ? root.cardRectOf(root.convertDialog.cardItem) : "" }
         // A menu row's own centre, so a driven click lands on the row a test named rather than on a
         // pixel derived from a row count the Menus settings section can change under it.
         function contextMenuRowCentre(i: int): string { return root.fleaWindow.centreOf(root.pane.contextMenu().itemFor(i)) }
@@ -404,33 +480,27 @@ QtObject {
         function railRenameEditorLive(): bool { return root.pane.sidebar.renameEditor() !== null }
         function railRenameEditorText(): string { var e = root.pane.sidebar.renameEditor(); return e ? e.editorText : "" }
         function railRenameFieldShown(): bool { var e = root.pane.sidebar.renameEditor(); return e ? e.editorShown : false }
-        function previewOpen(): bool { return root.pane.preview.active }
-        function previewKind(): string { return root.pane.preview.kind }
-        function previewState(): string { return root.pane.preview.status }
-        function previewPosition(): int { return root.pane.preview.position } function previewDuration(): int { return root.pane.preview.duration }
-        // Fix round 1: what the strip actually draws, not a re-derived guess at its visible: expression.
-        function previewStrip(): string { return JSON.stringify({ visible: root.pane.preview.stripVisible, muted: root.pane.preview.muted, mute: root.fleaWindow.centreOf(root.pane.preview.muteMark) }) }
-        // A 0.25 zoom step and an expand flag are not legible off a screenshot, so the seam is the
-        // only honest answer for either; "" means no PDF is loaded, which is not zoom 1 or false.
-        function previewPdfPage(): int { var p = root.pane.preview.pdfItem; return p ? p.page : -1 }
-        function previewPdfZoom(): string { var p = root.pane.preview.pdfItem; return p ? String(p.zoom) : "" }
-        function previewPdfFocus(): int { var p = root.pane.preview.pdfItem; return p ? p.pdfControlIndex : -1 }
-        function pdfState(overlay: bool): string {
-            var p = overlay ? root.pane.preview.pdfItem : root.pane.previewColumnItem
-            if (!p) return "null"
-            return JSON.stringify({ page: overlay ? p.page : p.pdfPage(), pages: overlay ? p.pageCount : p.pdfPages,
-                frame: overlay ? "" : root.fleaWindow.rectOf(p.pdfFrameItem),
-                toolbar: overlay ? "" : root.fleaWindow.rectOf(p.pdfToolbarItem),
-                zoom: overlay ? p.zoom : p.pdfZoom, scrollY: p.pdfScrollY, focused: p.activeFocus, control: p.pdfControlIndex,
-                controls: p.pdfControls.map(function (control) { return { name: control.accessName, enabled: control.enabled,
-                    visible: control.visible, centre: root.fleaWindow.centreOf(control) } }) })
-        }
-        function previewExpanded(): string { var p = root.pane.preview.pdfItem; return p ? String(p.expanded) : "" }
-        function previewSwapState(): string { return JSON.stringify({ column: root.columns ? root.columns.swapState() : null, look: root.pane.preview.swapState() }) }
+        function previewOpen(): bool { return root.previewReaders.previewOpen() }
+        function columnMarkdownView(): string { return root.previewReaders.columnMarkdownView() }
+        function previewKind(): string { return root.previewReaders.previewKind() }
+        function previewState(): string { return root.previewReaders.previewState() }
+        function compareState(): string { return root.previewReaders.compareState() }
+        function previewTextState(column: bool): string { return root.previewReaders.previewTextState(column) }
+        function previewFigures(): string { return root.previewReaders.previewFigures() }
+        function previewBlockKinds(column: bool): string { return root.previewReaders.previewBlockKinds(column) }
+        function previewPosition(): int { return root.previewReaders.previewPosition() }
+        function previewDuration(): int { return root.previewReaders.previewDuration() }
+        function previewStrip(): string { return root.previewReaders.previewStrip() }
+        function previewPdfPage(): int { return root.previewReaders.previewPdfPage() }
+        function previewPdfZoom(): string { return root.previewReaders.previewPdfZoom() }
+        function previewPdfFocus(): int { return root.previewReaders.previewPdfFocus() }
+        function pdfState(overlay: bool): string { return root.previewReaders.pdfState(overlay) }
+        function previewExpanded(): string { return root.previewReaders.previewExpanded() }
+        function previewSwapState(): string { return root.previewReaders.previewSwapState() }
         function previewSelectionState(): string {
             var column = root.pane.previewColumnItem
             return JSON.stringify({view: root.pane.viewMode, width: root.pane.listSlot.width,
-                available: root.pane.width - root.pane.sidebarWidth,
+                available: root.pane.width - root.pane.railInset,
                 inlineVisible: column !== null && column.visible,
                 index: root.pane.previewIndex, path: column ? column.path : "",
                 focused: column !== null && column.activeFocus,
@@ -442,7 +512,13 @@ QtObject {
         }
         function rowCellColor(i: int): string {
             var item = root.pane.itemFor(i)
-            return item ? String(item.cellColor()) : ""
+            return item ? String(item.cellInk) : ""
+        }
+        // The date cell's drawn ink, which Highlight today's dates can lift above rowCellColor.
+        function rowDateColor(i: int): string {
+            var item = root.pane.itemFor(i)
+            var cell = item ? item.cell("date") : null
+            return cell ? String(cell.color) : ""
         }
         // Binds the actual defect: an eliding cell's content stays inside width; a broken one does not.
         function rowCellOverflow(i: int): string {
@@ -472,6 +548,17 @@ QtObject {
                 return ""
             return Math.round(item.x) + "|" + Math.round(item.width)
         }
+        // ListColumns040 board: the pointer's own target for an edge drag or double click.
+        function headerCellCentre(name: string): string {
+            var item = root.pane.header.cell(name)
+            return item ? root.fleaWindow.centreOf(item) : ""
+        }
+        // The last drag the header saw, "startX|lastX|startWidth|preview", kept after release
+        // until the next press, so a test asserts the column followed the pointer as the app saw it.
+        function headerDragTrace(): string {
+            var h = root.pane.header
+            return h.dragStartX + "|" + h.dragLastX + "|" + h.dragStartWidth + "|" + h.dragPreview
+        }
         // The header's drawn columns beside a row's. Both resolve theirs from their own width
         // through Theme.columns, so a disagreement shows up here rather than as a stray column.
         function columnSet(i: int): string {
@@ -490,7 +577,10 @@ QtObject {
                 previewReady: column !== null && column.frameStatus === Image.Ready})
         }
         function viewContentY(): int { return Math.round(root.pane.viewMode === "columns" && root.columns ? root.columns.activeContentY() : root.pane.listArea.contentY) }
+        // The true end of travel in contentY terms: the column view or the list area, origin plus content minus viewport, whole pixels.
+        function viewEndY(): int { var v = root.pane.viewMode === "columns" && root.columns ? root.columns.activeColumn().viewport : root.pane.listArea; return Math.round(v.originY + v.contentHeight - v.height) }
         function listAreaRect(): string { return root.fleaWindow.rectOf(root.pane.listArea) }
+        function listingDropActive(): bool { return root.previewReaders.listingDropActive() }
         function rowRect(i: int): string { return root.fleaWindow.rectOf(root.pane.visibleItemFor(i)) }
         function dragPaneGeometry(side: int, index: int): string {
             var pane = side >= 0 && side < root.panes.length ? root.panes[side] : null
@@ -510,20 +600,39 @@ QtObject {
         function columnThumbShown(): bool { return root.columns ? root.columns.thumbShown() : false }
         function columnFrameReady(): bool { return root.columns ? root.columns.frameReady() : false }
         function columnTextLines(): string { return root.columns ? root.columns.textLines() : "" }
+        function columnMarkdownText(): string { return root.columns ? root.columns.markdownText() : "" }
+        function htmlState(column: bool): string { return root.previewReaders.htmlState(column) }
         function columnLinesRect(): string { return root.columns ? root.fleaWindow.rectOf(root.columns.linesItem()) : "" }
         function columnArchiveRect(): string { return root.columns ? root.fleaWindow.rectOf(root.columns.archiveItem()) : "" }
-        function previewSurfaceRect(): string { return root.fleaWindow.rectOf(root.pane.preview.surfaceItem()) }
-        function previewMediaLoaded(): bool { return root.pane.preview.mediaLoaded() }
-        function previewText(): string { return root.pane.preview.textShown() }
-        function previewArchiveNames(): string { return root.pane.preview.archiveNames() }
+        function previewSurfaceRect(): string { return root.previewReaders.previewSurfaceRect() }
+        function previewTable(): string { return root.previewReaders.previewTable() }
+        function previewPictureRect(): string { return root.previewReaders.previewPictureRect() }
+        function previewMediaLoaded(): bool { return root.previewReaders.previewMediaLoaded() }
+        function previewText(): string { return root.previewReaders.previewText() }
+        function previewMarkdownView(): string { return root.previewReaders.previewMarkdownView() }
+        function previewCloseState(): string { return root.previewReaders.previewCloseState() }
+        function previewEndGap(): int { return root.previewReaders.previewEndGap() }
+        function previewScrollY(): int { return root.previewReaders.previewScrollY() }
+        function previewTextLength(): int { return root.previewReaders.previewTextLength() }
+        function previewTextTail(n: int): string { return root.previewReaders.previewTextTail(n) }
+        function previewArchiveNames(): string { return root.previewReaders.previewArchiveNames() }
         function columnArchiveNames(): string { return root.columns ? root.columns.archiveNames() : "" }
         function columnFailure(): string { return root.columns ? root.columns.failureText() : "" }
         function rowThumbRect(i: int): string { var item = root.pane.visibleItemFor(i); return item && item.thumbItem ? root.fleaWindow.rectOf(item.thumbItem) : "" }
         function columnFrameRect(): string { return root.columns ? root.fleaWindow.rectOf(root.columns.frameItem()) : "" }
+        function columnPictureRect(): string { return root.columns ? root.fleaWindow.rectOf(root.columns.pictureItem()) : "" }
         function columnChildEmpty(): string { var e = root.columns ? root.columns.childEmptyItem() : null; return e ? e.visible + " " + e.opacity.toFixed(2) + " " + e.markItem.opacity.toFixed(2) : "" }
         function columnChildMarkRect(): string { var e = root.columns ? root.columns.childEmptyItem() : null; return e ? root.fleaWindow.rectOf(e.markItem) : "" }
         function columnChildRowCentre(i: int): string { return root.columns ? root.fleaWindow.centreOf(root.columns.childItemAt(i)) : "" }
+        function columnChildRowName(i: int): string { var item = root.columns ? root.columns.childItemAt(i) : null; return item && item.row ? item.row.n : "" }
+        function columnActiveRect(): string { return root.columns ? root.fleaWindow.rectOf(root.columns.activeColumn()) : "" }
         function columnParentRowCentre(i: int): string { return root.columns ? root.fleaWindow.centreOf(root.columns.parentItemAt(i)) : "" }
+        // ColumnsWidth board: the live count and the deeper ancestors a wide window shows.
+        function columnCount(): int { return root.columns ? root.columns.columnCount : 0 }
+        function columnGrandparentRowCentre(i: int): string { return root.columns ? root.fleaWindow.centreOf(root.columns.grandparentItemAt(i)) : "" }
+        function columnGreatGrandparentRowCentre(i: int): string { return root.columns ? root.fleaWindow.centreOf(root.columns.greatGrandparentItemAt(i)) : "" }
+        // ListColumns040 board: the stored edge widths beside the drawn header and row sets.
+        function columnWidths(): string { return JSON.stringify(ViewState.state.columnWidths || {}) }
         function rowIcon(i: int): string {
             var item = root.pane.itemFor(i)
             return item ? String(item.iconUrl) : ""
@@ -569,7 +678,7 @@ QtObject {
         function visibleRows(): int { return root.pane.visibleRows }
         // The list's scroll position and the platform's lines per notch, for tests/ui.sh scroll.
         function listContentY(): int { return Math.round(root.pane.listArea.contentY) }
-        function scrollbarState(): string { var bar = root.pane.listArea.scrollBar; return bar ? JSON.stringify({visible: bar.visible, shown: bar.shown, knob: bar.knobWidth, rect: root.fleaWindow.rectOf(bar), handle: bar.handleLength, offset: bar.handleOffset, content: bar.contentLength, viewport: bar.viewportLength}) : "{}" }
+        function scrollbarState(): string { var bar = root.pane.listArea.scrollBar; return bar ? JSON.stringify({visible: bar.visible, shown: bar.shown, knob: bar.knobWidth, rect: root.fleaWindow.rectOf(bar), knobRect: root.fleaWindow.rectOf(bar.knobItem), handle: bar.handleLength, offset: bar.handleOffset, content: bar.contentLength, viewport: bar.viewportLength}) : "{}" }
         function wheelLines(): int { return Application.styleHints.wheelScrollLines }
         function thumbRequests(): int { return root.backend.thumbRequests }
         function dirSizeRequests(): int { return root.backend.dirSizeRequests }
@@ -578,12 +687,18 @@ QtObject {
         function swapState(): string { return JSON.stringify(root.pane.swap.describe()) }
         function thumbFile(i: int): string { return root.pane.thumbFor(i) }
         function rowCentre(i: int): string { return root.pane.rowFor(i) ? root.fleaWindow.centreOf(root.pane.visibleItemFor(i)) : "" }
-        // The same lookup as rowCentre, but for the preview's own seek slider, so a test can drive
-        // a real wheel event over it without hardcoding the strip's layout.
-        function previewSliderCentre(): string {
-            return root.pane.preview.active && root.pane.preview.isMedia ? root.fleaWindow.centreOf(root.pane.preview.seekSlider) : ""
+        function rowNameCentre(i: int): string {
+            var label = root.rowNameItem(i)
+            if (!label) return ""
+            var width = Math.min(label.width, label.contentWidth === undefined ? label.implicitWidth : label.contentWidth)
+            var height = Math.min(label.height, label.contentHeight === undefined ? label.implicitHeight : label.contentHeight)
+            var x = root.pane.viewMode === "grid" ? label.width / 2 : width / 2
+            var point = label.mapToItem(null, x, height / 2)
+            return Math.round(point.x) + " " + Math.round(point.y)
         }
-        // The same lookup as rowCentre, but for a rail row: the rail has no ListView, so Sidebar.railItemFor(i) walks its own two Repeaters instead.
+        function rowNameRect(i: int): string { return root.fleaWindow.rectOf(root.rowNameItem(i)) }
+        function previewSliderCentre(): string { return root.previewReaders.previewSliderCentre() }
+        // The same lookup as rowCentre, but for a rail row: the rail has no ListView, so Sidebar.railItemFor(i) walks its own Repeaters instead.
         function railRowCentre(i: int): string { return root.fleaWindow.centreOf(root.pane.sidebar.railItemFor(i)) }
         function railLabel(i: int): string { var item = root.pane.sidebar.railItemFor(i); return item ? item.modelData.label : "" }
         function railLabels(): string { var out = []; for (var i = 0; i < root.pane.railCount; i++) { var item = root.pane.sidebar.railItemFor(i); out.push(item ? item.modelData.label : "") } return out.join("|") }
@@ -598,12 +713,34 @@ QtObject {
         function viewMode(): string { return root.pane.viewMode }
         // What this box probed: the compress submenu is exactly this and never a fixed list.
         function archiveFormats(): string { return root.backend.archiveFormats.join("|") }
+        // The two password cards, so a test waits on the open card and its error rather than a sleep.
+        function archiveCardsState(): string {
+            var cards = root.archiveCards
+            if (!cards) return JSON.stringify({opened: false})
+            var compress = cards.compressItem, extract = cards.extractItem
+            return JSON.stringify({opened: true,
+                compressOpened: !!compress && compress.opened === true,
+                extractOpened: !!extract && extract.opened === true,
+                compressCount: compress ? compress.count : 0, compressFormat: compress ? compress.format : "",
+                compressError: compress ? compress.errorText : "", compressFocus: compress ? compress.focusPart : -1,
+                canCompress: !!compress && compress.canCompress === true, compressCapture: compress ? compress.captureState() : null,
+                extractLeaf: extract ? extract.leaf : "", extractError: extract ? extract.errorText : "",
+                extractFocus: extract ? extract.focusPart : -1, extractCapture: extract ? extract.captureState() : null,
+                canExtract: !!extract && extract.canExtract === true})
+        }
         function canConvert(): bool { return root.backend.canConvert }
         // The one popup in the design, so a test can assert it opened and what it would write.
         function convertOpen(): bool { return root.convertDialog ? root.convertDialog.opened : false }
         function keymapSheetOpen(): bool { return root.keymapSheet ? root.keymapSheet.opened : false }
         // One row per line, "<cap> <wording>", so a test asserts the sheet without OCR.
         function keymapSheetRows(): string { return root.keymapSheet ? root.keymapSheet.rows() : "" }
+        // The result rows as JSON with keys, label, where (the drawn muted text) and disabled, so a test asserts the where on screen.
+        function keymapSheetResults(): string { return root.keymapSheet ? root.keymapSheet.resultState() : "[]" }
+        // Sidebar040: the query the typed keys narrowed the sheet to, "" at rest.
+        function keymapQuery(): string { return root.keymapSheet ? root.keymapSheet.query : "" }
+        // Sidebar040: the main window's Recent place, "" off and "results" once the history answered.
+        function recentMode(): string { return root.pane.recentMode }
+        function recentFrom(): string { return root.pane.recentFrom }
         function convertFormat(): string { return root.convertDialog ? root.convertDialog.format : "" }
         function convertStrip(): bool { return root.convertDialog ? root.convertDialog.strip : false }
         function convertState(): string {
@@ -613,9 +750,9 @@ QtObject {
                 checking: dialog.checking, busy: dialog.busy, unavailable: dialog.unavailable, collision: dialog.collision, error: dialog.errorText,
                 output: dialog.outputPath, outputText: dialog.outputItem.text, outputLines: dialog.outputItem.lineCount,
                 outputRect: root.fleaWindow.rectOf(dialog.outputItem),
-                bodyRect: root.fleaWindow.rectOf(dialog.bodyItem), scrollY: dialog.bodyItem.contentY,
+                bodyRect: root.cardRectOf(dialog.bodyItem), scrollY: dialog.bodyItem.contentY,
                 requestId: dialog.requestId, operationId: dialog.operationId, cursor: dialog.cursor, focusPart: dialog.focusPart, canConvert: dialog.canConvert,
-                rect: root.fleaWindow.rectOf(dialog.cardItem),
+                rect: root.cardRectOf(dialog.cardItem),
                 formats: dialog.formats.map(function(format, index) {
                     return Object.assign(root.controlState(format, dialog.formatItem(index)), {selected: dialog.format === format,
                         current: dialog.formatItem(index).current, labelColor: String(dialog.formatItem(index).labelColor),
@@ -624,6 +761,14 @@ QtObject {
                     root.controlState("Cancel", dialog.cancelItem), root.controlState("Convert", dialog.submitItem)]})
         }
         function convertTitleCentre(): string { return root.convertDialog ? root.fleaWindow.centreOf(root.convertDialog.titleItem) : "" }
+        // Bulk rename card state for the controller's 1:1 capture beside its board.
+        function bulkRenameState(): string {
+            var dialog = root.bulkRenameDialog
+            if (!dialog) return JSON.stringify({opened: false})
+            return JSON.stringify({opened: dialog.opened, footer: dialog.footerText, rename: dialog.renameText,
+                canRename: dialog.canRename, count: dialog.oldNames.length, focus: dialog.focusedControl,
+                rect: root.cardRectOf(dialog.cardItem)})
+        }
         // The preview column's own table and state, so a test asserts the canvas's rows without OCR.
         function previewFacts(): string { return root.columns ? root.columns.factsLine() : "" }
         function previewColumnState(): string { return root.columns ? root.columns.previewStateName() : "" }
@@ -643,10 +788,6 @@ QtObject {
         function columnPdfPage(): int { return root.columns ? root.columns.pdfPage() : -1 }
         function columnPdfPages(): int { return root.columns ? root.columns.pdfPages() : -1 }
         function columnPdfLoaded(): bool { return root.columns ? root.columns.pdfLoaded() : false }
-        function columnChevronCentre(dir: string): string {
-            var item = root.columns ? root.columns.pdfChevron(dir) : null
-            return item && item.visible ? root.fleaWindow.centreOf(item) : ""
-        }
         function chromeHeight(): int { return Math.round(Theme.chromeHeight) }
         function tabCount(): int { return Tabs.count(root.pane) }
         function tabIndex(): int { return Tabs.currentIndex(root.pane) }
@@ -668,6 +809,8 @@ QtObject {
         function pathBarOpen(): bool { return root.chrome.editing }
         function pathBarText(): string { return String(root.chrome.editText) }
         function pathCentre(): string { return root.fleaWindow.centreOf(root.chrome.pathArea) }
+        // The open path field's frame, "x y width height", the accent hairline a native capture is read against.
+        function pathFrameRect(): string { return root.fleaWindow.rectOf(root.chrome.pathFrame) }
         // The elision marker, or "" while the whole path fits: the one spot the crumbs slide under.
         function elisionCentre(): string {
             return root.chrome.elisionMarker ? root.fleaWindow.centreOf(root.chrome.elisionMarker) : ""
@@ -675,6 +818,7 @@ QtObject {
         // Issue 45's segments, reached the way tabCentre reaches a tab: a driven press on a real
         // crumb is the only thing that can tell a bound TapHandler from an unbound one.
         function crumbCount(): int { return root.chrome.crumbItems.count }
+        function crumbText(): string { return root.chrome.crumbItems.model.map(function (c) { return c.text }).join("") }
         // Measured: with the bar open the slot is hidden and a crumb's box is still there, and a path
         // too long for the bar slides its head clean off the left, so a bare centre aims a driven
         // click at the desktop. Answering "" for both is what stops a test pressing nothing at all.
@@ -688,6 +832,7 @@ QtObject {
         }
         // A dual pane's own path, side 0 or 1, answered the way crumbCount and crumbCentre answer the chrome's.
         function paneCrumbCount(side: int): int { return root.panes[side] ? root.panes[side].pathCrumbs.count : 0 }
+        function paneCrumbText(side: int): string { var p = root.panes[side]; return p ? p.pathCrumbs.model.map(function (c) { return c.text }).join("") : "" }
         function paneCrumbCentre(side: int, i: int): string {
             var pane = root.panes[side]
             var item = pane ? pane.pathCrumbs.itemAt(i) : null
@@ -732,11 +877,18 @@ QtObject {
             return JSON.stringify({inside: inside, busy: !!dialog && dialog.busy,
                 activeItem: item ? String(item) : "", field: dialog ? dialog.formFocus() : ""})
         }
+        // The cohesion captures' reader over the window, see ui/IpcControls.qml and ui/js/ControlReader.js.
+        function cohesionControls(): string {
+            var window = root.pane.Window.window
+            var kinds = /^(DialogButton|ChromeButton|CheckBox|DialogField|ProtocolChip|Crumb|MenuRow|SidebarRow|SettingsSegment|SettingsRow|TabBar|PathEntry|RenameField)_QML/
+            return Qt.createComponent("IpcControls.qml").createObject(null).read(window, window ? window.contentItem : null, kinds, {})
+        }
         function networkHostPortWidths(): string { return root.networkDialog ? root.networkDialog.formHostPortWidths() : "" }
         // Mask state and presence only: the seam never returns password content.
         function networkPasswordState(): string { return root.networkDialog ? root.networkDialog.formPasswordState() : "" }
         function networkPasswordEyeCentre(): string { return root.networkDialog ? root.networkDialog.formPasswordEyeCentre() : "" }
         function networkNote(): string { return root.networkDialog ? root.networkDialog.formNote() : "" }
+        function networkPasswordHint(): string { return root.networkDialog ? root.networkDialog.formPasswordHint() : "" }
         function networkAction(): string { return root.networkDialog ? root.networkDialog.formAction() : "" }
         function networkStatus(): string { return root.networkDialog ? root.networkDialog.statusText : "" }
         function networkDialogMetrics(): string { return root.networkDialog ? root.networkDialog.formMetrics() : "" }
@@ -786,7 +938,13 @@ QtObject {
             return out.join("\n")
         }
         function networkStartIndex(): int { return root.pane.sidebar.placesEntries.length }
+        // True once the Network group was rebuilt after a gio listing and a mountinfo read, so an empty networkEntries is an answer and not the unbuilt state.
+        function networkBuilt(): bool { var s = root.pane.sidebar; return s.railGate.showNetwork === true && s.service !== null && s.service._listedOnce === true && String(s.service._lastMountinfo).length > 0 }
+        // Tests feed mountinfo text through the rail service's own rebuild seam.
+        function networkFeedMountinfo(text: string): string { if (root.pane.sidebar.service) { root.pane.sidebar.service.rebuild(text); return "fed" } return "no service" }
 
+        // The eject chain's guard state beside the rail, so a failed eject names its guard.
+        function deviceEjectState(): string { return root.pane.sidebar.ejectChainState() }
         // One line per entry, "label|group|kind|mounted", the same shape networkEntries answers.
         function deviceEntries(): string {
             var out = []
@@ -797,5 +955,39 @@ QtObject {
             }
             return out.join("\n")
         }
+        // The Unlock card flea --unlock opens, so a capture waits on its phase instead of sleeping.
+        function unlockState(): string {
+            var unlockDialog = root.unlockHost ? root.unlockHost.dialog : null
+            if (!unlockDialog || !unlockDialog.opened) return JSON.stringify({opened: false})
+            return JSON.stringify({opened: true, phase: String(unlockDialog.phase), note: String(unlockDialog.noteText),
+                noteIsError: unlockDialog.noteIsError === true, device: String(unlockDialog.device), label: String(unlockDialog.driveLabel),
+                subtitle: String(unlockDialog.subtitleText), focus: unlockDialog.focusPart(), masked: unlockDialog.masked === true,
+                rect: root.cardRectOf(unlockDialog.cardItem),
+                controls: ["cancel", "unlock"].map(function (b) { return root.controlState(b, unlockDialog.buttonItem(b)) }),
+                revealed: unlockDialog.fieldItem.revealed, eye: unlockDialog.fieldItem.eyeCentre()})
+        }
+        function trashFocusEmpty(): bool { var view = root.pane.trash.item; if (!view) return false; view.emptyItem.forceActiveFocus(Qt.TabFocusReason); return view.emptyItem.activeFocus }
+        // open() leaves the keyboard on the view itself; forcing a focus scope alone returns it to its last child, so the button lets go first.
+        function trashFocusListing(): bool { var view = root.pane.trash.item; if (!view) return false; view.emptyItem.focus = false; view.forceActiveFocus(); return view.activeFocus && !view.emptyItem.activeFocus }
+        // "hovered|focused|pressed|available" read from the strip button's own handlers and properties, one word each.
+        function trashEmptyState(): string { var view = root.pane.trash.item; if (!view) return ""; var item = view.emptyItem; var hover = item.data.find(function(o) { return o.hovered !== undefined }); var tap = item.data.find(function(o) { return o.pressed !== undefined }); return [hover.hovered, item.focused, tap.pressed, item.available].join("|") }
+        function columnNames(slot: string): string { return root.columns ? root.columns.drawnNames(slot) : "" }
+        function columnPeekNames(path: string): string { return root.columns ? root.columns.peekNames(path) : "" }
+        function flashState(): string {
+            var host = root.flashHost()
+            return host ? host.describe() : "{\"opened\":false}"
+        }
+        function flashControlCentre(name: string): string {
+            var host = root.flashHost()
+            var item = host ? host.controlItem(name) : null
+            return item ? root.fleaWindow.centreOf(item) : ""
+        }
+    }
+    // Flash image's bodies live on the window's host, so each entry point here stays one call.
+    function flashHost() { return root.pane.overlayParent ? root.pane.overlayParent.flashHost : null }
+    function rowNameItem(i) {
+        var item = root.pane.rowFor(i) ? root.pane.visibleItemFor(i) : null
+        var label = item ? (item.captionItem || item.nameItem()) : null
+        return label && item.visible && label.visible ? label : null
     }
 }

@@ -1,11 +1,15 @@
 pragma Singleton
 
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
+import "js/Buttons.js" as Buttons
 import "js/Columns.js" as Columns
 import "js/Contrast.js" as Contrast
+import "js/Density.js" as Density
 import "js/Palette.js" as Palette
 import "js/TextSize.js" as TextSize
 
@@ -15,6 +19,8 @@ Singleton {
 
     readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/current"
 
+    // The parsed colors.toml, for the code inks CodeLines lifts.
+    property var palette: ({})
     // True only once colors.toml parsed to a palette, so a test can tell one from a fallback.
     property bool ready: false
 
@@ -42,40 +48,45 @@ Singleton {
         executable: "#a6e3a1"
     })
 
-    readonly property QtObject color: QtObject {
-        readonly property color background: Color.background
-        readonly property color foreground: Color.foreground
-        property color muted: Qt.darker(Color.foreground, 1.4)
-        readonly property color accent: Color.accent
-        property color error: Color.urgent
-        property color surface: root.fallbackColor.surface
-        property color symlink: root.fallbackColor.symlink
-        property color executable: root.fallbackColor.executable
-        // The accent as a frame rather than as ink: on a card's own surface a frame is a graphical
-        // object, so it is lifted to 3:1 there the way symlink and executable are lifted on the list.
-        property color accentFrame: Color.accent
-    }
+    // A palette role at or under this HSV saturation carries no colour (urgent falls back to the foreground, a grey accent cannot mark focus).
+    readonly property real hueFloor: 0.2
+    // The least contrast text needs on its ground (WCAG AA), and the least a frame or glyph needs (a graphical object).
+    readonly property real textContrast: 4.5
+    readonly property real frameContrast: 3
+    // Tag swatch colours lifted on the listing and the menu ground plus the digit fallback, filled once per theme load by Contrast.tagTheme.
+    property var tag: ({ colors: {}, menuColors: {}, fallback: false })
+    // The board's fixed tag slot width, once a tagged row has been seen in the folder.
+    readonly property int tagSlotWidth: 88
+
+    readonly property QtObject color: ThemeColors { textContrast: root.textContrast; hueFloor: root.hueFloor }
 
     readonly property QtObject font: QtObject {
         readonly property string family: Style.font.family
         // Following takes Omarchy's resolved token, so a theme's own font override still wins. An
         // override runs Style's own fontPx ratios at the pinned stop, which is the same ladder.
-        // Running text draws at Omarchy's regular body (GM, 2026-09-07); bodySmall stays the geometry token every row and mark is sized from.
+        // Running text draws at Omarchy's regular body (decided 2026-09-07); bodySmall stays the geometry token every row and mark is sized from.
         readonly property int body: root.overridden ? TextSize.body(root.baseSize) : Style.font.body
         readonly property int bodySmall: root.overridden ? TextSize.bodySmall(root.baseSize) : Style.font.bodySmall
         readonly property int caption: root.overridden ? TextSize.caption(root.baseSize) : Style.font.caption
     }
 
-    readonly property real densityRatio: ViewState.density === "compact" ? 0.5 : ViewState.density === "comfortable" ? 1.5 : 1
+    // Tight drops the padding through Density040, Compact stays the default.
+    readonly property real densityRatio: Density.ratioFor(ViewState.density)
 
     readonly property QtObject spacing: QtObject {
         readonly property int hairline: Style.spacing.hairline
         readonly property int rowPaddingX: Math.round(Style.spacing.rowPaddingX * root.sizeRatio)
         readonly property int rowPaddingY: Math.round(Style.spacing.controlPaddingY * root.sizeRatio)
         readonly property int gap: Math.round(Style.spacing.rowGap * root.sizeRatio)
+        // Properties040's Tags pair: 6 px from a swatch to its name and 16 px between tags at text size 14.
+        readonly property int tagNameGap: Math.round(Style.space(5) * root.sizeRatio)
+        readonly property int tagPairGap: Math.round(Style.space(14) * root.sizeRatio)
     }
 
-    // One glyph's advance in a monospace face is every glyph's advance, so this sizes every fixed column.
+    // One glyph's advance in a monospace face is every glyph's advance, so this sizes every fixed column; row names budget off bodyAdvance, grid captions off bodySmallAdvance.
+    readonly property real glyphAdvance: glyphMetrics.advanceWidth
+    // The body-face advance the row names draw at; Row and ColumnRow budget off this, never the caption one.
+    readonly property real bodyAdvance: bodyGlyphMetrics.advanceWidth
     TextMetrics {
         id: glyphMetrics
         font.family: Style.font.family
@@ -85,30 +96,42 @@ Singleton {
 
     // Trash draws its Deleted cell at body, and body/bodySmall is not one ratio across the size stops.
     TextMetrics { id: bodyGlyphMetrics; font.family: Style.font.family; font.pixelSize: root.font.body; text: "0" }
+    readonly property real bodySmallAdvance: root.glyphAdvance // Same inputs as glyphMetrics, so one object serves both; grid tile budgets off this, never the body one.
 
-    // The header and every row read these, so the two cannot drift apart.
+    // The header and every row read the stored widths so the two cannot drift apart; a drag previews in the header alone, ListColumns040 callout 1.
+    // Sample input: {"mode": "wide"} answers the measured width, {"size": -40} the same.
+    function storedWidth(key, fallback) {
+        var raw = ViewState.state.columnWidths ? ViewState.state.columnWidths[key] : undefined
+        var n = Columns.storedNumber(raw)
+        if (!(n >= 0))
+            return fallback
+        return Columns.clampListWidth(n)
+    }
     readonly property QtObject column: QtObject {
-        // mode is a permanent column per the operator's ruling; Row and Header both read this width.
-        readonly property int mode: Math.round(root.modeChars * glyphMetrics.advanceWidth)
-        readonly property int size: Math.round(root.sizeChars * glyphMetrics.advanceWidth)
-        readonly property int date: Math.round(root.dateChars * glyphMetrics.advanceWidth)
+        // mode is a permanent column by design; Row and Header both read this width.
+        readonly property int mode: root.storedWidth("mode", Math.round(root.modeChars * glyphMetrics.advanceWidth))
+        readonly property int size: root.storedWidth("size", Math.round(root.sizeChars * glyphMetrics.advanceWidth))
+        readonly property int date: root.storedWidth("date", Math.round(root.dateChars * glyphMetrics.advanceWidth))
         // Trash's Deleted column: the same sixteen characters in the size that draws them, ceil because a rounded width elides at base 14.
         readonly property int trashDate: Math.ceil(root.dateChars * bodyGlyphMetrics.advanceWidth)
         // The send picker's own, anchored the way kind below it is rather than counted in characters.
         readonly property int pickerDate: Math.round(root.pickerDateBaseWidth * root.font.bodySmall / root.pickerDateBaseBodySmall)
         // Kind text varies too much for a character count, so its base is a pixel width scaled by the same ratio bodySmall already is.
-        readonly property int kind: Math.round(root.kindBaseWidth * root.font.bodySmall / 12)
+        readonly property int kind: root.storedWidth("kind", Math.round(root.kindBaseWidth * root.font.bodySmall / 12))
+        readonly property int location: 150 // Sidebar040's fixed Recent column, shared by Header and Row.
         // Not a column: the floor under the name, which the four above drop one by one to protect.
         readonly property int nameMin: Math.round(root.nameMinChars * glyphMetrics.advanceWidth)
     }
 
     // Row height follows the font so it scales with omarchy display text size.
     readonly property int rowHeight: Math.round(font.bodySmall * lineBoxRatio) + 2 * spacing.rowPaddingY
-    readonly property int fileRowHeight: Math.round(font.bodySmall * lineBoxRatio) + 2 * Math.round(spacing.rowPaddingY * densityRatio)
+    readonly property int fileRowHeight: Density.rowHeight(Math.round(font.bodySmall * lineBoxRatio), spacing.rowPaddingY, ViewState.density)
     // The icon slot is the row's text line box, so an icon can never change the row height.
     readonly property int iconSize: root.rowHeight - 2 * root.spacing.rowPaddingY
     // A mark is sized from the type scale, never from its slot: 19, the canvas's own M.mark, is the row and menu one.
     readonly property real markSize: root.font.bodySmall * 1.45
+    // The clipboard mark's own size, read by every view and the list's shared budgets.
+    readonly property int clipMarkSize: 12
     // A mark standing alone takes its own step of the same scale: States.dc.html draws Locked and Error at 40.
     readonly property int stateMarkSize: Math.round(root.font.bodySmall * 3.1)
     // The brand moment, the empty hero and the loading crawl: 48, which is 6/5 of stateMarkSize on the same board.
@@ -121,7 +144,7 @@ Singleton {
     // WCAG 2.5.8 floor. Marks stay at their type-scale size; the hit box grows to this.
     readonly property int hitMin: 24
     // The wheel, see ui/FastScrollHandler.qml: a notch is the platform's lines times notchPx times the
-    // multiplier, and a touchpad's pixels move one to one. PR 16's pair, 4x calibrated on Omarchy Spotify.
+    // multiplier (PR 16's pair, 4x on Omarchy Spotify); touchpad pixels move times TOUCH_GAIN (decided 2026-10-01).
     readonly property QtObject scroll: QtObject {
         readonly property int notchPx: 24
         readonly property real multiplier: 4
@@ -151,12 +174,16 @@ Singleton {
     // What is left of the strip once its rule and both insets are taken off. The hit box stays the
     // whole strip, so a press still clears hitMin however small the frame gets.
     readonly property int chromeControlHeight: root.chromeHeight - root.spacing.hairline - 2 * root.chromeControlInset
+    // The room a dialog body's clip keeps past its controls, RING plus a hairline: a focused filled check box draws its keyline two hairlines outside its box, and CardScroll.reveal() keeps this much past a control it scrolls to.
+    readonly property int focusClearance: Buttons.RING + root.spacing.hairline
     // The two steps of that fill, in whichever role the control carries: the pointer's and the
     // keyboard's. The second is the weight the rail's own active row and the segmented chooser's
     // active segment already take, so a control under the keyboard reads at the same strength.
-    readonly property real washHover: 0.08
-    readonly property real washActive: 0.14
-    readonly property real disabledOpacity: 0.55
+    readonly property real washHover: Buttons.WASH_HOVER
+    readonly property real washActive: Buttons.WASH_PRESS
+    readonly property real disabledOpacity: Buttons.DISABLED_OPACITY
+    // A search result's base name takes at most this share of the row, so its folder always shows; Row and ColumnRow read it.
+    readonly property real searchNameShare: 0.66
     // An accent edge is 2px along a tall side and 3px flush along a short one, measured in Quickshell.
     readonly property int accentEdge: 3
     // "rwxrwxrwx", Format.permissions is always exactly this wide.
@@ -182,6 +209,9 @@ Singleton {
         readonly property real nameMin: 180 * root.font.bodySmall / 13
     }
 
+    // The narrowest Dual listing: the name floor Columns.dualSet protects, with the row padding, mark and gap before it.
+    readonly property real dualMinWidth: 2 * root.spacing.rowPaddingX + root.markSize + root.spacing.gap + root.dualColumn.nameMin
+
     function dualColumns(width, hidden) {
         return Columns.dualSet(width, {rowPaddingX: root.spacing.rowPaddingX, gap: root.spacing.gap,
             iconSize: root.markSize, nameMin: root.dualColumn.nameMin,
@@ -200,8 +230,11 @@ Singleton {
         readonly property int minCellWidth: root.space(125)
     }
 
-    // GM's September 8 sizing override gives dialog cards more room without enlarging context menus.
+    // The September 8 sizing override gives dialog cards more room without enlarging context menus.
     readonly property real dialogWidthRatio: 9 / 8
+    // A card's whole size inside its room and a whole centred origin, so no hairline of its frame lands on a half pixel.
+    function cardSpan(want, room) { return Math.max(0, Math.min(Math.ceil(want), Math.floor(room))) }
+    function cardOrigin(room, span) { return Math.round((room - span) / 2) }
 
     // The Settings board's anatomy, resolved at base-size 14: a border-box panel 560 wide whose two
     // outer hairlines leave 558 inside, split into a 150 rail and a 408 pane. 480 and 350 are those
@@ -218,6 +251,8 @@ Singleton {
     readonly property QtObject preview: QtObject {
         // Quick-Look sized inset over the window, not a second window.
         readonly property real fraction: 0.82
+        // TallPreviews specimen C leaves 24 px of the window above and below a tall Quick Look, in resolved pixels at base 14.
+        readonly property int edge: 24
     }
 
     // The columns a list of this width can draw, less the ones ViewState hides; Header and Row call
@@ -225,15 +260,16 @@ Singleton {
     readonly property var columnTokens: ({
         rowPaddingX: root.spacing.rowPaddingX, gap: root.spacing.gap, iconSize: root.iconSize,
         nameMin: root.column.nameMin, mode: root.column.mode,
-        size: root.column.size, date: root.column.date, kind: root.column.kind
+        size: root.column.size, date: root.column.date, kind: root.column.kind, location: root.column.location
     })
-    function columnSet(dateWidth) { return dateWidth === undefined ? root.columnTokens : Object.assign({}, root.columnTokens, {date: dateWidth}); }
-    function columns(width, hidden, dateWidth) { return Columns.set(width, root.columnSet(dateWidth), hidden); }
-
-    // The same set as one string, which is what the seam in ui/Ipc.qml compares across the two.
-    function columnNames(width, hidden, dateWidth) {
-        return Columns.names(root.columns(width, hidden, dateWidth));
+    function columnSet(dateWidth, dual) {
+        if (dual)
+            return Object.assign({}, root.columnTokens, {iconSize: root.markSize,
+                nameMin: root.dualColumn.nameMin, size: root.dualColumn.size,
+                date: dateWidth === undefined ? root.dualColumn.date : dateWidth});
+        return dateWidth === undefined ? root.columnTokens : Object.assign({}, root.columnTokens, {date: dateWidth});
     }
+    function columns(width, hidden, dateWidth, recent, dual) { return recent ? Columns.recentSet(width, root.columnSet(dateWidth, dual), hidden, dual) : Columns.set(width, root.columnSet(dateWidth), hidden); }
 
     // Five callers plus the grid and settings tokens above: ConvertDialog, KeymapSheet, NetworkDialog, NetworkForm, TransferCard; every other spacing token is direct.
     function space(px) {
@@ -292,18 +328,30 @@ Singleton {
         var bg = Palette.pick(found, ["background"], root.fallbackColor.background);
         var surface = Palette.pick(found, Palette.SURFACE_KEYS, root.fallbackColor.surface);
         root.color.surface = surface;
-        Color.loadColors(body);
-        // Measured over the 22 stock palettes in tests/js/themes.js: 20 set a muted under the 3:1 a
-        // caption needs, rose-pine's at 1.48, so it is lifted the way the two ladder colours below are.
-        root.color.muted = Contrast.ensureRatio(
-            Palette.pick(found, ["muted"], Qt.darker(Color.foreground, 1.4)), bg, 3);
-        root.color.accentFrame = Contrast.ensureRatio(Color.accent, surface, 3);
-        root.color.symlink = Contrast.ensureRatio(
+        Commons.Color.loadColors(body);
+        // Frames and glyphs draw the palette's muted lifted to frameContrast; text lifts that to textContrast on the background, then the surface.
+        root.color.opaqueMutedFrame = Contrast.ensureRatio(
+            Palette.pick(found, ["muted"], Qt.darker(Commons.Color.foreground, 1.4)), bg, root.frameContrast);
+        root.color.opaqueMuted = Contrast.ensureRatio(Contrast.ensureRatio(root.color.opaqueMutedFrame, bg, root.textContrast), surface, root.textContrast);
+        // Metadata ink is the foreground darkened one step, lifted the same two ways; the unlifted step stays for glyphs that read it.
+        root.color.opaqueMetadataFrame = Qt.darker(Commons.Color.foreground, 1.4);
+        root.color.opaqueMetadata = Contrast.ensureRatio(Contrast.ensureRatio(root.color.opaqueMetadataFrame, bg, root.textContrast), surface, root.textContrast);
+        // Headings take the palette's bright foreground (the ANSI ring's color15 without one) when it has more contrast than the foreground.
+        var bright = Palette.pick(found, ["bright_foreground", "color15"], String(Commons.Color.foreground));
+        root.color.opaqueForegroundBright = Contrast.ratio(bright, bg) > Contrast.ratio(String(Commons.Color.foreground), bg) ? bright : Commons.Color.foreground;
+        root.color.opaqueAccentFrame = Contrast.ensureRatio(Commons.Color.accent, surface, 3);
+        root.color.accentHasHue = Commons.Color.accent.hsvSaturation > root.hueFloor;
+        root.color.opaqueSymlink = Contrast.ensureRatio(
             Palette.pick(found, ["cyan", "color6"], root.fallbackColor.symlink), bg, 4.5);
-        root.color.executable = Contrast.ensureRatio(
+        root.color.opaqueExecutable = Contrast.ensureRatio(
             Palette.pick(found, ["green", "color2"], root.fallbackColor.executable), bg, 4.5);
+        root.palette = found;
         // Urgent is the palette's own red: seven of the 23 installed themes leave it under 4.5:1 on their own ground, so it is lifted the way symlink and executable are, and the three whose red carries no chroma at all (solitude, white, vantablack) fall back to the foreground, because a destructive row drawn in the same grey as an unavailable one reads as switched off rather than as dangerous.
-        root.color.error = Color.urgent.hsvSaturation > 0.2 ? Contrast.ensureRatio(Color.urgent, bg, 4.5) : String(Color.foreground);
+        var hued = Commons.Color.urgent.hsvSaturation > root.hueFloor;
+        root.color.opaqueError = hued ? Contrast.ensureRatio(Commons.Color.urgent, bg, Math.max(4.5, Contrast.ratio(String(root.color.opaqueMuted), bg))) : String(Commons.Color.foreground);
+        // The status bar draws that same ink on the surface, where four themes land under 4.5; it is never quieter than the caption there.
+        root.color.opaqueErrorOnSurface = hued ? Contrast.ensureRatio(Commons.Color.urgent, surface, Math.max(4.5, Contrast.ratio(String(root.color.opaqueMuted), surface))) : String(Commons.Color.foreground);
+        root.tag = Contrast.tagTheme(found, bg, surface);
         // A body that parsed to nothing left every role on its fallback, so the flag says so rather
         // than reporting that the read happened: text() returns "" for a file that is not there.
         root.ready = Palette.isPalette(found);
@@ -346,8 +394,8 @@ Singleton {
         path: root.stateDir + "/theme/shell.toml"
         blockLoading: true
         printErrors: false
-        onLoaded: Color.loadShell(text())
-        onLoadFailed: Color.loadShell("")
+        onLoaded: Commons.Color.loadShell(text())
+        onLoadFailed: Commons.Color.loadShell("")
     }
 
     // omarchy-theme-set rm -rf's and mv's the theme directory, so an inotify watch on a file inside
@@ -366,6 +414,19 @@ Singleton {
             // The OEM shell's applyTheme runs this beside the two reloads above, and without it a theme that moves decoration:rounding leaves every corner here on the old value.
             Style.scheduleRefresh();
         }
+    }
+
+    // Hyprland reloads its config for a Window Corners, Gaps or Transparency change with no theme switch, so Style's rounding and Glass's mode are read again then.
+    signal configReloaded()
+    function hyprEvent(name) {
+        if (name !== "configreloaded") return;
+        Style.scheduleRefresh();
+        root.configReloaded();
+    }
+    // The Hyprland singleton is only touched inside Hyprland, so a headless run has no socket to join.
+    Connections {
+        target: Quickshell.env("HYPRLAND_INSTANCE_SIGNATURE") !== null ? Hyprland : null
+        function onRawEvent(event) { root.hyprEvent(event.name) }
     }
 
     // Read once, not watched: the Display section reports the compositor's scale and Flea owns no
